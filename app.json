@@ -5,6 +5,13 @@
     "version": "2.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
+    "backgroundColor": "#0B0F17",
+    "newArchEnabled": true,
+    "platforms": ["android"],
+    "splash": {
+      "backgroundColor": "#0B0F17",
+      "resizeMode": "contain"
+    },
     "android": {
       "package": "com.pulseos.app",
       "versionCode": 2,
@@ -14,14 +21,9 @@
       "permissions": [
         "android.permission.INTERNET",
         "android.permission.VIBRATE",
-        "android.permission.RECEIVE_BOOT_COMPLETED",
-        "android.permission.RECORD_AUDIO",
-        "android.permission.SYSTEM_ALERT_WINDOW",
-        "android.permission.FOREGROUND_SERVICE"
-      ]
-    },
-    "plugins": [
-      "./withHarkNativeOS.js"
-    ]
+        "android.permission.REQUEST_INSTALL_PACKAGES"
+      ],
+      "softwareKeyboardLayoutMode": "resize"
+    }
   }
 }

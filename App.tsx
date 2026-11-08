@@ -14,12 +14,16 @@ import {
   Switch,
   Text,
   TextInput,
+  Vibration,
   View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { WebView, WebViewMessageEvent, WebViewNavigation } from 'react-native-webview';
 import * as Speech from 'expo-speech';
+import * as Application from 'expo-application';
+import * as FileSystem from 'expo-file-system';
+import * as IntentLauncher from 'expo-intent-launcher';
 
 /* ------------------------------------------------------------------ */
 /* Theme                                                               */
@@ -55,6 +59,7 @@ const CLOUD_DOMAIN = 'app.github.dev';
 
 const DEFAULT_MODEL = 'gemini-flash-latest';
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
+const DEFAULT_UPDATE_REPO = 'RedChip6261/pulse-os-android';
 
 const SYSTEM_PROMPT = [
   'You are Pulse, a proactive personal-productivity assistant inside the Pulse OS mobile app.',
@@ -67,7 +72,7 @@ const SYSTEM_PROMPT = [
   '"one_line_summary": a single short sentence summarising the task or plan.',
 ].join(' ');
 
-type Tab = 'CHAT' | 'WIDGETS' | 'WORKSPACE';
+type Tab = 'CHAT' | 'WIDGETS' | 'WORKSPACE' | 'SETTINGS';
 
 type PulseReply = {
   direct_response: string;
@@ -165,6 +170,8 @@ async function callGemini(
   apiKey: string,
   model: string,
   history: ChatMessage[],
+  extraSystem = '',
+  temperature = 0.7,
 ): Promise<{ reply: PulseReply; modelUsed: string }> {
   const contents = history
     .filter((m) => m.role !== 'error')
@@ -175,9 +182,9 @@ async function callGemini(
     }));
 
   const body = JSON.stringify({
-    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+    systemInstruction: { parts: [{ text: SYSTEM_PROMPT + (extraSystem ? '\n' + extraSystem : '') }] },
     contents,
-    generationConfig: { temperature: 0.7, responseMimeType: 'application/json' },
+    generationConfig: { temperature, responseMimeType: 'application/json' },
   });
 
   const attempt = async (m: string) =>
@@ -299,6 +306,7 @@ async function callCloudChat(
   token: string,
   geminiKey: string | undefined,
   history: ChatMessage[],
+  extraSystem = '',
 ): Promise<{ reply: PulseReply; modelUsed: string }> {
   const messages = history
     .filter((m) => m.role !== 'error')
@@ -307,7 +315,7 @@ async function callCloudChat(
       role: m.role === 'user' ? 'user' : 'assistant',
       text: m.role === 'assistant' && m.reply ? JSON.stringify(m.reply) : m.text,
     }));
-  const json = await cloudFetch(base, token, '/api/chat', { body: { messages }, geminiKey });
+  const json = await cloudFetch(base, token, '/api/chat', { body: { messages, context: extraSystem }, geminiKey });
   const r = json?.reply ?? {};
   return {
     reply: {
@@ -581,79 +589,343 @@ const WIDGETS = [
 ];
 
 /* ------------------------------------------------------------------ */
+/* Settings model (one JSON blob, migrated from the old per-key store) */
+/* ------------------------------------------------------------------ */
+
+const STORAGE_SETTINGS = 'pulseos.settings.v2';
+
+type Settings = {
+  // Profile
+  name: string;
+  email: string;
+  role: string;
+  avatar: string;
+  focusGoalMin: number;
+  personalize: boolean;
+  // Assistant
+  apiKey: string;
+  model: string;
+  temperature: number;
+  replyLength: 'short' | 'balanced' | 'detailed';
+  historyLimit: number;
+  // Cloud
+  cloudUrl: string;
+  cloudToken: string;
+  cloudMode: boolean;
+  // Voice
+  voiceOn: boolean;
+  voiceRate: number;
+  voicePitch: number;
+  voiceLang: string;
+  // Workspace
+  homeUrl: string;
+  confirmBeforeComplete: boolean;
+  // Chat behaviour
+  haptics: boolean;
+  // Updates
+  updateRepo: string;
+  updateToken: string;
+  autoCheckUpdates: boolean;
+};
+
+const DEFAULT_SETTINGS: Settings = {
+  name: '',
+  email: '',
+  role: '',
+  avatar: '⚡',
+  focusGoalMin: 120,
+  personalize: true,
+  apiKey: '',
+  model: DEFAULT_MODEL,
+  temperature: 0.7,
+  replyLength: 'balanced',
+  historyLimit: 60,
+  cloudUrl: '',
+  cloudToken: '',
+  cloudMode: false,
+  voiceOn: false,
+  voiceRate: 1.0,
+  voicePitch: 1.0,
+  voiceLang: 'en-US',
+  homeUrl: 'https://www.google.com',
+  confirmBeforeComplete: true,
+  haptics: true,
+  updateRepo: DEFAULT_UPDATE_REPO,
+  updateToken: '',
+  autoCheckUpdates: true,
+};
+
+async function loadSettings(): Promise<Settings> {
+  const raw = await AsyncStorage.getItem(STORAGE_SETTINGS);
+  if (raw) {
+    try {
+      return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    } catch {
+      /* fall through to migration */
+    }
+  }
+  // Migrate values saved by earlier versions of the app.
+  const [k, m, v, cu, ct, cm] = await Promise.all([
+    AsyncStorage.getItem(STORAGE_API_KEY),
+    AsyncStorage.getItem(STORAGE_MODEL),
+    AsyncStorage.getItem(STORAGE_VOICE),
+    AsyncStorage.getItem(STORAGE_CLOUD_URL),
+    AsyncStorage.getItem(STORAGE_CLOUD_TOKEN),
+    AsyncStorage.getItem(STORAGE_CLOUD_MODE),
+  ]);
+  const s: Settings = {
+    ...DEFAULT_SETTINGS,
+    apiKey: k || '',
+    model: m || DEFAULT_MODEL,
+    voiceOn: v === '1',
+    cloudUrl: cu || '',
+    cloudToken: ct || '',
+    cloudMode: cm === '1' && !!cu,
+  };
+  await AsyncStorage.setItem(STORAGE_SETTINGS, JSON.stringify(s));
+  return s;
+}
+
+function profileContext(s: Settings): string {
+  if (!s.personalize) return '';
+  const bits: string[] = [];
+  if (s.name.trim()) bits.push('The user\'s name is ' + s.name.trim() + '.');
+  if (s.role.trim()) bits.push('They describe themselves as: ' + s.role.trim() + '.');
+  if (s.focusGoalMin > 0) bits.push('Their daily focus goal is ' + s.focusGoalMin + ' minutes.');
+  const len =
+    s.replyLength === 'short'
+      ? 'Keep direct_response to 1-2 sentences.'
+      : s.replyLength === 'detailed'
+        ? 'direct_response may be detailed (up to ~150 words).'
+        : 'Keep direct_response concise (2-4 sentences).';
+  bits.push(len);
+  return bits.join(' ');
+}
+
+function speakWith(s: Settings, text: string) {
+  if (!text.trim()) return;
+  Speech.stop();
+  Speech.speak(text, { language: s.voiceLang || 'en-US', rate: s.voiceRate || 1, pitch: s.voicePitch || 1 });
+}
+
+/* ------------------------------------------------------------------ */
+/* In-app updates (GitHub Releases, no Play Store)                     */
+/* ------------------------------------------------------------------ */
+
+type UpdateInfo = {
+  available: boolean;
+  latestBuild: number;
+  currentBuild: number;
+  tag: string;
+  name: string;
+  notes: string;
+  publishedAt: string;
+  sizeBytes: number;
+  assetApiUrl: string;
+  htmlUrl: string;
+};
+
+function currentBuildNumber(): number {
+  const n = parseInt(String(Application.nativeBuildVersion ?? '0'), 10);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function buildFromTag(tag: string): number {
+  const m = String(tag).match(/(\d+)\s*$/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+async function checkForUpdate(repo: string, token: string): Promise<UpdateInfo> {
+  const r = repo.trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\/+$/, '');
+  if (!/^[\w.-]+\/[\w.-]+$/.test(r)) throw new Error('Update source must look like owner/repo.');
+  const headers: Record<string, string> = { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
+  if (token.trim()) headers.Authorization = 'Bearer ' + token.trim();
+  const res = await fetch('https://api.github.com/repos/' + r + '/releases/latest', { headers });
+  if (res.status === 404) {
+    throw new Error(
+      token.trim()
+        ? 'No release found yet. The next successful build publishes one.'
+        : 'No release found. If the repo is private, add a read-only GitHub token in Updates.',
+    );
+  }
+  if (res.status === 401 || res.status === 403) throw new Error('GitHub refused the token (HTTP ' + res.status + ').');
+  if (!res.ok) throw new Error('GitHub HTTP ' + res.status);
+  const rel: any = await res.json();
+  const asset = (rel.assets || []).find((a: any) => /\.apk$/i.test(String(a?.name)));
+  if (!asset) throw new Error('The latest release has no APK attached.');
+  const latestBuild = buildFromTag(rel.tag_name);
+  const currentBuild = currentBuildNumber();
+  return {
+    available: latestBuild > currentBuild,
+    latestBuild,
+    currentBuild,
+    tag: String(rel.tag_name),
+    name: String(rel.name || rel.tag_name),
+    notes: String(rel.body || '').trim(),
+    publishedAt: String(rel.published_at || ''),
+    sizeBytes: Number(asset.size) || 0,
+    assetApiUrl: String(asset.url),
+    htmlUrl: String(rel.html_url || ''),
+  };
+}
+
+async function downloadAndInstall(
+  info: UpdateInfo,
+  token: string,
+  onProgress: (fraction: number) => void,
+): Promise<void> {
+  if (Platform.OS !== 'android') throw new Error('Updates install on Android only.');
+  const dest = (FileSystem.cacheDirectory || FileSystem.documentDirectory || '') + 'pulse-os-' + info.latestBuild + '.apk';
+  await FileSystem.deleteAsync(dest, { idempotent: true });
+  const headers: Record<string, string> = { Accept: 'application/octet-stream' };
+  if (token.trim()) headers.Authorization = 'Bearer ' + token.trim();
+  const task = FileSystem.createDownloadResumable(info.assetApiUrl, dest, { headers }, (p) => {
+    const total = p.totalBytesExpectedToWrite > 0 ? p.totalBytesExpectedToWrite : info.sizeBytes;
+    if (total > 0) onProgress(Math.min(1, p.totalBytesWritten / total));
+  });
+  const result = await task.downloadAsync();
+  if (!result || (result.status && result.status >= 400)) {
+    throw new Error('Download failed (HTTP ' + (result?.status ?? '?') + ').');
+  }
+  const stat = await FileSystem.getInfoAsync(dest);
+  if (!stat.exists || (stat.size ?? 0) < 1024 * 1024) throw new Error('Downloaded file looks incomplete.');
+  onProgress(1);
+  const contentUri = await FileSystem.getContentUriAsync(dest);
+  // Hands the APK to Android's own package installer; the user confirms the install there.
+  await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
+    data: contentUri,
+    flags: 1, // FLAG_GRANT_READ_URI_PERMISSION
+    type: 'application/vnd.android.package-archive',
+  });
+}
+
+function formatBytes(n: number) {
+  if (!n) return '';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+/* ------------------------------------------------------------------ */
 /* App                                                                 */
 /* ------------------------------------------------------------------ */
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('CHAT');
-  const [voiceOn, setVoiceOn] = useState(false);
-  const voiceRef = useRef(false);
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const settingsRef = useRef<Settings>(DEFAULT_SETTINGS);
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
 
   useEffect(() => {
-    AsyncStorage.getItem(STORAGE_VOICE).then((v) => {
-      const on = v === '1';
-      voiceRef.current = on;
-      setVoiceOn(on);
+    loadSettings().then((s) => {
+      settingsRef.current = s;
+      setSettings(s);
+      if (s.autoCheckUpdates && s.updateRepo) {
+        checkForUpdate(s.updateRepo, s.updateToken)
+          .then((u) => setUpdate(u.available ? u : null))
+          .catch(() => undefined);
+      }
     });
   }, []);
 
-  const toggleVoice = useCallback(() => {
-    const next = !voiceRef.current;
-    voiceRef.current = next;
-    setVoiceOn(next);
-    AsyncStorage.setItem(STORAGE_VOICE, next ? '1' : '0');
-    if (next) speak('Voice readout on.');
-    else Speech.stop();
+  const patchSettings = useCallback((patch: Partial<Settings>) => {
+    const next = { ...settingsRef.current, ...patch };
+    settingsRef.current = next;
+    setSettings(next);
+    AsyncStorage.setItem(STORAGE_SETTINGS, JSON.stringify(next));
   }, []);
 
+  const toggleVoice = useCallback(() => {
+    const next = !settingsRef.current.voiceOn;
+    patchSettings({ voiceOn: next });
+    if (next) speakWith(settingsRef.current, 'Voice readout on.');
+    else Speech.stop();
+  }, [patchSettings]);
+
   const say = useCallback((text: string) => {
-    if (voiceRef.current) speak(text);
+    if (settingsRef.current.voiceOn) speakWith(settingsRef.current, text);
   }, []);
+
+  if (!settings) {
+    return (
+      <View style={styles.center}>
+        <ActivityIndicator color={C.accent} />
+      </View>
+    );
+  }
+
+  const tabs: { id: Tab; icon: string }[] = [
+    { id: 'CHAT', icon: '💬' },
+    { id: 'WIDGETS', icon: '🧩' },
+    { id: 'WORKSPACE', icon: '🌐' },
+    { id: 'SETTINGS', icon: '⚙️' },
+  ];
 
   return (
     <SafeAreaView style={styles.root}>
       <StatusBar style="light" backgroundColor={C.bg} />
       <View style={styles.header}>
-        <View>
-          <Text style={styles.brand}>Pulse OS</Text>
-          <Text style={styles.brandSub}>{tab.charAt(0) + tab.slice(1).toLowerCase()}</Text>
-        </View>
+        <Pressable onPress={() => setTab('SETTINGS')} style={styles.rowCenter} accessibilityLabel="Open profile">
+          <View style={styles.avatarSmall}>
+            <Text style={{ fontSize: 18 }}>{settings.avatar || '⚡'}</Text>
+          </View>
+          <View>
+            <Text style={styles.brand}>Pulse OS</Text>
+            <Text style={styles.brandSub}>
+              {settings.name.trim() ? 'Hi, ' + settings.name.trim().split(' ')[0] : tab.charAt(0) + tab.slice(1).toLowerCase()}
+            </Text>
+          </View>
+        </Pressable>
         <Pressable
           onPress={toggleVoice}
           accessibilityRole="switch"
-          accessibilityState={{ checked: voiceOn }}
+          accessibilityState={{ checked: settings.voiceOn }}
           accessibilityLabel="Voice readout"
-          style={[styles.voiceBtn, voiceOn && styles.voiceBtnOn]}
+          style={[styles.voiceBtn, settings.voiceOn && styles.voiceBtnOn]}
         >
-          <Text style={styles.voiceIcon}>{voiceOn ? '🔊' : '🔈'}</Text>
-          <Text style={[styles.voiceText, voiceOn && { color: C.text }]}>{voiceOn ? 'ON' : 'OFF'}</Text>
+          <Text style={styles.voiceIcon}>{settings.voiceOn ? '🔊' : '🔈'}</Text>
+          <Text style={[styles.voiceText, settings.voiceOn && { color: C.text }]}>{settings.voiceOn ? 'ON' : 'OFF'}</Text>
         </Pressable>
       </View>
 
+      {update && tab !== 'SETTINGS' ? (
+        <Pressable onPress={() => setTab('SETTINGS')} style={styles.updateBanner}>
+          <Text style={styles.updateBannerText}>
+            ⬆️ Update available: build {update.latestBuild} (you have {update.currentBuild}). Tap to install.
+          </Text>
+        </Pressable>
+      ) : null}
+
       <View style={{ flex: 1 }}>
         <View style={[styles.fill, tab !== 'CHAT' && styles.hidden]}>
-          <ChatScreen say={say} />
+          <ChatScreen say={say} settings={settings} patchSettings={patchSettings} openSettings={() => setTab('SETTINGS')} />
         </View>
         <View style={[styles.fill, tab !== 'WIDGETS' && styles.hidden]}>
           <WidgetsScreen say={say} />
         </View>
         <View style={[styles.fill, tab !== 'WORKSPACE' && styles.hidden]}>
-          <WorkspaceScreen say={say} />
+          <WorkspaceScreen say={say} homeUrl={settings.homeUrl} confirmFirst={settings.confirmBeforeComplete} />
+        </View>
+        <View style={[styles.fill, tab !== 'SETTINGS' && styles.hidden]}>
+          <SettingsScreen
+            settings={settings}
+            patchSettings={patchSettings}
+            update={update}
+            setUpdate={setUpdate}
+          />
         </View>
       </View>
 
       <View style={styles.tabBar}>
-        {(['CHAT', 'WIDGETS', 'WORKSPACE'] as Tab[]).map((t) => (
+        {tabs.map(({ id, icon }) => (
           <Pressable
-            key={t}
-            onPress={() => setTab(t)}
+            key={id}
+            onPress={() => setTab(id)}
             style={styles.tabItem}
             accessibilityRole="tab"
-            accessibilityState={{ selected: tab === t }}
+            accessibilityState={{ selected: tab === id }}
           >
-            <Text style={styles.tabIcon}>{t === 'CHAT' ? '💬' : t === 'WIDGETS' ? '🧩' : '🌐'}</Text>
-            <Text style={[styles.tabLabel, tab === t && styles.tabLabelActive]}>{t}</Text>
-            {tab === t ? <View style={styles.tabDot} /> : null}
+            <Text style={styles.tabIcon}>{icon}</Text>
+            <Text style={[styles.tabLabel, tab === id && styles.tabLabelActive]}>{id}</Text>
+            {tab === id ? <View style={styles.tabDot} /> : id === 'SETTINGS' && update ? <View style={styles.tabBadge} /> : null}
           </Pressable>
         ))}
       </View>
@@ -665,81 +937,53 @@ export default function App() {
 /* CHAT                                                                */
 /* ------------------------------------------------------------------ */
 
-function ChatScreen({ say }: { say: (t: string) => void }) {
-  const [apiKey, setApiKey] = useState('');
-  const [keyDraft, setKeyDraft] = useState('');
-  const [model, setModel] = useState(DEFAULT_MODEL);
-  const [modelDraft, setModelDraft] = useState(DEFAULT_MODEL);
-  const [showSettings, setShowSettings] = useState(false);
+function ChatScreen({
+  say,
+  settings,
+  patchSettings,
+  openSettings,
+}: {
+  say: (t: string) => void;
+  settings: Settings;
+  patchSettings: (p: Partial<Settings>) => void;
+  openSettings: () => void;
+}) {
+  const { apiKey, model, cloudUrl, cloudToken, cloudMode } = settings;
   const [loaded, setLoaded] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
-  const listRef = useRef<FlatList<ChatMessage>>(null);
-
-  // Cloud backend
-  const [cloudUrl, setCloudUrl] = useState('');
-  const [cloudUrlDraft, setCloudUrlDraft] = useState('');
-  const [cloudToken, setCloudToken] = useState('');
-  const [cloudTokenDraft, setCloudTokenDraft] = useState('');
-  const [cloudMode, setCloudMode] = useState(false);
-  const [cloudModeDraft, setCloudModeDraft] = useState(false);
   const [cloudStatus, setCloudStatus] = useState<CloudStatus>('off');
   const [cloudHealthInfo, setCloudHealthInfo] = useState<CloudHealth | null>(null);
-  const [testing, setTesting] = useState(false);
+  const listRef = useRef<FlatList<ChatMessage>>(null);
 
-  const checkCloud = useCallback(async (base: string): Promise<CloudHealth | null> => {
+  const checkCloud = useCallback(async (base: string) => {
     if (!base) {
       setCloudStatus('off');
       setCloudHealthInfo(null);
-      return null;
+      return;
     }
     setCloudStatus('checking');
     try {
       const h = await cloudHealth(base);
       setCloudHealthInfo(h);
       setCloudStatus('online');
-      return h;
     } catch {
       setCloudHealthInfo(null);
       setCloudStatus('offline');
-      return null;
     }
   }, []);
 
+  useEffect(() => {
+    checkCloud(cloudUrl);
+  }, [cloudUrl, checkCloud]);
+
   // Only send the phone's key when the server says it has none of its own.
-  const keyForCloud = () => (cloudHealthInfo && cloudHealthInfo.gemini_key_on_server === false && apiKey ? apiKey : undefined);
+  const keyForCloud = () =>
+    cloudHealthInfo && cloudHealthInfo.gemini_key_on_server === false && apiKey ? apiKey : undefined;
 
   useEffect(() => {
-    (async () => {
-      const [k, m, h, cu, ct, cm] = await Promise.all([
-        AsyncStorage.getItem(STORAGE_API_KEY),
-        AsyncStorage.getItem(STORAGE_MODEL),
-        AsyncStorage.getItem(STORAGE_CHAT),
-        AsyncStorage.getItem(STORAGE_CLOUD_URL),
-        AsyncStorage.getItem(STORAGE_CLOUD_TOKEN),
-        AsyncStorage.getItem(STORAGE_CLOUD_MODE),
-      ]);
-      if (cu) {
-        setCloudUrl(cu);
-        setCloudUrlDraft(cu);
-      }
-      if (ct) {
-        setCloudToken(ct);
-        setCloudTokenDraft(ct);
-      }
-      const cloudOn = cm === '1' && !!cu;
-      setCloudMode(cloudOn);
-      setCloudModeDraft(cm === '1');
-      if (cu) checkCloud(cu);
-      if (k) {
-        setApiKey(k);
-        setKeyDraft(k);
-      }
-      if (m) {
-        setModel(m);
-        setModelDraft(m);
-      }
+    AsyncStorage.getItem(STORAGE_CHAT).then((h) => {
       if (h) {
         try {
           setMessages(JSON.parse(h));
@@ -747,87 +991,13 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
           setMessages([]);
         }
       }
-      if (!k && !cloudOn) setShowSettings(true);
       setLoaded(true);
-    })();
-  }, [checkCloud]);
+    });
+  }, []);
 
   useEffect(() => {
-    if (loaded) AsyncStorage.setItem(STORAGE_CHAT, JSON.stringify(messages.slice(-60)));
-  }, [messages, loaded]);
-
-  const saveSettings = async () => {
-    const k = keyDraft.trim();
-    const m = modelDraft.trim() || DEFAULT_MODEL;
-    const cu = normalizeCloudUrl(cloudUrlDraft);
-    const ct = cloudTokenDraft.trim();
-    const cm = cloudModeDraft && !!cu;
-    if (cloudModeDraft && !cu) {
-      Alert.alert('Cloud URL needed', 'Paste the URL your Codespace printed, or turn cloud mode off.');
-      return;
-    }
-    if (!k && !cm) {
-      Alert.alert('API key needed', 'Paste your Gemini API key, or turn on cloud mode with a server that has its own key.');
-      return;
-    }
-    await AsyncStorage.multiSet([
-      [STORAGE_API_KEY, k],
-      [STORAGE_MODEL, m],
-      [STORAGE_CLOUD_URL, cu],
-      [STORAGE_CLOUD_TOKEN, ct],
-      [STORAGE_CLOUD_MODE, cloudModeDraft ? '1' : '0'],
-    ]);
-    setApiKey(k);
-    setModel(m);
-    setCloudUrl(cu);
-    setCloudUrlDraft(cu);
-    setCloudToken(ct);
-    setCloudMode(cm);
-    setShowSettings(false);
-    if (cu) {
-      const h = await checkCloud(cu);
-      if (cm && !h) {
-        Alert.alert('Cloud not reachable', 'Saved, but the server did not answer. Chat will use this device until it does.');
-      } else if (cm && h && h.gemini_key_on_server === false && !k) {
-        Alert.alert('No Gemini key anywhere', 'The server has no GEMINI_API_KEY secret. Add one there, or paste a key here.');
-      }
-    }
-  };
-
-  const testCloud = async () => {
-    const cu = normalizeCloudUrl(cloudUrlDraft);
-    if (!cu) {
-      Alert.alert('Cloud URL needed', 'Paste the URL your Codespace printed.');
-      return;
-    }
-    setCloudUrlDraft(cu);
-    setTesting(true);
-    try {
-      const h = await cloudHealth(cu);
-      let authNote = '';
-      if (h.auth_required) {
-        try {
-          await cloudFetch(cu, cloudTokenDraft.trim(), '/api/info', { timeoutMs: 12000 });
-          authNote = '\nToken: accepted';
-        } catch (e: any) {
-          authNote = '\nToken: ' + (e?.message || 'rejected');
-        }
-      }
-      setCloudHealthInfo(h);
-      setCloudStatus('online');
-      Alert.alert(
-        'Cloud online',
-        'Model: ' + (h.model || '?') +
-          '\nGemini key on server: ' + (h.gemini_key_on_server ? 'yes' : 'no') +
-          '\nToken required: ' + (h.auth_required ? 'yes' : 'no') + authNote,
-      );
-    } catch (e: any) {
-      setCloudStatus('offline');
-      Alert.alert('Cloud not reachable', e?.message || String(e));
-    } finally {
-      setTesting(false);
-    }
-  };
+    if (loaded) AsyncStorage.setItem(STORAGE_CHAT, JSON.stringify(messages.slice(-Math.max(10, settings.historyLimit))));
+  }, [messages, loaded, settings.historyLimit]);
 
   const clearChat = () => {
     Alert.alert('Clear chat', 'Delete the whole conversation?', [
@@ -841,20 +1011,22 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
     if (!text || busy) return;
     const useCloud = cloudMode && !!cloudUrl;
     if (!apiKey && !useCloud) {
-      setShowSettings(true);
+      openSettings();
       return;
     }
+    if (settings.haptics) Vibration.vibrate(10);
     const userMsg: ChatMessage = { id: uid(), role: 'user', text, ts: Date.now() };
     const next = [...messages, userMsg];
     setMessages(next);
     setInput('');
     setBusy(true);
+    const ctx = profileContext(settings);
     try {
       let result: { reply: PulseReply; modelUsed: string } | null = null;
       let source: 'cloud' | 'device' = 'device';
       if (useCloud) {
         try {
-          result = await callCloudChat(cloudUrl, cloudToken, keyForCloud(), next);
+          result = await callCloudChat(cloudUrl, cloudToken, keyForCloud(), next, ctx);
           source = 'cloud';
           setCloudStatus('online');
         } catch (cloudErr: any) {
@@ -872,13 +1044,11 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
         }
       }
       if (!result) {
-        result = await callGemini(apiKey, model, next);
+        result = await callGemini(apiKey, model, next, ctx, settings.temperature);
       }
       const { reply, modelUsed } = result;
-      if (source === 'device' && modelUsed !== model) {
-        setModel(modelUsed);
-        setModelDraft(modelUsed);
-        AsyncStorage.setItem(STORAGE_MODEL, modelUsed);
+      if (source === 'device' && modelUsed && modelUsed !== model) {
+        patchSettings({ model: modelUsed });
       }
       const botMsg: ChatMessage = {
         id: uid(),
@@ -902,13 +1072,13 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
 
   const cloudPlan = async (reply: PulseReply) => {
     if (!cloudUrl) {
-      setShowSettings(true);
+      openSettings();
       return;
     }
     if (busy) return;
     setBusy(true);
     const now = new Date();
-    const start = pad(now.getHours() + (now.getMinutes() > 0 ? 1 : 0)) + ':00';
+    const start = pad((now.getHours() + (now.getMinutes() > 0 ? 1 : 0)) % 24) + ':00';
     try {
       const run = await runCloudTask(cloudUrl, cloudToken, keyForCloud(), 'plan', {
         summary: reply.one_line_summary || reply.direct_response.slice(0, 300),
@@ -947,7 +1117,7 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
       ? '☁️ Cloud · ' + (cloudStatus === 'online' ? 'online' : cloudStatus === 'checking' ? 'checking…' : 'offline')
       : apiKey
         ? 'Model: ' + model
-        : 'No API key set';
+        : 'Set up a Gemini key or cloud in Settings';
 
   if (!loaded) {
     return (
@@ -973,7 +1143,7 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
           </Text>
         </Pressable>
         <View style={{ flexDirection: 'row', gap: 8 }}>
-          <Pressable onPress={() => setShowSettings((s) => !s)} style={styles.chip}>
+          <Pressable onPress={openSettings} style={styles.chip}>
             <Text style={styles.chipText}>⚙️ Settings</Text>
           </Pressable>
           <Pressable onPress={clearChat} style={styles.chip}>
@@ -981,80 +1151,6 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
           </Pressable>
         </View>
       </View>
-
-      {showSettings ? (
-        <View style={styles.settings}>
-          <Text style={styles.settingsTitle}>Gemini API key</Text>
-          <Text style={styles.mutedSmall}>
-            Stored only on this device. Optional when your cloud server has its own key.
-          </Text>
-          <TextInput
-            value={keyDraft}
-            onChangeText={setKeyDraft}
-            placeholder="AIza..."
-            placeholderTextColor={C.muted}
-            secureTextEntry
-            autoCapitalize="none"
-            autoCorrect={false}
-            style={styles.input}
-          />
-          <Text style={[styles.settingsTitle, { marginTop: 8 }]}>Model</Text>
-          <TextInput
-            value={modelDraft}
-            onChangeText={setModelDraft}
-            placeholder={DEFAULT_MODEL}
-            placeholderTextColor={C.muted}
-            autoCapitalize="none"
-            autoCorrect={false}
-            style={styles.input}
-          />
-
-          <View style={styles.divider} />
-          <View style={styles.rowBetween}>
-            <Text style={styles.settingsTitle}>☁️ Cloud backend</Text>
-            <View style={styles.rowCenter}>
-              <Text style={styles.mutedSmall}>{cloudModeDraft ? 'Chat via cloud' : 'Off'}</Text>
-              <Switch
-                value={cloudModeDraft}
-                onValueChange={setCloudModeDraft}
-                trackColor={{ false: C.border, true: C.accent }}
-                thumbColor="#fff"
-              />
-            </View>
-          </View>
-          <Text style={styles.mutedSmall}>
-            Paste the URL your Codespace prints (https://NAME-3000.app.github.dev), or just the Codespace name.
-          </Text>
-          <TextInput
-            value={cloudUrlDraft}
-            onChangeText={setCloudUrlDraft}
-            placeholder="https://your-codespace-3000.app.github.dev"
-            placeholderTextColor={C.muted}
-            autoCapitalize="none"
-            autoCorrect={false}
-            keyboardType="url"
-            style={styles.input}
-          />
-          <TextInput
-            value={cloudTokenDraft}
-            onChangeText={setCloudTokenDraft}
-            placeholder="PULSE_TOKEN (if the server has one)"
-            placeholderTextColor={C.muted}
-            secureTextEntry
-            autoCapitalize="none"
-            autoCorrect={false}
-            style={styles.input}
-          />
-          <View style={{ flexDirection: 'row', gap: 8 }}>
-            <Pressable onPress={testCloud} disabled={testing} style={[styles.secondaryBtn, { flex: 1 }]}>
-              {testing ? <ActivityIndicator color={C.text} /> : <Text style={styles.primaryBtnText}>Test connection</Text>}
-            </Pressable>
-            <Pressable onPress={saveSettings} style={[styles.primaryBtn, { flex: 1, marginTop: 0 }]}>
-              <Text style={styles.primaryBtnText}>Save</Text>
-            </Pressable>
-          </View>
-        </View>
-      ) : null}
 
       <FlatList
         ref={listRef}
@@ -1064,10 +1160,17 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
         onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
         ListEmptyComponent={
           <View style={styles.empty}>
-            <Text style={styles.emptyTitle}>What's on your plate?</Text>
+            <Text style={styles.emptyTitle}>
+              {settings.name.trim() ? 'What\'s on your plate, ' + settings.name.trim().split(' ')[0] + '?' : 'What\'s on your plate?'}
+            </Text>
             <Text style={styles.muted}>
               Try: "Plan my week around a Friday exam" or "Help me budget for a trip to Goa".
             </Text>
+            {!apiKey && !(cloudMode && cloudUrl) ? (
+              <Pressable onPress={openSettings} style={[styles.primaryBtn, { paddingHorizontal: 18 }]}>
+                <Text style={styles.primaryBtnText}>Open Settings to get started</Text>
+              </Pressable>
+            ) : null}
           </View>
         }
         renderItem={({ item }) => (
@@ -1079,7 +1182,7 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
         <TextInput
           value={input}
           onChangeText={setInput}
-          placeholder={apiKey || (cloudMode && cloudUrl) ? 'Ask Pulse anything…' : 'Add a Gemini key or cloud URL first'}
+          placeholder={apiKey || (cloudMode && cloudUrl) ? 'Ask Pulse anything…' : 'Add a Gemini key or cloud URL in Settings'}
           placeholderTextColor={C.muted}
           style={styles.composerInput}
           multiline
@@ -1303,10 +1406,19 @@ function normalizeUrl(raw: string): string {
   return searchUrl(s);
 }
 
-function WorkspaceScreen({ say }: { say: (t: string) => void }) {
+function WorkspaceScreen({
+  say,
+  homeUrl,
+  confirmFirst,
+}: {
+  say: (t: string) => void;
+  homeUrl: string;
+  confirmFirst: boolean;
+}) {
+  const home = normalizeUrl(homeUrl || HOME_URL);
   const webRef = useRef<WebView>(null);
-  const [url, setUrl] = useState(HOME_URL);
-  const [field, setField] = useState(HOME_URL);
+  const [url, setUrl] = useState(home);
+  const [field, setField] = useState(home);
   const [canBack, setCanBack] = useState(false);
   const [loading, setLoading] = useState(false);
   const [title, setTitle] = useState('');
@@ -1322,21 +1434,23 @@ function WorkspaceScreen({ say }: { say: (t: string) => void }) {
 
   const confirmComplete = () => {
     const label = title || field;
+    const markDone = () => {
+      setCompleted((prev) => [{ title: label, url: field, ts: Date.now() }, ...prev].slice(0, 20));
+      say('Task complete: ' + label);
+    };
+    if (!confirmFirst) {
+      markDone();
+      return;
+    }
     Alert.alert('Confirm task complete', 'Mark "' + label + '" as done?', [
       { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Confirm',
-        onPress: () => {
-          setCompleted((prev) => [{ title: label, url: field, ts: Date.now() }, ...prev].slice(0, 20));
-          say('Task complete: ' + label);
-        },
-      },
+      { text: 'Confirm', onPress: markDone },
     ]);
   };
 
   const close = () => {
-    setUrl(HOME_URL);
-    setField(HOME_URL);
+    setUrl(home);
+    setField(home);
     setTitle('');
   };
 
@@ -1401,6 +1515,291 @@ function WorkspaceScreen({ say }: { say: (t: string) => void }) {
         </Pressable>
       </View>
     </View>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* SETTINGS (Profile · Assistant · Cloud · Voice · Workspace · Updates) */
+/* ------------------------------------------------------------------ */
+
+const AVATARS = ['⚡', '🧠', '🚀', '🦊', '🐼', '🐱', '🔥', '🌙', '🎯', '💡', '😎', '🙂'];
+const REPLY_LENGTHS: Settings['replyLength'][] = ['short', 'balanced', 'detailed'];
+
+function SettingRow({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  return (
+    <View style={styles.settingRow}>
+      <View style={{ flex: 1, paddingRight: 10 }}>
+        <Text style={styles.settingLabel}>{label}</Text>
+        {hint ? <Text style={styles.mutedSmall}>{hint}</Text> : null}
+      </View>
+      {children}
+    </View>
+  );
+}
+
+function Stepper({ value, onChange, step, min, max, suffix }: { value: number; onChange: (n: number) => void; step: number; min: number; max: number; suffix?: string }) {
+  const set = (n: number) => onChange(Math.max(min, Math.min(max, Math.round(n * 100) / 100)));
+  return (
+    <View style={styles.stepper}>
+      <Pressable onPress={() => set(value - step)} style={styles.stepBtn}><Text style={styles.stepBtnText}>−</Text></Pressable>
+      <Text style={styles.stepValue}>{value}{suffix || ''}</Text>
+      <Pressable onPress={() => set(value + step)} style={styles.stepBtn}><Text style={styles.stepBtnText}>+</Text></Pressable>
+    </View>
+  );
+}
+
+function SettingsScreen({
+  settings,
+  patchSettings,
+  update,
+  setUpdate,
+}: {
+  settings: Settings;
+  patchSettings: (p: Partial<Settings>) => void;
+  update: UpdateInfo | null;
+  setUpdate: (u: UpdateInfo | null) => void;
+}) {
+  const s = settings;
+  const [testing, setTesting] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [installing, setInstalling] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [checkMsg, setCheckMsg] = useState('');
+
+  const testCloud = async () => {
+    const cu = normalizeCloudUrl(s.cloudUrl);
+    if (!cu) {
+      Alert.alert('Cloud URL needed', 'Paste the URL your Codespace printed.');
+      return;
+    }
+    patchSettings({ cloudUrl: cu });
+    setTesting(true);
+    try {
+      const h = await cloudHealth(cu);
+      let authNote = '';
+      if (h.auth_required) {
+        try {
+          await cloudFetch(cu, s.cloudToken.trim(), '/api/info', { timeoutMs: 12000 });
+          authNote = '\nToken: accepted';
+        } catch (e: any) {
+          authNote = '\nToken: ' + (e?.message || 'rejected');
+        }
+      }
+      Alert.alert(
+        'Cloud online',
+        'Model: ' + (h.model || '?') +
+          '\nGemini key on server: ' + (h.gemini_key_on_server ? 'yes' : 'no') +
+          '\nToken required: ' + (h.auth_required ? 'yes' : 'no') + authNote,
+      );
+    } catch (e: any) {
+      Alert.alert('Cloud not reachable', e?.message || String(e));
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const check = async () => {
+    setChecking(true);
+    setCheckMsg('');
+    try {
+      const info = await checkForUpdate(s.updateRepo, s.updateToken);
+      setUpdate(info.available ? info : null);
+      setCheckMsg(
+        info.available
+          ? 'Update available: build ' + info.latestBuild + ' (you have ' + info.currentBuild + ').'
+          : 'You are on the latest build (' + info.currentBuild + ').',
+      );
+    } catch (e: any) {
+      setCheckMsg('');
+      Alert.alert('Update check failed', e?.message || String(e));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const install = async () => {
+    if (!update) return;
+    setInstalling(true);
+    setProgress(0);
+    try {
+      await downloadAndInstall(update, s.updateToken, setProgress);
+      setCheckMsg('Installer opened. Approve the install to finish.');
+    } catch (e: any) {
+      Alert.alert('Install failed', e?.message || String(e));
+    } finally {
+      setInstalling(false);
+    }
+  };
+
+  const cur = currentBuildNumber();
+
+  return (
+    <ScrollView contentContainerStyle={{ padding: 16, gap: 14, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
+      <Text style={styles.sectionTitle}>Settings</Text>
+
+      {/* Profile */}
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>👤 Profile</Text>
+        <View style={styles.profileRow}>
+          <View style={styles.avatarBig}><Text style={{ fontSize: 30 }}>{s.avatar}</Text></View>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.profileName}>{s.name.trim() || 'Your name'}</Text>
+            <Text style={styles.mutedSmall}>{s.role.trim() || 'Add a role or headline'}</Text>
+          </View>
+        </View>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingVertical: 6 }}>
+          {AVATARS.map((a) => (
+            <Pressable key={a} onPress={() => patchSettings({ avatar: a })} style={[styles.emojiPick, s.avatar === a && styles.emojiPickOn]}>
+              <Text style={{ fontSize: 20 }}>{a}</Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+        <Text style={styles.fieldLabel}>Name</Text>
+        <TextInput value={s.name} onChangeText={(t) => patchSettings({ name: t })} placeholder="e.g. Alex" placeholderTextColor={C.muted} style={styles.input} />
+        <Text style={styles.fieldLabel}>Email</Text>
+        <TextInput value={s.email} onChangeText={(t) => patchSettings({ email: t })} placeholder="you@example.com" placeholderTextColor={C.muted} autoCapitalize="none" keyboardType="email-address" style={styles.input} />
+        <Text style={styles.fieldLabel}>Role / headline</Text>
+        <TextInput value={s.role} onChangeText={(t) => patchSettings({ role: t })} placeholder="e.g. CS student, building a startup" placeholderTextColor={C.muted} style={styles.input} />
+        <SettingRow label="Personalize replies" hint="Let Pulse use your profile for context">
+          <Switch value={s.personalize} onValueChange={(v) => patchSettings({ personalize: v })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
+        </SettingRow>
+        <SettingRow label="Daily focus goal" hint="Minutes of deep work">
+          <Stepper value={s.focusGoalMin} onChange={(n) => patchSettings({ focusGoalMin: n })} step={15} min={0} max={720} suffix="m" />
+        </SettingRow>
+      </View>
+
+      {/* Assistant */}
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>🧠 Assistant</Text>
+        <Text style={styles.mutedSmall}>Gemini API key — stored only on this device. Free at aistudio.google.com.</Text>
+        <TextInput value={s.apiKey} onChangeText={(t) => patchSettings({ apiKey: t })} placeholder="AIza…" placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} style={styles.input} />
+        <Text style={styles.fieldLabel}>Model</Text>
+        <TextInput value={s.model} onChangeText={(t) => patchSettings({ model: t })} placeholder={DEFAULT_MODEL} placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} style={styles.input} />
+        <Text style={styles.fieldLabel}>Reply length</Text>
+        <View style={styles.segment}>
+          {REPLY_LENGTHS.map((r) => (
+            <Pressable key={r} onPress={() => patchSettings({ replyLength: r })} style={[styles.segItem, s.replyLength === r && styles.segItemOn]}>
+              <Text style={[styles.segText, s.replyLength === r && styles.segTextOn]}>{r.charAt(0).toUpperCase() + r.slice(1)}</Text>
+            </Pressable>
+          ))}
+        </View>
+        <SettingRow label="Creativity" hint="Model temperature">
+          <Stepper value={s.temperature} onChange={(n) => patchSettings({ temperature: n })} step={0.1} min={0} max={1} />
+        </SettingRow>
+        <SettingRow label="Chat history kept" hint="Messages stored on device">
+          <Stepper value={s.historyLimit} onChange={(n) => patchSettings({ historyLimit: n })} step={10} min={10} max={200} />
+        </SettingRow>
+      </View>
+
+      {/* Cloud */}
+      <View style={styles.settingsCard}>
+        <View style={styles.rowBetween}>
+          <Text style={styles.cardTitle}>☁️ Cloud backend</Text>
+          <Switch value={s.cloudMode} onValueChange={(v) => patchSettings({ cloudMode: v && !!s.cloudUrl })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
+        </View>
+        <Text style={styles.mutedSmall}>Route chat through your own server. Paste the Codespace URL (https://NAME-3000.app.github.dev) or just the name.</Text>
+        <TextInput value={s.cloudUrl} onChangeText={(t) => patchSettings({ cloudUrl: t })} onBlur={() => patchSettings({ cloudUrl: normalizeCloudUrl(s.cloudUrl) })} placeholder="https://your-codespace-3000.app.github.dev" placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} keyboardType="url" style={styles.input} />
+        <TextInput value={s.cloudToken} onChangeText={(t) => patchSettings({ cloudToken: t })} placeholder="PULSE_TOKEN (if the server has one)" placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} style={styles.input} />
+        <Pressable onPress={testCloud} disabled={testing} style={styles.secondaryBtn}>
+          {testing ? <ActivityIndicator color={C.text} /> : <Text style={styles.primaryBtnText}>Test connection</Text>}
+        </Pressable>
+      </View>
+
+      {/* Voice */}
+      <View style={styles.settingsCard}>
+        <View style={styles.rowBetween}>
+          <Text style={styles.cardTitle}>🔊 Voice readout</Text>
+          <Switch
+            value={s.voiceOn}
+            onValueChange={(v) => {
+              patchSettings({ voiceOn: v });
+              if (v) speakWith({ ...s, voiceOn: true }, 'Voice readout on.');
+              else Speech.stop();
+            }}
+            trackColor={{ false: C.border, true: C.accent }}
+            thumbColor="#fff"
+          />
+        </View>
+        <Text style={styles.mutedSmall}>Reads summaries and reminders aloud.</Text>
+        <SettingRow label="Speed">
+          <Stepper value={s.voiceRate} onChange={(n) => patchSettings({ voiceRate: n })} step={0.1} min={0.5} max={2} />
+        </SettingRow>
+        <SettingRow label="Pitch">
+          <Stepper value={s.voicePitch} onChange={(n) => patchSettings({ voicePitch: n })} step={0.1} min={0.5} max={2} />
+        </SettingRow>
+        <Text style={styles.fieldLabel}>Language code</Text>
+        <TextInput value={s.voiceLang} onChangeText={(t) => patchSettings({ voiceLang: t })} placeholder="en-US" placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} style={styles.input} />
+        <Pressable onPress={() => speakWith(settings, 'This is how Pulse will read your tasks aloud.')} style={styles.secondaryBtn}>
+          <Text style={styles.primaryBtnText}>Preview voice</Text>
+        </Pressable>
+      </View>
+
+      {/* Workspace & chat */}
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>🌐 Workspace & chat</Text>
+        <Text style={styles.fieldLabel}>Workspace home page</Text>
+        <TextInput value={s.homeUrl} onChangeText={(t) => patchSettings({ homeUrl: t })} placeholder="https://www.google.com" placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} keyboardType="url" style={styles.input} />
+        <SettingRow label="Confirm before marking done" hint="Ask before completing a task">
+          <Switch value={s.confirmBeforeComplete} onValueChange={(v) => patchSettings({ confirmBeforeComplete: v })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
+        </SettingRow>
+        <SettingRow label="Haptics" hint="Vibrate when sending">
+          <Switch value={s.haptics} onValueChange={(v) => patchSettings({ haptics: v })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
+        </SettingRow>
+      </View>
+
+      {/* Updates */}
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>⬇️ App updates</Text>
+        <Text style={styles.mutedSmall}>Pulse OS installs outside the Play Store, so it updates itself from GitHub Releases. You're on build {cur}.</Text>
+        <Text style={styles.fieldLabel}>Release source (owner/repo)</Text>
+        <TextInput value={s.updateRepo} onChangeText={(t) => patchSettings({ updateRepo: t })} placeholder={DEFAULT_UPDATE_REPO} placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} style={styles.input} />
+        <Text style={styles.fieldLabel}>GitHub token (needed for a private repo)</Text>
+        <TextInput value={s.updateToken} onChangeText={(t) => patchSettings({ updateToken: t })} placeholder="ghp_… (read-only)" placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} style={styles.input} />
+        <SettingRow label="Check on launch" hint="Look for updates when the app opens">
+          <Switch value={s.autoCheckUpdates} onValueChange={(v) => patchSettings({ autoCheckUpdates: v })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
+        </SettingRow>
+        <Pressable onPress={check} disabled={checking || installing} style={styles.secondaryBtn}>
+          {checking ? <ActivityIndicator color={C.text} /> : <Text style={styles.primaryBtnText}>Check for updates</Text>}
+        </Pressable>
+        {checkMsg ? <Text style={[styles.mutedSmall, { marginTop: 6 }]}>{checkMsg}</Text> : null}
+        {update ? (
+          <View style={styles.updateBox}>
+            <Text style={styles.updateHead}>{update.name || ('Build ' + update.latestBuild)}</Text>
+            <Text style={styles.mutedSmall}>
+              {formatBytes(update.sizeBytes)}{update.sizeBytes ? ' · ' : ''}build {update.latestBuild}
+            </Text>
+            {update.notes ? <Text style={[styles.mutedSmall, { marginTop: 6 }]} numberOfLines={6}>{update.notes}</Text> : null}
+            {installing ? (
+              <View style={styles.progressTrack}><View style={[styles.progressFill, { width: (Math.round(progress * 100) + '%') as any }]} /></View>
+            ) : null}
+            <Pressable onPress={install} disabled={installing} style={[styles.primaryBtn, { marginTop: 10 }]}>
+              <Text style={styles.primaryBtnText}>{installing ? 'Downloading ' + Math.round(progress * 100) + '%' : '⬇️ Download & install'}</Text>
+            </Pressable>
+          </View>
+        ) : null}
+        <Text style={[styles.mutedSmall, { marginTop: 8 }]}>Android will ask you to allow installs from Pulse OS the first time.</Text>
+      </View>
+
+      {/* About */}
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>ℹ️ About</Text>
+        <Text style={styles.mutedSmall}>
+          {(Application.applicationName || 'Pulse OS')} v{Application.nativeApplicationVersion || '1.0.0'} (build {cur})
+        </Text>
+        <Text style={styles.mutedSmall}>Package: {Application.applicationId || 'com.pulseos.app'}</Text>
+        <Pressable
+          onPress={() =>
+            Alert.alert('Reset settings', 'Restore every setting to its default? Your chat history stays.', [
+              { text: 'Cancel', style: 'cancel' },
+              { text: 'Reset', style: 'destructive', onPress: () => patchSettings({ ...DEFAULT_SETTINGS }) },
+            ])
+          }
+          style={[styles.secondaryBtn, { borderColor: C.danger, marginTop: 8 }]}
+        >
+          <Text style={[styles.primaryBtnText, { color: C.danger }]}>Reset all settings</Text>
+        </Pressable>
+      </View>
+    </ScrollView>
   );
 }
 
@@ -1520,6 +1919,39 @@ const styles = StyleSheet.create({
   rowCenter: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   sourceTag: { color: C.accent2, fontSize: 11, fontWeight: '700', marginTop: 6 },
   cloudBtn: { borderColor: C.accent2 },
+  avatarSmall: {
+    width: 34, height: 34, borderRadius: 17, backgroundColor: C.panel2, borderWidth: 1, borderColor: C.border,
+    alignItems: 'center', justifyContent: 'center', marginRight: 10,
+  },
+  avatarBig: {
+    width: 60, height: 60, borderRadius: 30, backgroundColor: C.panel2, borderWidth: 2, borderColor: C.accent,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  profileRow: { flexDirection: 'row', alignItems: 'center', gap: 14, marginBottom: 4 },
+  profileName: { color: C.text, fontSize: 18, fontWeight: '800' },
+  emojiPick: { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center', backgroundColor: C.panel2, borderWidth: 1, borderColor: C.border },
+  emojiPickOn: { borderColor: C.accent, backgroundColor: '#2A1F5C' },
+  settingsCard: { backgroundColor: C.panel, borderRadius: 16, borderWidth: 1, borderColor: C.border, padding: 14, gap: 8 },
+  cardTitle: { color: C.text, fontSize: 15, fontWeight: '800' },
+  fieldLabel: { color: C.muted, fontSize: 12, fontWeight: '700', marginTop: 4 },
+  settingRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 4 },
+  settingLabel: { color: C.text, fontSize: 14, fontWeight: '600' },
+  stepper: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  stepBtn: { width: 32, height: 32, borderRadius: 8, backgroundColor: C.panel2, borderWidth: 1, borderColor: C.border, alignItems: 'center', justifyContent: 'center' },
+  stepBtnText: { color: C.text, fontSize: 18, fontWeight: '700' },
+  stepValue: { color: C.text, minWidth: 44, textAlign: 'center', fontWeight: '700' },
+  segment: { flexDirection: 'row', backgroundColor: C.panel2, borderRadius: 10, padding: 3, borderWidth: 1, borderColor: C.border },
+  segItem: { flex: 1, paddingVertical: 8, borderRadius: 8, alignItems: 'center' },
+  segItemOn: { backgroundColor: C.accent },
+  segText: { color: C.muted, fontWeight: '700', fontSize: 13 },
+  segTextOn: { color: '#fff' },
+  updateBanner: { backgroundColor: '#123524', borderBottomWidth: 1, borderBottomColor: C.good, paddingHorizontal: 14, paddingVertical: 8 },
+  updateBannerText: { color: C.text, fontSize: 13, fontWeight: '600' },
+  updateBox: { marginTop: 8, padding: 12, borderRadius: 12, backgroundColor: C.panel2, borderWidth: 1, borderColor: C.good },
+  updateHead: { color: C.text, fontWeight: '800', fontSize: 15 },
+  progressTrack: { height: 6, borderRadius: 3, backgroundColor: C.border, marginTop: 10, overflow: 'hidden' },
+  progressFill: { height: 6, backgroundColor: C.good },
+  tabBadge: { width: 6, height: 6, borderRadius: 3, backgroundColor: C.good, marginTop: 3 },
 
   empty: { padding: 24, alignItems: 'center', gap: 8, marginTop: 40 },
   emptyTitle: { color: C.text, fontSize: 18, fontWeight: '700' },
