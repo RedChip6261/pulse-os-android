@@ -925,22 +925,20 @@ function buildFromTag(tag: string): number {
 
 async function checkForUpdate(repo: string, token: string): Promise<UpdateInfo> {
   const r = repo.trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\/+$/, '');
-  if (!/^[\w.-]+\/[\w.-]+$/.test(r)) throw new Error('Update source must look like owner/repo.');
+  if (!/^[\w.-]+\/[\w.-]+$/.test(r)) throw new Error('Update server is not set up.');
   const headers: Record<string, string> = { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
   if (token.trim()) headers.Authorization = 'Bearer ' + token.trim();
-  const res = await fetch('https://api.github.com/repos/' + r + '/releases/latest', { headers });
-  if (res.status === 404) {
-    throw new Error(
-      token.trim()
-        ? 'No release found yet. The next successful build publishes one.'
-        : 'No release found. If the repo is private, add a read-only GitHub token in Updates.',
-    );
+  let res: Response;
+  try {
+    res = await fetch('https://api.github.com/repos/' + r + '/releases/latest', { headers });
+  } catch {
+    throw new Error('No internet connection. Try again.');
   }
-  if (res.status === 401 || res.status === 403) throw new Error('GitHub refused the token (HTTP ' + res.status + ').');
-  if (!res.ok) throw new Error('GitHub HTTP ' + res.status);
+  if (res.status === 404) throw new Error('Update server unavailable right now.');
+  if (!res.ok) throw new Error('Couldn\'t check for updates (' + res.status + '). Try again later.');
   const rel: any = await res.json();
   const asset = (rel.assets || []).find((a: any) => /\.apk$/i.test(String(a?.name)));
-  if (!asset) throw new Error('The latest release has no APK attached.');
+  if (!asset) throw new Error('Update server unavailable right now.');
   const latestBuild = buildFromTag(rel.tag_name);
   const currentBuild = currentBuildNumber();
   return {
@@ -1006,8 +1004,8 @@ export default function App() {
     loadSettings().then((s) => {
       settingsRef.current = s;
       setSettings(s);
-      if (s.autoCheckUpdates && s.updateRepo) {
-        checkForUpdate(s.updateRepo, s.updateToken)
+      if (s.autoCheckUpdates) {
+        checkForUpdate(DEFAULT_UPDATE_REPO, s.updateToken)
           .then((u) => setUpdate(u.available ? u : null))
           .catch(() => undefined);
       }
@@ -1781,6 +1779,7 @@ function SettingsScreen({
   const [installing, setInstalling] = useState(false);
   const [progress, setProgress] = useState(0);
   const [checkMsg, setCheckMsg] = useState('');
+  const [checkState, setCheckState] = useState<'ok' | 'new' | 'error' | ''>('');
 
   const testCloud = async () => {
     const cu = normalizeCloudUrl(s.cloudUrl);
@@ -1817,17 +1816,16 @@ function SettingsScreen({
   const check = async () => {
     setChecking(true);
     setCheckMsg('');
+    setCheckState('');
     try {
-      const info = await checkForUpdate(s.updateRepo, s.updateToken);
+      const info = await checkForUpdate(DEFAULT_UPDATE_REPO, s.updateToken);
       setUpdate(info.available ? info : null);
-      setCheckMsg(
-        info.available
-          ? 'Update available: build ' + info.latestBuild + ' (you have ' + info.currentBuild + ').'
-          : 'You are on the latest build (' + info.currentBuild + ').',
-      );
+      setCheckState(info.available ? 'new' : 'ok');
+      setCheckMsg(info.available ? 'A new version is available.' : '✓ You\'re up to date.');
     } catch (e: any) {
-      setCheckMsg('');
-      Alert.alert('Update check failed', e?.message || String(e));
+      setUpdate(null);
+      setCheckState('error');
+      setCheckMsg(e?.message || 'Couldn\'t check for updates. Try again.');
     } finally {
       setChecking(false);
     }
@@ -1839,9 +1837,11 @@ function SettingsScreen({
     setProgress(0);
     try {
       await downloadAndInstall(update, s.updateToken, setProgress);
-      setCheckMsg('Installer opened. Approve the install to finish.');
+      setCheckState('ok');
+      setCheckMsg('Tap Install on the next screen to finish.');
     } catch (e: any) {
-      Alert.alert('Install failed', e?.message || String(e));
+      setCheckState('error');
+      setCheckMsg('Update failed: ' + (e?.message || String(e)));
     } finally {
       setInstalling(false);
     }
@@ -1989,34 +1989,28 @@ function SettingsScreen({
       {/* Updates */}
       <View style={styles.settingsCard}>
         <Text style={styles.cardTitle}>⬇️ App updates</Text>
-        <Text style={styles.mutedSmall}>Pulse OS installs outside the Play Store, so it updates itself from GitHub Releases. You're on build {cur}.</Text>
-        <Text style={styles.fieldLabel}>Release source (owner/repo)</Text>
-        <TextInput value={s.updateRepo} onChangeText={(t) => patchSettings({ updateRepo: t })} placeholder={DEFAULT_UPDATE_REPO} placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} style={styles.input} />
-        <Text style={styles.fieldLabel}>GitHub token (needed for a private repo)</Text>
-        <TextInput value={s.updateToken} onChangeText={(t) => patchSettings({ updateToken: t })} placeholder="ghp_… (read-only)" placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} style={styles.input} />
-        <SettingRow label="Check on launch" hint="Look for updates when the app opens">
-          <Switch value={s.autoCheckUpdates} onValueChange={(v) => patchSettings({ autoCheckUpdates: v })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
-        </SettingRow>
-        <Pressable onPress={check} disabled={checking || installing} style={styles.secondaryBtn}>
-          {checking ? <ActivityIndicator color={C.text} /> : <Text style={styles.primaryBtnText}>Check for updates</Text>}
+        <Text style={styles.mutedSmall}>Version {Application.nativeApplicationVersion || '2.0.0'} (build {cur})</Text>
+        <Pressable onPress={check} disabled={checking || installing} style={styles.primaryBtn}>
+          {checking ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Check for updates</Text>}
         </Pressable>
-        {checkMsg ? <Text style={[styles.mutedSmall, { marginTop: 6 }]}>{checkMsg}</Text> : null}
+        {checkMsg ? (
+          <Text style={[styles.updateResult, checkState === 'ok' && { color: C.good }, checkState === 'error' && { color: C.danger }]}>
+            {checkMsg}
+          </Text>
+        ) : null}
         {update ? (
           <View style={styles.updateBox}>
-            <Text style={styles.updateHead}>{update.name || ('Build ' + update.latestBuild)}</Text>
-            <Text style={styles.mutedSmall}>
-              {formatBytes(update.sizeBytes)}{update.sizeBytes ? ' · ' : ''}build {update.latestBuild}
-            </Text>
-            {update.notes ? <Text style={[styles.mutedSmall, { marginTop: 6 }]} numberOfLines={6}>{update.notes}</Text> : null}
+            <Text style={styles.updateHead}>New version ready · build {update.latestBuild}</Text>
+            {update.sizeBytes ? <Text style={styles.mutedSmall}>{formatBytes(update.sizeBytes)}</Text> : null}
+            {update.notes ? <Text style={[styles.mutedSmall, { marginTop: 6 }]} numberOfLines={4}>What's new: {update.notes}</Text> : null}
             {installing ? (
               <View style={styles.progressTrack}><View style={[styles.progressFill, { width: (Math.round(progress * 100) + '%') as any }]} /></View>
             ) : null}
-            <Pressable onPress={install} disabled={installing} style={[styles.primaryBtn, { marginTop: 10 }]}>
-              <Text style={styles.primaryBtnText}>{installing ? 'Downloading ' + Math.round(progress * 100) + '%' : '⬇️ Download & install'}</Text>
+            <Pressable onPress={install} disabled={installing} style={[styles.primaryBtn, { marginTop: 10, backgroundColor: C.good }]}>
+              <Text style={styles.primaryBtnText}>{installing ? 'Downloading ' + Math.round(progress * 100) + '%' : 'Update now'}</Text>
             </Pressable>
           </View>
         ) : null}
-        <Text style={[styles.mutedSmall, { marginTop: 8 }]}>Android will ask you to allow installs from Pulse OS the first time.</Text>
       </View>
 
       {/* About */}
@@ -2186,6 +2180,7 @@ const styles = StyleSheet.create({
   segTextOn: { color: '#fff' },
   updateBanner: { backgroundColor: '#123524', borderBottomWidth: 1, borderBottomColor: C.good, paddingHorizontal: 14, paddingVertical: 8 },
   updateBannerText: { color: C.text, fontSize: 13, fontWeight: '600' },
+  updateResult: { color: C.muted, fontSize: 14, fontWeight: '600', marginTop: 8, textAlign: 'center' },
   updateBox: { marginTop: 8, padding: 12, borderRadius: 12, backgroundColor: C.panel2, borderWidth: 1, borderColor: C.good },
   updateHead: { color: C.text, fontWeight: '800', fontSize: 15 },
   progressTrack: { height: 6, borderRadius: 3, backgroundColor: C.border, marginTop: 10, overflow: 'hidden' },
