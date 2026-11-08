@@ -1,0 +1,22 @@
+{
+  "expo": {
+    "name": "Pulse OS",
+    "slug": "pulse-os",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0B0F17",
+    "newArchEnabled": true,
+    "platforms": ["android"],
+    "splash": {
+      "backgroundColor": "#0B0F17",
+      "resizeMode": "contain"
+    },
+    "android": {
+      "package": "com.pulseos.app",
+      "versionCode": 1,
+      "permissions": ["INTERNET"],
+      "softwareKeyboardLayoutMode": "resize"
+    }
+  }
+}
