@@ -11,6 +11,7 @@ import {
   ScrollView,
   StatusBar as RNStatusBar,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
@@ -45,6 +46,12 @@ const STORAGE_API_KEY = 'pulseos.gemini_api_key';
 const STORAGE_MODEL = 'pulseos.gemini_model';
 const STORAGE_VOICE = 'pulseos.voice_enabled';
 const STORAGE_CHAT = 'pulseos.chat_history';
+const STORAGE_CLOUD_URL = 'pulseos.cloud_url';
+const STORAGE_CLOUD_TOKEN = 'pulseos.cloud_token';
+const STORAGE_CLOUD_MODE = 'pulseos.cloud_mode';
+
+const CLOUD_PORT = 3000;
+const CLOUD_DOMAIN = 'app.github.dev';
 
 const DEFAULT_MODEL = 'gemini-flash-latest';
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
@@ -73,7 +80,18 @@ type ChatMessage = {
   role: 'user' | 'assistant' | 'error';
   text: string;
   reply?: PulseReply;
+  source?: 'cloud' | 'device';
   ts: number;
+};
+
+type CloudStatus = 'off' | 'checking' | 'online' | 'offline';
+
+type CloudHealth = {
+  ok: boolean;
+  gemini_key_on_server?: boolean;
+  auth_required?: boolean;
+  model?: string;
+  public_url?: string;
 };
 
 /* ------------------------------------------------------------------ */
@@ -210,6 +228,106 @@ async function callGemini(
     throw new Error('Gemini returned no text (' + reason + ').');
   }
   return { reply: parsePulseReply(text), modelUsed };
+}
+
+/* ---- Cloud backend (GitHub Codespaces or any HTTPS host) ---- */
+
+/**
+ * Accepts a full URL ("https://foo-3000.app.github.dev"), a host ("foo-3000.app.github.dev"),
+ * or just the Codespace name ("fluffy-space-giggle-x5r9") and returns the base URL.
+ */
+function normalizeCloudUrl(raw: string): string {
+  let s = raw.trim().replace(/\s+/g, '');
+  if (!s) return '';
+  if (/^https?:\/\//i.test(s)) return s.replace(/\/+$/, '');
+  if (s.includes('.')) return ('https://' + s).replace(/\/+$/, '');
+  if (/^[a-z0-9-]+$/i.test(s)) {
+    // A bare Codespace name: build its forwarded-port URL.
+    const name = s.replace(new RegExp('-' + CLOUD_PORT + '$'), '');
+    return 'https://' + name + '-' + CLOUD_PORT + '.' + CLOUD_DOMAIN;
+  }
+  return s;
+}
+
+async function cloudFetch(
+  base: string,
+  token: string,
+  path: string,
+  init: { method?: string; body?: unknown; geminiKey?: string; timeoutMs?: number } = {},
+): Promise<any> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), init.timeoutMs ?? 45000);
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  if (init.body !== undefined) headers['Content-Type'] = 'application/json';
+  if (token) headers.Authorization = 'Bearer ' + token;
+  if (init.geminiKey) headers['x-gemini-key'] = init.geminiKey;
+  try {
+    const res = await fetch(base + path, {
+      method: init.method ?? (init.body !== undefined ? 'POST' : 'GET'),
+      headers,
+      body: init.body !== undefined ? JSON.stringify(init.body) : undefined,
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    let json: any = null;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      // A private Codespace port answers with a GitHub sign-in page, not JSON.
+      throw new Error(
+        res.status === 401 || /<html/i.test(text)
+          ? 'Cloud URL returned a web page. Set port ' + CLOUD_PORT + ' to Public in the Codespace Ports tab.'
+          : 'Cloud returned non-JSON (HTTP ' + res.status + ').',
+      );
+    }
+    if (!res.ok || json?.ok === false) throw new Error(json?.error || 'Cloud HTTP ' + res.status);
+    return json;
+  } catch (e: any) {
+    if (e?.name === 'AbortError') throw new Error('Cloud timed out. Is the Codespace running?');
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function cloudHealth(base: string): Promise<CloudHealth> {
+  return cloudFetch(base, '', '/health', { timeoutMs: 12000 });
+}
+
+async function callCloudChat(
+  base: string,
+  token: string,
+  geminiKey: string | undefined,
+  history: ChatMessage[],
+): Promise<{ reply: PulseReply; modelUsed: string }> {
+  const messages = history
+    .filter((m) => m.role !== 'error')
+    .slice(-12)
+    .map((m) => ({
+      role: m.role === 'user' ? 'user' : 'assistant',
+      text: m.role === 'assistant' && m.reply ? JSON.stringify(m.reply) : m.text,
+    }));
+  const json = await cloudFetch(base, token, '/api/chat', { body: { messages }, geminiKey });
+  const r = json?.reply ?? {};
+  return {
+    reply: {
+      direct_response: String(r.direct_response ?? ''),
+      proactive_checklist: Array.isArray(r.proactive_checklist) ? r.proactive_checklist.map(String) : [],
+      one_line_summary: String(r.one_line_summary ?? ''),
+    },
+    modelUsed: String(json?.model ?? ''),
+  };
+}
+
+async function runCloudTask(
+  base: string,
+  token: string,
+  geminiKey: string | undefined,
+  type: string,
+  payload: unknown,
+): Promise<any> {
+  const json = await cloudFetch(base, token, '/api/task', { body: { type, payload }, geminiKey, timeoutMs: 60000 });
+  return json.run;
 }
 
 function speak(text: string) {
@@ -559,13 +677,61 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
   const [busy, setBusy] = useState(false);
   const listRef = useRef<FlatList<ChatMessage>>(null);
 
+  // Cloud backend
+  const [cloudUrl, setCloudUrl] = useState('');
+  const [cloudUrlDraft, setCloudUrlDraft] = useState('');
+  const [cloudToken, setCloudToken] = useState('');
+  const [cloudTokenDraft, setCloudTokenDraft] = useState('');
+  const [cloudMode, setCloudMode] = useState(false);
+  const [cloudModeDraft, setCloudModeDraft] = useState(false);
+  const [cloudStatus, setCloudStatus] = useState<CloudStatus>('off');
+  const [cloudHealthInfo, setCloudHealthInfo] = useState<CloudHealth | null>(null);
+  const [testing, setTesting] = useState(false);
+
+  const checkCloud = useCallback(async (base: string): Promise<CloudHealth | null> => {
+    if (!base) {
+      setCloudStatus('off');
+      setCloudHealthInfo(null);
+      return null;
+    }
+    setCloudStatus('checking');
+    try {
+      const h = await cloudHealth(base);
+      setCloudHealthInfo(h);
+      setCloudStatus('online');
+      return h;
+    } catch {
+      setCloudHealthInfo(null);
+      setCloudStatus('offline');
+      return null;
+    }
+  }, []);
+
+  // Only send the phone's key when the server says it has none of its own.
+  const keyForCloud = () => (cloudHealthInfo && cloudHealthInfo.gemini_key_on_server === false && apiKey ? apiKey : undefined);
+
   useEffect(() => {
     (async () => {
-      const [k, m, h] = await Promise.all([
+      const [k, m, h, cu, ct, cm] = await Promise.all([
         AsyncStorage.getItem(STORAGE_API_KEY),
         AsyncStorage.getItem(STORAGE_MODEL),
         AsyncStorage.getItem(STORAGE_CHAT),
+        AsyncStorage.getItem(STORAGE_CLOUD_URL),
+        AsyncStorage.getItem(STORAGE_CLOUD_TOKEN),
+        AsyncStorage.getItem(STORAGE_CLOUD_MODE),
       ]);
+      if (cu) {
+        setCloudUrl(cu);
+        setCloudUrlDraft(cu);
+      }
+      if (ct) {
+        setCloudToken(ct);
+        setCloudTokenDraft(ct);
+      }
+      const cloudOn = cm === '1' && !!cu;
+      setCloudMode(cloudOn);
+      setCloudModeDraft(cm === '1');
+      if (cu) checkCloud(cu);
       if (k) {
         setApiKey(k);
         setKeyDraft(k);
@@ -581,10 +747,10 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
           setMessages([]);
         }
       }
-      if (!k) setShowSettings(true);
+      if (!k && !cloudOn) setShowSettings(true);
       setLoaded(true);
     })();
-  }, []);
+  }, [checkCloud]);
 
   useEffect(() => {
     if (loaded) AsyncStorage.setItem(STORAGE_CHAT, JSON.stringify(messages.slice(-60)));
@@ -593,17 +759,74 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
   const saveSettings = async () => {
     const k = keyDraft.trim();
     const m = modelDraft.trim() || DEFAULT_MODEL;
-    if (!k) {
-      Alert.alert('API key needed', 'Paste your Gemini API key from Google AI Studio.');
+    const cu = normalizeCloudUrl(cloudUrlDraft);
+    const ct = cloudTokenDraft.trim();
+    const cm = cloudModeDraft && !!cu;
+    if (cloudModeDraft && !cu) {
+      Alert.alert('Cloud URL needed', 'Paste the URL your Codespace printed, or turn cloud mode off.');
+      return;
+    }
+    if (!k && !cm) {
+      Alert.alert('API key needed', 'Paste your Gemini API key, or turn on cloud mode with a server that has its own key.');
       return;
     }
     await AsyncStorage.multiSet([
       [STORAGE_API_KEY, k],
       [STORAGE_MODEL, m],
+      [STORAGE_CLOUD_URL, cu],
+      [STORAGE_CLOUD_TOKEN, ct],
+      [STORAGE_CLOUD_MODE, cloudModeDraft ? '1' : '0'],
     ]);
     setApiKey(k);
     setModel(m);
+    setCloudUrl(cu);
+    setCloudUrlDraft(cu);
+    setCloudToken(ct);
+    setCloudMode(cm);
     setShowSettings(false);
+    if (cu) {
+      const h = await checkCloud(cu);
+      if (cm && !h) {
+        Alert.alert('Cloud not reachable', 'Saved, but the server did not answer. Chat will use this device until it does.');
+      } else if (cm && h && h.gemini_key_on_server === false && !k) {
+        Alert.alert('No Gemini key anywhere', 'The server has no GEMINI_API_KEY secret. Add one there, or paste a key here.');
+      }
+    }
+  };
+
+  const testCloud = async () => {
+    const cu = normalizeCloudUrl(cloudUrlDraft);
+    if (!cu) {
+      Alert.alert('Cloud URL needed', 'Paste the URL your Codespace printed.');
+      return;
+    }
+    setCloudUrlDraft(cu);
+    setTesting(true);
+    try {
+      const h = await cloudHealth(cu);
+      let authNote = '';
+      if (h.auth_required) {
+        try {
+          await cloudFetch(cu, cloudTokenDraft.trim(), '/api/info', { timeoutMs: 12000 });
+          authNote = '\nToken: accepted';
+        } catch (e: any) {
+          authNote = '\nToken: ' + (e?.message || 'rejected');
+        }
+      }
+      setCloudHealthInfo(h);
+      setCloudStatus('online');
+      Alert.alert(
+        'Cloud online',
+        'Model: ' + (h.model || '?') +
+          '\nGemini key on server: ' + (h.gemini_key_on_server ? 'yes' : 'no') +
+          '\nToken required: ' + (h.auth_required ? 'yes' : 'no') + authNote,
+      );
+    } catch (e: any) {
+      setCloudStatus('offline');
+      Alert.alert('Cloud not reachable', e?.message || String(e));
+    } finally {
+      setTesting(false);
+    }
   };
 
   const clearChat = () => {
@@ -616,7 +839,8 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
   const send = async () => {
     const text = input.trim();
     if (!text || busy) return;
-    if (!apiKey) {
+    const useCloud = cloudMode && !!cloudUrl;
+    if (!apiKey && !useCloud) {
       setShowSettings(true);
       return;
     }
@@ -626,8 +850,32 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
     setInput('');
     setBusy(true);
     try {
-      const { reply, modelUsed } = await callGemini(apiKey, model, next);
-      if (modelUsed !== model) {
+      let result: { reply: PulseReply; modelUsed: string } | null = null;
+      let source: 'cloud' | 'device' = 'device';
+      if (useCloud) {
+        try {
+          result = await callCloudChat(cloudUrl, cloudToken, keyForCloud(), next);
+          source = 'cloud';
+          setCloudStatus('online');
+        } catch (cloudErr: any) {
+          setCloudStatus('offline');
+          if (!apiKey) throw cloudErr;
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: uid(),
+              role: 'error',
+              text: 'Cloud unavailable (' + (cloudErr?.message || 'error') + '). Answering on this device.',
+              ts: Date.now(),
+            },
+          ]);
+        }
+      }
+      if (!result) {
+        result = await callGemini(apiKey, model, next);
+      }
+      const { reply, modelUsed } = result;
+      if (source === 'device' && modelUsed !== model) {
         setModel(modelUsed);
         setModelDraft(modelUsed);
         AsyncStorage.setItem(STORAGE_MODEL, modelUsed);
@@ -637,6 +885,7 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
         role: 'assistant',
         text: reply.direct_response,
         reply,
+        source,
         ts: Date.now(),
       };
       setMessages((prev) => [...prev, botMsg]);
@@ -651,6 +900,55 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
     }
   };
 
+  const cloudPlan = async (reply: PulseReply) => {
+    if (!cloudUrl) {
+      setShowSettings(true);
+      return;
+    }
+    if (busy) return;
+    setBusy(true);
+    const now = new Date();
+    const start = pad(now.getHours() + (now.getMinutes() > 0 ? 1 : 0)) + ':00';
+    try {
+      const run = await runCloudTask(cloudUrl, cloudToken, keyForCloud(), 'plan', {
+        summary: reply.one_line_summary || reply.direct_response.slice(0, 300),
+        checklist: reply.proactive_checklist,
+        start,
+      });
+      setCloudStatus('online');
+      const blocks: any[] = Array.isArray(run?.result?.blocks) ? run.result.blocks : [];
+      const lines = blocks.map(
+        (b) => String(b?.time ?? '') + '  ·  ' + String(b?.minutes ?? '?') + ' min  ·  ' + String(b?.task ?? ''),
+      );
+      const tip = String(run?.result?.tip ?? '').trim();
+      const plan: PulseReply = {
+        direct_response: (lines.length ? lines.join('\n') : 'The server returned no blocks.') + (tip ? '\n\nTip: ' + tip : ''),
+        proactive_checklist: blocks.slice(0, 5).map((b) => String(b?.time ?? '') + ' ' + String(b?.task ?? '')),
+        one_line_summary: 'Time-blocked plan from ' + start + ' (' + blocks.length + ' blocks)',
+      };
+      setMessages((prev) => [
+        ...prev,
+        { id: uid(), role: 'assistant', text: plan.direct_response, reply: plan, source: 'cloud', ts: Date.now() },
+      ]);
+      say(plan.one_line_summary);
+    } catch (e: any) {
+      setCloudStatus('offline');
+      setMessages((prev) => [
+        ...prev,
+        { id: uid(), role: 'error', text: 'Cloud task failed: ' + (e?.message || String(e)), ts: Date.now() },
+      ]);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const statusLabel =
+    cloudMode && cloudUrl
+      ? '☁️ Cloud · ' + (cloudStatus === 'online' ? 'online' : cloudStatus === 'checking' ? 'checking…' : 'offline')
+      : apiKey
+        ? 'Model: ' + model
+        : 'No API key set';
+
   if (!loaded) {
     return (
       <View style={styles.center}>
@@ -662,12 +960,21 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
   return (
     <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
       <View style={styles.chatToolbar}>
-        <Text style={styles.muted} numberOfLines={1}>
-          {apiKey ? 'Model: ' + model : 'No API key set'}
-        </Text>
+        <Pressable onPress={() => cloudUrl && checkCloud(cloudUrl)} style={{ flex: 1 }}>
+          <Text
+            style={[
+              styles.muted,
+              cloudMode && cloudStatus === 'online' && { color: C.good },
+              cloudMode && cloudStatus === 'offline' && { color: C.danger },
+            ]}
+            numberOfLines={1}
+          >
+            {statusLabel}
+          </Text>
+        </Pressable>
         <View style={{ flexDirection: 'row', gap: 8 }}>
           <Pressable onPress={() => setShowSettings((s) => !s)} style={styles.chip}>
-            <Text style={styles.chipText}>⚙️ Key</Text>
+            <Text style={styles.chipText}>⚙️ Settings</Text>
           </Pressable>
           <Pressable onPress={clearChat} style={styles.chip}>
             <Text style={styles.chipText}>🗑 Clear</Text>
@@ -679,7 +986,7 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
         <View style={styles.settings}>
           <Text style={styles.settingsTitle}>Gemini API key</Text>
           <Text style={styles.mutedSmall}>
-            Stored only on this device. Get one free at aistudio.google.com.
+            Stored only on this device. Optional when your cloud server has its own key.
           </Text>
           <TextInput
             value={keyDraft}
@@ -701,9 +1008,51 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
             autoCorrect={false}
             style={styles.input}
           />
-          <Pressable onPress={saveSettings} style={styles.primaryBtn}>
-            <Text style={styles.primaryBtnText}>Save</Text>
-          </Pressable>
+
+          <View style={styles.divider} />
+          <View style={styles.rowBetween}>
+            <Text style={styles.settingsTitle}>☁️ Cloud backend</Text>
+            <View style={styles.rowCenter}>
+              <Text style={styles.mutedSmall}>{cloudModeDraft ? 'Chat via cloud' : 'Off'}</Text>
+              <Switch
+                value={cloudModeDraft}
+                onValueChange={setCloudModeDraft}
+                trackColor={{ false: C.border, true: C.accent }}
+                thumbColor="#fff"
+              />
+            </View>
+          </View>
+          <Text style={styles.mutedSmall}>
+            Paste the URL your Codespace prints (https://NAME-3000.app.github.dev), or just the Codespace name.
+          </Text>
+          <TextInput
+            value={cloudUrlDraft}
+            onChangeText={setCloudUrlDraft}
+            placeholder="https://your-codespace-3000.app.github.dev"
+            placeholderTextColor={C.muted}
+            autoCapitalize="none"
+            autoCorrect={false}
+            keyboardType="url"
+            style={styles.input}
+          />
+          <TextInput
+            value={cloudTokenDraft}
+            onChangeText={setCloudTokenDraft}
+            placeholder="PULSE_TOKEN (if the server has one)"
+            placeholderTextColor={C.muted}
+            secureTextEntry
+            autoCapitalize="none"
+            autoCorrect={false}
+            style={styles.input}
+          />
+          <View style={{ flexDirection: 'row', gap: 8 }}>
+            <Pressable onPress={testCloud} disabled={testing} style={[styles.secondaryBtn, { flex: 1 }]}>
+              {testing ? <ActivityIndicator color={C.text} /> : <Text style={styles.primaryBtnText}>Test connection</Text>}
+            </Pressable>
+            <Pressable onPress={saveSettings} style={[styles.primaryBtn, { flex: 1, marginTop: 0 }]}>
+              <Text style={styles.primaryBtnText}>Save</Text>
+            </Pressable>
+          </View>
         </View>
       ) : null}
 
@@ -721,14 +1070,16 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
             </Text>
           </View>
         }
-        renderItem={({ item }) => <MessageBubble msg={item} say={say} />}
+        renderItem={({ item }) => (
+          <MessageBubble msg={item} say={say} onCloudPlan={cloudUrl ? cloudPlan : undefined} />
+        )}
       />
 
       <View style={styles.composer}>
         <TextInput
           value={input}
           onChangeText={setInput}
-          placeholder={apiKey ? 'Ask Pulse anything…' : 'Add your Gemini key first'}
+          placeholder={apiKey || (cloudMode && cloudUrl) ? 'Ask Pulse anything…' : 'Add a Gemini key or cloud URL first'}
           placeholderTextColor={C.muted}
           style={styles.composerInput}
           multiline
@@ -743,7 +1094,15 @@ function ChatScreen({ say }: { say: (t: string) => void }) {
   );
 }
 
-function MessageBubble({ msg, say }: { msg: ChatMessage; say: (t: string) => void }) {
+function MessageBubble({
+  msg,
+  say,
+  onCloudPlan,
+}: {
+  msg: ChatMessage;
+  say: (t: string) => void;
+  onCloudPlan?: (r: PulseReply) => void;
+}) {
   if (msg.role === 'user') {
     return (
       <View style={[styles.bubble, styles.userBubble]}>
@@ -763,13 +1122,22 @@ function MessageBubble({ msg, say }: { msg: ChatMessage; say: (t: string) => voi
     <View style={{ marginBottom: 12 }}>
       <View style={[styles.bubble, styles.botBubble]}>
         <Text style={styles.bubbleText}>{msg.text}</Text>
+        {msg.source === 'cloud' ? <Text style={styles.sourceTag}>☁️ cloud</Text> : null}
       </View>
-      {r ? <ActionCard reply={r} say={say} /> : null}
+      {r ? <ActionCard reply={r} say={say} onCloudPlan={onCloudPlan} /> : null}
     </View>
   );
 }
 
-function ActionCard({ reply, say }: { reply: PulseReply; say: (t: string) => void }) {
+function ActionCard({
+  reply,
+  say,
+  onCloudPlan,
+}: {
+  reply: PulseReply;
+  say: (t: string) => void;
+  onCloudPlan?: (r: PulseReply) => void;
+}) {
   const summary = reply.one_line_summary || reply.direct_response.slice(0, 120);
   const fullText =
     summary + (reply.proactive_checklist.length ? '\n\n- ' + reply.proactive_checklist.join('\n- ') : '');
@@ -788,6 +1156,16 @@ function ActionCard({ reply, say }: { reply: PulseReply; say: (t: string) => voi
         <ActionButton label="✉️ Email" url={mailtoUrl(summary, fullText)} />
         <ActionButton label="💬 SMS" url={smsUrl(fullText)} />
         <ActionButton label="📞 Dial" url="tel:" />
+        {onCloudPlan && reply.proactive_checklist.length ? (
+          <Pressable
+            onPress={() => onCloudPlan(reply)}
+            style={({ pressed }) => [styles.actionBtn, styles.cloudBtn, pressed && { opacity: 0.7 }]}
+            accessibilityRole="button"
+            accessibilityLabel="Build a time-blocked plan in the cloud"
+          >
+            <Text style={styles.actionText}>☁️ Cloud plan</Text>
+          </Pressable>
+        ) : null}
       </View>
 
       {reply.proactive_checklist.length ? (
@@ -1129,6 +1507,19 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   primaryBtnText: { color: '#fff', fontWeight: '700' },
+  secondaryBtn: {
+    backgroundColor: C.panel2,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: C.border,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  divider: { height: StyleSheet.hairlineWidth, backgroundColor: C.border, marginVertical: 8 },
+  rowBetween: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  rowCenter: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  sourceTag: { color: C.accent2, fontSize: 11, fontWeight: '700', marginTop: 6 },
+  cloudBtn: { borderColor: C.accent2 },
 
   empty: { padding: 24, alignItems: 'center', gap: 8, marginTop: 40 },
   emptyTitle: { color: C.text, fontSize: 18, fontWeight: '700' },
