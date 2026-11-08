@@ -1,0 +1,36 @@
+{
+  "name": "Pulse OS Cloud Backend",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:1-20-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "forwardPorts": [3000],
+  "portsAttributes": {
+    "3000": {
+      "label": "Pulse OS API",
+      "onAutoForward": "notify"
+    }
+  },
+  "containerEnv": {
+    "PORT": "3000"
+  },
+  "secrets": {
+    "GEMINI_API_KEY": {
+      "description": "Gemini API key from Google AI Studio. The server uses it so your phone never has to hold one.",
+      "documentationUrl": "https://aistudio.google.com/apikey"
+    },
+    "PULSE_TOKEN": {
+      "description": "Any long random string. The app must send the same token; it stops strangers using your public URL."
+    }
+  },
+  "postCreateCommand": "cd server && npm install --no-audit --no-fund",
+  "postStartCommand": "bash .devcontainer/start-backend.sh",
+  "customizations": {
+    "codespaces": {
+      "openFiles": ["server/server.js"]
+    },
+    "vscode": {
+      "extensions": ["dbaeumer.vscode-eslint"]
+    }
+  }
+}
