@@ -1,0 +1,15 @@
+{
+  "name": "pulse-os-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloud backend for the Pulse OS app (health check, Gemini chat, task runner).",
+  "main": "server.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
