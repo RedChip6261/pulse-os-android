@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-android:
     runs-on: ubuntu-latest
@@ -27,11 +30,18 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Stamp build number (used by in-app updates)
+        run: |
+          node -e "const fs=require('fs');const a=JSON.parse(fs.readFileSync('app.json'));a.expo.android.versionCode=Number(process.env.GITHUB_RUN_NUMBER);fs.writeFileSync('app.json',JSON.stringify(a,null,2));console.log('versionCode',a.expo.android.versionCode)"
+
       - name: Expo prebuild (Android)
         run: npx expo prebuild --platform android --no-install
 
       - name: Embed JS bundle in debug APK (runs without Metro)
         run: sed -i 's/^react {/react {\n    debuggableVariants = []/' android/app/build.gradle
+
+      - name: Longer Gradle download timeout (avoids flaky wrapper downloads)
+        run: sed -i 's/^networkTimeout=.*/networkTimeout=120000/' android/gradle/wrapper/gradle-wrapper.properties
 
       - name: Assemble debug APK
         run: |
@@ -45,3 +55,16 @@ jobs:
           name: Pulse-OS-Debug-APK
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      - name: Publish GitHub Release (in-app updater reads this)
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          N=${{ github.run_number }}
+          cp android/app/build/outputs/apk/debug/app-debug.apk "pulse-os-build-$N.apk"
+          gh release create "build-$N" "pulse-os-build-$N.apk" \
+            --target "$GITHUB_SHA" \
+            --title "Pulse OS build $N" \
+            --notes "$(git log -1 --pretty=%s)" \
+            --latest
