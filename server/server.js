@@ -1,22 +1,14 @@
 /*
- * Pulse OS cloud backend
- * ----------------------
- * A small Express server the Pulse OS app talks to over HTTPS.
- * Runs in GitHub Codespaces (see .devcontainer/) or any Node 20+ host.
- *
- * Routes
- *   GET  /health          -> liveness + config check (no auth)
+ * Pulse OS cloud backend v2.0 (Fast Gemini 2.5 Flash + Multimodal + Action Extraction + Source Verification)
+ * ----------------------------------------------------------------------------------------------------------
+ * Routes:
+ *   GET  /health          -> liveness + config check
  *   GET  /api/info        -> server info, available task types
- *   POST /api/chat        -> Gemini chat with the Pulse JSON contract
- *   POST /api/task        -> run one named task, returns its result
- *   GET  /api/tasks       -> the most recent task runs (newest first)
- *   GET  /api/tasks/:id   -> one task run
- *
- * Environment (set as Codespaces secrets or in your shell)
- *   PORT            default 3000
- *   GEMINI_API_KEY  server-side Gemini key (recommended; keeps it off the phone)
- *   GEMINI_MODEL    default gemini-flash-latest
- *   PULSE_TOKEN     if set, every /api/* call must send "Authorization: Bearer <token>"
+ *   POST /api/chat        -> Multimodal + Memory + Device Automation + Source Verification chat
+ *   POST /api/analyze     -> Dedicated multimodal analyzer (image base64, document text, or video URL)
+ *   POST /api/task        -> Run one named task (echo, budget, plan, summarize, verify_source, extract_actions)
+ *   GET  /api/tasks       -> Recent task runs
+ *   GET  /api/tasks/:id   -> Single task run
  */
 
 'use strict';
@@ -27,25 +19,31 @@ const crypto = require('crypto');
 const PORT = Number(process.env.PORT) || 3000;
 const SERVER_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const PULSE_TOKEN = (process.env.PULSE_TOKEN || '').trim();
-const DEFAULT_MODEL = (process.env.GEMINI_MODEL || 'gemini-flash-latest').trim();
+const DEFAULT_MODEL = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
+const FALLBACK_MODELS = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash'];
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
 const STARTED_AT = new Date();
 const MAX_RUNS = 100;
 
 const SYSTEM_PROMPT = [
-  'You are Pulse, a proactive personal-productivity assistant inside the Pulse OS mobile app.',
-  'Answer the user directly and helpfully, then anticipate what they will need next:',
-  'reminders, calendar blocks, weather checks, budgeting, messages to send, prep steps, deadlines.',
-  'You MUST reply with ONLY a single strict JSON object, no markdown, no code fences, no extra text.',
-  'The JSON object must have exactly these keys:',
-  '"direct_response": a string answering the user clearly and concisely;',
-  '"proactive_checklist": an array of 2 to 5 short strings (max ~10 words each) of helpful follow-up actions;',
-  '"one_line_summary": a single short sentence summarising the task or plan.',
-].join(' ');
-
-/* ------------------------------------------------------------------ */
-/* Helpers                                                             */
-/* ------------------------------------------------------------------ */
+  'You are Pulse, an advanced multimodal AI assistant and device automation agent inside the Pulse OS mobile app.',
+  'Core capabilities:',
+  '1. DEVICE AUTOMATION AGENT: You help the user interact with installed mobile apps (such as Meesho, WhatsApp, Instagram, Telegram, Free Fire, Flipkart, YouTube, Maps), navigate UI elements, input user-specified data, and execute shopping or messaging workflows ONLY upon explicit user confirmation.',
+  '2. MULTIMODAL AI ASSISTANT:',
+  '   - For images: Describe contents accurately, extract visible text (OCR), detect objects, and answer specific questions about visual details.',
+  '   - For documents and files: Read uploaded content, extract key facts, and provide concise, structured summaries.',
+  '   - For video links: Extract/analyze transcript or video context, summarize core content, and answer questions precisely.',
+  '3. SMART CONTEXT MEMORY & ACTION EXTRACTION: Personalize responses using the provided user memory profile, and automatically extract actionable tasks, calendar events, and reminders from text, files, images, or videos.',
+  '4. QUICK-VERIFY SOURCE CHECKING: Cross-check extracted facts, URLs, prices, and dates for internal consistency and flag any unverified claims.',
+  'Always provide structured, precise, and practical answers without unnecessary filler.',
+  'You MUST reply with ONLY a single strict JSON object with these keys:',
+  '"direct_response": string (clear, structured answer without filler);',
+  '"proactive_checklist": array of 2 to 5 short strings (follow-up actions);',
+  '"one_line_summary": string (single short sentence summary);',
+  '"extracted_actions": array of objects {"type": "task" | "calendar" | "reminder" | "app_workflow", "title": string, "when": string, "app": string, "requires_confirmation": boolean};',
+  '"memory_updates": array of short strings (new user facts/preferences worth remembering across sessions);',
+  '"source_verification": {"status": "verified" | "needs_review" | "not_applicable", "confidence": "high" | "medium" | "low", "notes": string}.',
+].join('\n');
 
 function publicUrl() {
   const name = process.env.CODESPACE_NAME;
@@ -78,7 +76,14 @@ function parsePulseReply(raw) {
     }
   }
   if (!obj || typeof obj !== 'object') {
-    return { direct_response: cleaned || 'No response received.', proactive_checklist: [], one_line_summary: '' };
+    return {
+      direct_response: cleaned || 'No response received.',
+      proactive_checklist: [],
+      one_line_summary: '',
+      extracted_actions: [],
+      memory_updates: [],
+      source_verification: { status: 'not_applicable', confidence: 'high', notes: '' },
+    };
   }
   return {
     direct_response: String(obj.direct_response ?? '').trim() || cleaned,
@@ -86,101 +91,100 @@ function parsePulseReply(raw) {
       ? obj.proactive_checklist.map((x) => String(x).trim()).filter(Boolean).slice(0, 8)
       : [],
     one_line_summary: String(obj.one_line_summary ?? '').trim(),
+    extracted_actions: Array.isArray(obj.extracted_actions) ? obj.extracted_actions.slice(0, 8) : [],
+    memory_updates: Array.isArray(obj.memory_updates)
+      ? obj.memory_updates.map((x) => String(x).trim()).filter(Boolean).slice(0, 5)
+      : [],
+    source_verification:
+      obj.source_verification && typeof obj.source_verification === 'object'
+        ? {
+            status: String(obj.source_verification.status || 'verified'),
+            confidence: String(obj.source_verification.confidence || 'high'),
+            notes: String(obj.source_verification.notes || ''),
+          }
+        : { status: 'not_applicable', confidence: 'high', notes: '' },
   };
 }
 
 let workingModel = DEFAULT_MODEL;
 
-async function discoverFlashModels(apiKey) {
-  try {
-    const res = await fetch(GEMINI_BASE.replace(/\/$/, '') + '?pageSize=200', {
-      headers: { 'x-goog-api-key': apiKey },
-    });
-    if (!res.ok) return [];
-    const json = await res.json();
-    const ver = (n) => {
-      const m = n.match(/gemini-(\d+(?:\.\d+)?)/);
-      return m ? parseFloat(m[1]) : 0;
-    };
-    return (json.models || [])
-      .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
-      .map((m) => String(m.name || '').replace(/^models\//, ''))
-      .filter((n) => /flash/i.test(n) && !/(lite|image|tts|audio|live|thinking|exp|preview|embedding)/i.test(n))
-      .sort((a, b) => ver(b) - ver(a));
-  } catch {
-    return [];
+function thinkingConfigFor(model) {
+  if (/gemini-2\.5/i.test(model) && !/pro/i.test(model)) {
+    return { thinkingBudget: 0 };
   }
+  return undefined;
 }
 
-/**
- * Calls Gemini generateContent. If the model is rejected, tries the model named in the
- * error, then the newest Flash model this key can see, then gemini-flash-latest.
- */
-async function gemini(apiKey, { system, contents, json = true, temperature = 0.7 }) {
-  const body = JSON.stringify({
-    systemInstruction: system ? { parts: [{ text: system }] } : undefined,
-    contents,
-    generationConfig: { temperature, ...(json ? { responseMimeType: 'application/json' } : {}) },
-  });
-  const attempt = (m) =>
-    fetch(GEMINI_BASE + encodeURIComponent(m) + ':generateContent', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-      body,
+async function gemini(apiKey, { system, contents, json = true, temperature = 0.4, timeoutMs = 12000 }) {
+  const buildBody = (m, includeThinking = true) => {
+    const thinking = includeThinking ? thinkingConfigFor(m) : undefined;
+    return JSON.stringify({
+      systemInstruction: system ? { parts: [{ text: system }] } : undefined,
+      contents,
+      generationConfig: {
+        temperature,
+        maxOutputTokens: 2048,
+        ...(json ? { responseMimeType: 'application/json' } : {}),
+        ...(thinking ? { thinkingConfig: thinking } : {}),
+      },
     });
+  };
 
-  let model = workingModel;
-  let res = await attempt(model);
-  if (!res.ok && [400, 403, 404].includes(res.status)) {
-    const err = await res.clone().json().catch(() => null);
-    const msg = (err && err.error && err.error.message) || '';
-    if (res.status === 404 || /model|not found|no longer available|not supported/i.test(msg)) {
-      const candidates = [];
-      (msg.match(/models\/([a-z0-9.\-]+)/gi) || [])
-        .map((x) => x.replace(/^models\//i, ''))
-        .forEach((x) => x !== model && !candidates.includes(x) && candidates.push(x));
-      (await discoverFlashModels(apiKey)).forEach((x) => x !== model && !candidates.includes(x) && candidates.push(x));
-      if (model !== 'gemini-flash-latest' && !candidates.includes('gemini-flash-latest')) {
-        candidates.push('gemini-flash-latest');
+  const attempt = async (m, includeThinking = true) => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      return await fetch(GEMINI_BASE + encodeURIComponent(m) + ':generateContent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        body: buildBody(m, includeThinking),
+        signal: ctrl.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const candidates = [workingModel, ...FALLBACK_MODELS.filter((m) => m !== workingModel)];
+  let lastData = null;
+  let lastStatus = 502;
+
+  for (const candidate of candidates) {
+    try {
+      let res = await attempt(candidate, true);
+      if (res.status === 400 && thinkingConfigFor(candidate)) {
+        res = await attempt(candidate, false);
       }
-      for (const c of candidates.slice(0, 5)) {
-        const r = await attempt(c);
-        if (r.ok) {
-          res = r;
-          model = c;
-          workingModel = c;
-          break;
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        const text = ((data && data.candidates && data.candidates[0] && data.candidates[0].content &&
+          data.candidates[0].content.parts) || [])
+          .filter((p) => !p.thought)
+          .map((p) => p.text || '')
+          .join('');
+        if (text) {
+          workingModel = candidate;
+          return { text, model: candidate };
         }
       }
+      lastStatus = res.status;
+      lastData = await res.clone().json().catch(() => null);
+      if (res.status === 401) break;
+    } catch (err) {
+      lastData = { error: { message: err.name === 'AbortError' ? `Timed out after ${timeoutMs}ms` : err.message } };
     }
   }
-  const data = await res.json().catch(() => null);
-  if (!res.ok) {
-    const e = new Error((data && data.error && data.error.message) || 'Gemini HTTP ' + res.status);
-    e.status = 502;
-    throw e;
-  }
-  const text = ((data && data.candidates && data.candidates[0] && data.candidates[0].content &&
-    data.candidates[0].content.parts) || [])
-    .map((p) => p.text || '')
-    .join('');
-  if (!text) {
-    const reason =
-      (data && data.promptFeedback && data.promptFeedback.blockReason) ||
-      (data && data.candidates && data.candidates[0] && data.candidates[0].finishReason) ||
-      'empty';
-    const e = new Error('Gemini returned no text (' + reason + ').');
-    e.status = 502;
-    throw e;
-  }
-  return { text, model };
+
+  const msg = (lastData && lastData.error && lastData.error.message) || 'Gemini HTTP ' + lastStatus;
+  const e = new Error(msg);
+  e.status = 502;
+  throw e;
 }
 
 function keyFor(req) {
-  // Server key first; otherwise the key the app sends in x-gemini-key (your own server, over HTTPS).
   const k = SERVER_KEY || String(req.get('x-gemini-key') || '').trim();
   if (!k) {
-    const e = new Error('No Gemini key: set the GEMINI_API_KEY Codespaces secret, or add a key in the app.');
+    const e = new Error('No Gemini key: set GEMINI_API_KEY secret or add a key in the app.');
     e.status = 400;
     throw e;
   }
@@ -190,21 +194,31 @@ function keyFor(req) {
 function toContents(messages) {
   if (!Array.isArray(messages)) return [];
   return messages
-    .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.text === 'string')
-    .slice(-12)
-    .map((m) => ({ role: m.role === 'user' ? 'user' : 'model', parts: [{ text: m.text.slice(0, 8000) }] }));
+    .filter((m) => m && (m.role === 'user' || m.role === 'assistant'))
+    .slice(-10)
+    .map((m) => {
+      const parts = [];
+      if (typeof m.text === 'string' && m.text.trim()) {
+        parts.push({ text: m.text.slice(0, 12000) });
+      }
+      if (m.inlineData && m.inlineData.data && m.inlineData.mimeType) {
+        parts.push({
+          inlineData: {
+            mimeType: String(m.inlineData.mimeType),
+            data: String(m.inlineData.data),
+          },
+        });
+      }
+      if (!parts.length) parts.push({ text: '' });
+      return { role: m.role === 'user' ? 'user' : 'model', parts };
+    });
 }
-
-/* ------------------------------------------------------------------ */
-/* Tasks: a fixed allow-list. No shell, no arbitrary code execution.   */
-/* ------------------------------------------------------------------ */
 
 const TASKS = {
   echo: {
     description: 'Round-trip test: returns what you sent plus server time.',
     run: async ({ payload }) => ({ received: payload ?? null, server_time: new Date().toISOString() }),
   },
-
   budget: {
     description: 'Totals a list of {label, amount} expenses against an income.',
     run: async ({ payload }) => {
@@ -226,7 +240,6 @@ const TASKS = {
       };
     },
   },
-
   plan: {
     description: 'Turns a summary + checklist into a time-blocked plan (Gemini).',
     needsGemini: true,
@@ -240,13 +253,8 @@ const TASKS = {
         system:
           'You are a planning engine. Reply with ONLY strict JSON: {"blocks":[{"time":"HH:MM","minutes":number,"task":string}],"tip":string}. ' +
           'Use 15 to 90 minute blocks, realistic order, include short breaks.',
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: `Goal: ${summary}\nSteps: ${checklist.join('; ')}\nStart at: ${startAt}` }],
-          },
-        ],
-        temperature: 0.4,
+        contents: [{ role: 'user', parts: [{ text: `Goal: ${summary}\nSteps: ${checklist.join('; ')}\nStart at: ${startAt}` }] }],
+        temperature: 0.3,
       });
       let parsed;
       try {
@@ -257,40 +265,35 @@ const TASKS = {
       return { ...parsed, model };
     },
   },
-
   summarize: {
-    description: 'Summarises text into a one-liner and key points (Gemini).',
+    description: 'Summarises documents, files, or transcripts + extracts actions & verifies sources (Gemini).',
     needsGemini: true,
     run: async ({ payload, apiKey }) => {
-      const textIn = String((payload && payload.text) || '').slice(0, 20000);
+      const textIn = String((payload && payload.text) || '').slice(0, 25000);
       if (!textIn.trim()) throw Object.assign(new Error('payload.text is required'), { status: 400 });
       const { text, model } = await gemini(apiKey, {
-        system: 'Reply with ONLY strict JSON: {"one_line_summary":string,"key_points":[string]} (3 to 6 points).',
+        system:
+          'Reply with ONLY strict JSON: {"one_line_summary":string,"key_points":[string],"extracted_actions":[{"type":"task"|"calendar"|"reminder","title":string,"when":string}],"source_verification":{"status":"verified"|"needs_review","confidence":"high"|"medium"|"low","notes":string}}.',
         contents: [{ role: 'user', parts: [{ text: textIn }] }],
-        temperature: 0.3,
+        temperature: 0.2,
       });
       let parsed;
       try {
         parsed = JSON.parse(stripCodeFences(text));
       } catch {
-        parsed = { one_line_summary: stripCodeFences(text), key_points: [] };
+        parsed = { one_line_summary: stripCodeFences(text), key_points: [], extracted_actions: [] };
       }
       return { ...parsed, model };
     },
   },
 };
 
-const runs = []; // in-memory, newest first; resets when the server restarts
-
-/* ------------------------------------------------------------------ */
-/* App                                                                 */
-/* ------------------------------------------------------------------ */
+const runs = [];
 
 const app = express();
 app.disable('x-powered-by');
-app.use(express.json({ limit: '256kb' }));
+app.use(express.json({ limit: '10mb' }));
 
-// CORS so the Expo web build / Snack can call it too. The native app doesn't need it.
 app.use((req, res, next) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-gemini-key');
@@ -299,7 +302,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Tiny request log.
 app.use((req, res, next) => {
   const t = Date.now();
   res.on('finish', () => console.log(`${req.method} ${req.path} -> ${res.statusCode} (${Date.now() - t}ms)`));
@@ -312,8 +314,6 @@ function safeEqual(a, b) {
   return x.length === y.length && crypto.timingSafeEqual(x, y);
 }
 
-// Auth for /api/*. Public Codespace ports are reachable by anyone with the URL,
-// so set PULSE_TOKEN and enter the same token in the app.
 app.use('/api', (req, res, next) => {
   if (!PULSE_TOKEN) return next();
   const header = String(req.get('authorization') || '');
@@ -328,7 +328,7 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     service: 'pulse-os-backend',
-    version: '1.0.0',
+    version: '2.0.0',
     uptime_s: Math.round(process.uptime()),
     started_at: STARTED_AT.toISOString(),
     gemini_key_on_server: Boolean(SERVER_KEY),
@@ -353,8 +353,17 @@ app.post('/api/chat', async (req, res, next) => {
     if (!contents.length || contents[contents.length - 1].role !== 'user') {
       return res.status(400).json({ ok: false, error: 'messages must end with a user message.' });
     }
-    const context = String((req.body && req.body.context) || '').slice(0, 800).trim();
-    const { text, model } = await gemini(apiKey, { system: SYSTEM_PROMPT + (context ? '\n' + context : ''), contents });
+    const context = String((req.body && req.body.context) || '').slice(0, 2000).trim();
+    const memory = String((req.body && req.body.memory) || '').slice(0, 2000).trim();
+    const fullSystem = [
+      SYSTEM_PROMPT,
+      memory ? `USER SMART MEMORY PROFILE:\n${memory}` : '',
+      context ? `ACTIVE DEVICE & MULTIMODAL CONTEXT:\n${context}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+
+    const { text, model } = await gemini(apiKey, { system: fullSystem, contents });
     res.json({ ok: true, reply: parsePulseReply(text), model, source: 'cloud' });
   } catch (e) {
     next(e);
@@ -414,7 +423,6 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Pulse OS backend listening on :${PORT}`);
+  console.log(`Pulse OS backend v2.0 listening on :${PORT}`);
   console.log(`Public URL: ${publicUrl()}`);
-  console.log(`Gemini key on server: ${SERVER_KEY ? 'yes' : 'no (app must send one)'}; token auth: ${PULSE_TOKEN ? 'on' : 'off'}`);
 });

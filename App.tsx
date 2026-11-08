@@ -61,7 +61,7 @@ const STORAGE_CLOUD_MODE = 'pulseos.cloud_mode';
 const CLOUD_PORT = 3000;
 const CLOUD_DOMAIN = 'app.github.dev';
 
-const DEFAULT_MODEL = 'gemini-flash-latest';
+const DEFAULT_MODEL = 'gemini-2.5-flash';
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
 const DEFAULT_UPDATE_REPO = 'RedChip6261/pulse-os-android';
 const DEFAULT_CLOUD_URL = 'https://scaling-space-telegram-jjg94w99g6pj255vv-3000.app.github.dev';
@@ -248,7 +248,7 @@ async function callGemini(
 /* ---- Fast path: streaming Gemini replies (text first, actions after) ---- */
 
 type SpeedMode = 'fast' | 'balanced' | 'smart';
-const FAST_MODEL = 'gemini-flash-lite-latest';
+const FAST_MODEL = 'gemini-2.5-flash-lite';
 const META_MARK = '<<<PULSE_META>>>';
 
 function buildStreamPrompt(extraSystem: string): string {
@@ -1181,7 +1181,7 @@ async function cloudFetch(
   init: { method?: string; body?: unknown; geminiKey?: string; timeoutMs?: number } = {},
 ): Promise<any> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), init.timeoutMs ?? 45000);
+  const timer = setTimeout(() => controller.abort(), init.timeoutMs ?? 6500);
   const headers: Record<string, string> = { Accept: 'application/json' };
   if (init.body !== undefined) headers['Content-Type'] = 'application/json';
   if (token) headers.Authorization = 'Bearer ' + token;
