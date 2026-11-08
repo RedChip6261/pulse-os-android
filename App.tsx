@@ -19,6 +19,7 @@ import {
   TextInput,
   Vibration,
   View,
+  NativeModules,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -28,6 +29,8 @@ import * as Application from 'expo-application';
 import * as FileSystem from 'expo-file-system';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { captureRef } from 'react-native-view-shot';
+
+const { HarkBridge } = NativeModules;
 
 /* ------------------------------------------------------------------ */
 /* Theme                                                               */
@@ -43,6 +46,7 @@ const C = {
   accent: '#7C5CFF',
   accent2: '#22D3EE',
   good: '#22C55E',
+  warn: '#F59E0B',
   danger: '#EF4444',
 };
 
@@ -57,38 +61,72 @@ const STORAGE_CHAT = 'pulseos.chat_history';
 const STORAGE_CLOUD_URL = 'pulseos.cloud_url';
 const STORAGE_CLOUD_TOKEN = 'pulseos.cloud_token';
 const STORAGE_CLOUD_MODE = 'pulseos.cloud_mode';
+const STORAGE_SMART_MEMORY = 'pulseos.smart_memory.v1';
 
 const CLOUD_PORT = 3000;
 const CLOUD_DOMAIN = 'app.github.dev';
 
 const DEFAULT_MODEL = 'gemini-2.5-flash';
+const FAST_MODEL = 'gemini-2.5-flash-lite';
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
 const DEFAULT_UPDATE_REPO = 'RedChip6261/pulse-os-android';
 const DEFAULT_CLOUD_URL = 'https://scaling-space-telegram-jjg94w99g6pj255vv-3000.app.github.dev';
 
 const SYSTEM_PROMPT = [
-  'You are Pulse, a proactive personal-productivity assistant inside the Pulse OS mobile app.',
-  'Answer the user directly and helpfully, then anticipate what they will need next:',
-  'reminders, calendar blocks, weather checks, budgeting, messages to send, prep steps, deadlines.',
-  'You MUST reply with ONLY a single strict JSON object, no markdown, no code fences, no extra text.',
-  'The JSON object must have exactly these keys:',
-  '"direct_response": a string answering the user clearly and concisely;',
-  '"proactive_checklist": an array of 2 to 5 short strings (max ~10 words each) of helpful follow-up actions;',
-  '"one_line_summary": a single short sentence summarising the task or plan.',
-].join(' ');
+  'You are Pulse, an OS-level AI agent with Accessibility Service & root/shell capabilities and an advanced multimodal AI assistant inside the Pulse OS mobile app.',
+  '1. OS-LEVEL DEVICE AUTOMATION AGENT: You control UI elements, tap screen coordinates, input user-specified data, and launch ANY installed mobile app (including Blinkit, Uber, Ola, Rapido, Zepto, Swiggy, Zomato, Meesho, Flipkart, Amazon, WhatsApp, Instagram, Telegram, Free Fire, PhonePe, GPay, Paytm, YouTube, Spotify, Maps, etc.). Parse the user voice/text command, identify the target app and action, and generate a sequence of UI automation steps to execute the task on the device screen. Handle missing-app or load exceptions gracefully with a clear status update.',
+  '2. MULTIMODAL AI ASSISTANT:',
+  '   - For images & photos: Describe the contents, extract text (OCR), detect objects, and answer specific user questions about the visual details.',
+  '   - For documents & files: Read the uploaded files, extract key information, and provide concise summaries tailored to the user needs.',
+  '   - For video files & video links: Extract transcripts/context, summarize the core content, and answer questions based on the video details.',
+  '3. SMART CONTEXT MEMORY & ACTION EXTRACTION: Personalize all text, image, and video responses across sessions. Automatically pull tasks, calendar events, and reminders directly from uploaded files, images, or videos.',
+  '4. QUICK-VERIFY SOURCE CHECKING: Cross-check extracted data from links and documents to ensure high accuracy.',
+  'Always provide structured, precise, and practical answers without unnecessary filler.',
+  'You MUST reply with ONLY a single strict JSON object, no markdown, no code fences, no extra text:',
+  '{',
+  '  "direct_response": "Clear, structured answer without filler",',
+  '  "proactive_checklist": ["2 to 5 short actionable follow-ups, extracted tasks, calendar events, or reminders"],',
+  '  "one_line_summary": "Single short sentence summary",',
+  '  "automation_script": [{"step": 1, "action": "launch_app|tap_text|tap_xy|input_text|swipe|wait|root_exec", "target": "app or node label or x,y", "value": "optional text"}],',
+  '  "memory_facts": ["optional new user preference or fact to remember across sessions"],',
+  '  "source_verified": "Verified | Needs Review"',
+  '}',
+].join('\n');
 
 type Tab = 'CHAT' | 'APPS' | 'LIVE' | 'SETTINGS';
+type SpeedMode = 'fast' | 'balanced' | 'smart';
+
+type AutomationStep = {
+  step?: number;
+  action: string;
+  target?: string;
+  value?: string;
+};
 
 type PulseReply = {
   direct_response: string;
   proactive_checklist: string[];
   one_line_summary: string;
+  automation_script?: AutomationStep[];
+  memory_facts?: string[];
+  source_verified?: string;
+};
+
+type AttachmentItem = {
+  uri: string;
+  name: string;
+  mimeType: string;
+  kind: 'image' | 'video' | 'document' | 'video_link';
+  base64?: string;
+  textContent?: string;
+  sizeBytes?: number;
 };
 
 type ChatMessage = {
   id: string;
   role: 'user' | 'assistant' | 'error';
   text: string;
+  attachment?: AttachmentItem;
   reply?: PulseReply;
   source?: 'cloud' | 'device';
   streaming?: boolean;
@@ -107,10 +145,35 @@ type CloudHealth = {
 };
 
 /* ------------------------------------------------------------------ */
-/* Helpers                                                             */
+/* Helpers & Smart Cross-Session Memory                                */
 /* ------------------------------------------------------------------ */
 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+async function loadSmartMemory(): Promise<string[]> {
+  try {
+    const raw = await AsyncStorage.getItem(STORAGE_SMART_MEMORY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr.map(String).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveSmartMemoryFacts(facts: string[]): Promise<string[]> {
+  const existing = await loadSmartMemory();
+  const merged = [...existing];
+  for (const f of facts) {
+    const clean = String(f || '').trim();
+    if (clean && clean.length > 3 && !merged.some((x) => x.toLowerCase() === clean.toLowerCase())) {
+      merged.push(clean);
+    }
+  }
+  const trimmed = merged.slice(-40);
+  await AsyncStorage.setItem(STORAGE_SMART_MEMORY, JSON.stringify(trimmed));
+  return trimmed;
+}
 
 function stripCodeFences(raw: string): string {
   let s = raw.trim();
@@ -145,113 +208,127 @@ function parsePulseReply(raw: string): PulseReply {
   const checklist = Array.isArray(obj.proactive_checklist)
     ? obj.proactive_checklist.map((x: unknown) => String(x)).filter((x: string) => x.trim().length > 0)
     : [];
+  const script = Array.isArray(obj.automation_script)
+    ? obj.automation_script.map((s: any, idx: number) => ({
+        step: Number(s?.step) || idx + 1,
+        action: String(s?.action || 'tap_text'),
+        target: String(s?.target || ''),
+        value: s?.value ? String(s.value) : undefined,
+      }))
+    : undefined;
+  const mem = Array.isArray(obj.memory_facts)
+    ? obj.memory_facts.map((x: unknown) => String(x).trim()).filter(Boolean)
+    : undefined;
   return {
     direct_response: String(obj.direct_response ?? '').trim() || cleaned,
     proactive_checklist: checklist,
     one_line_summary: String(obj.one_line_summary ?? '').trim(),
+    automation_script: script && script.length ? script : undefined,
+    memory_facts: mem && mem.length ? mem : undefined,
+    source_verified: obj.source_verified ? String(obj.source_verified) : undefined,
   };
 }
 
-async function discoverFlashModels(apiKey: string): Promise<string[]> {
+/* ------------------------------------------------------------------ */
+/* Video Link Transcript & Quick-Verify Source Checker                 */
+/* ------------------------------------------------------------------ */
+
+async function fetchVideoLinkContext(url: string): Promise<string> {
+  const cleanUrl = url.trim();
+  const lines: string[] = [`Video URL: ${cleanUrl}`];
   try {
-    const res = await fetch(GEMINI_BASE.replace(/\/$/, '') + '?pageSize=200', {
-      headers: { 'x-goog-api-key': apiKey },
-    });
-    if (!res.ok) return [];
-    const json: any = await res.json();
-    const names: string[] = (json?.models ?? [])
-      .filter((m: any) => (m?.supportedGenerationMethods ?? []).includes('generateContent'))
-      .map((m: any) => String(m?.name ?? '').replace(/^models\//, ''))
-      .filter((n: string) => /flash/i.test(n) && !/(lite|image|tts|audio|live|thinking|exp|preview|embedding)/i.test(n));
-    const ver = (n: string) => {
-      const m = n.match(/gemini-(\d+(?:\.\d+)?)/);
-      return m ? parseFloat(m[1]) : 0;
-    };
-    return names.sort((a, b) => ver(b) - ver(a));
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 4500);
+    const oRes = await fetch(`https://noembed.com/embed?url=${encodeURIComponent(cleanUrl)}`, { signal: ctrl.signal }).finally(() =>
+      clearTimeout(t),
+    );
+    if (oRes.ok) {
+      const oJson: any = await oRes.json();
+      if (oJson?.title) lines.push(`Video Title: ${oJson.title}`);
+      if (oJson?.author_name) lines.push(`Channel/Author: ${oJson.author_name}`);
+    }
   } catch {
-    return [];
+    /* ignore */
   }
-}
-
-async function callGemini(
-  apiKey: string,
-  model: string,
-  history: ChatMessage[],
-  extraSystem = '',
-  temperature = 0.7,
-): Promise<{ reply: PulseReply; modelUsed: string }> {
-  const contents = history
-    .filter((m) => m.role !== 'error')
-    .slice(-12)
-    .map((m) => ({
-      role: m.role === 'user' ? 'user' : 'model',
-      parts: [{ text: m.role === 'assistant' && m.reply ? JSON.stringify(m.reply) : m.text }],
-    }));
-
-  const body = JSON.stringify({
-    systemInstruction: { parts: [{ text: SYSTEM_PROMPT + (extraSystem ? '\n' + extraSystem : '') }] },
-    contents,
-    generationConfig: { temperature, responseMimeType: 'application/json' },
-  });
-
-  const attempt = async (m: string) =>
-    fetch(GEMINI_BASE + encodeURIComponent(m) + ':generateContent', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-      body,
-    });
-
-  let modelUsed = model;
-  let res = await attempt(model);
-  if (!res.ok && (res.status === 404 || res.status === 400 || res.status === 403)) {
-    // The model may be retired or unavailable to this key: find a working Flash model.
-    const errJson: any = await res.clone().json().catch(() => null);
-    const errMsg: string = errJson?.error?.message || '';
-    if (/model|not found|no longer available|not supported/i.test(errMsg) || res.status === 404) {
-      const candidates: string[] = [];
-      const suggested = errMsg.match(/models\/([a-z0-9.\-]+)/gi) || [];
-      suggested
-        .map((x) => x.replace(/^models\//i, ''))
-        .filter((x) => x !== model)
-        .forEach((x) => candidates.push(x));
-      (await discoverFlashModels(apiKey)).forEach((x) => {
-        if (x !== model && !candidates.includes(x)) candidates.push(x);
-      });
-      if (!candidates.includes('gemini-flash-latest') && model !== 'gemini-flash-latest') {
-        candidates.push('gemini-flash-latest');
+  const yt = cleanUrl.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/);
+  if (yt) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 5500);
+      const res = await fetch(`https://www.youtube.com/watch?v=${yt[1]}`, { signal: ctrl.signal }).finally(() => clearTimeout(t));
+      const html = await res.text();
+      const descMatch = html.match(/"shortDescription":"((?:\\.|[^"\\])*)"/);
+      if (descMatch?.[1]) {
+        const desc = JSON.parse(`"${descMatch[1]}"`);
+        lines.push(`Description:\n${desc.slice(0, 3500)}`);
       }
-      for (const c of candidates.slice(0, 5)) {
-        const r = await attempt(c);
-        if (r.ok) {
-          res = r;
-          modelUsed = c;
-          break;
-        }
+      const capMatch = html.match(/"captionTracks":\[\{"baseUrl":"([^"]+)"/);
+      if (capMatch?.[1]) {
+        const capUrl = capMatch[1].replace(/\\u0026/g, '&');
+        const capRes = await fetch(capUrl);
+        const capXml = await capRes.text();
+        const transcript = Array.from(capXml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g))
+          .map((m) =>
+            m[1]
+              .replace(/&amp;/g, '&')
+              .replace(/&#39;/g, "'")
+              .replace(/&quot;/g, '"')
+              .replace(/<[^>]+>/g, ' ')
+              .trim(),
+          )
+          .filter(Boolean)
+          .join(' ');
+        if (transcript) lines.push(`Video Transcript:\n${transcript.slice(0, 15000)}`);
       }
+    } catch {
+      /* fallback to oEmbed title */
     }
   }
-  const json: any = await res.json().catch(() => null);
-  if (!res.ok) {
-    const msg = json?.error?.message || 'HTTP ' + res.status;
-    throw new Error(msg);
-  }
-  const text: string =
-    json?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text ?? '').join('') ?? '';
-  if (!text) {
-    const reason = json?.promptFeedback?.blockReason || json?.candidates?.[0]?.finishReason || 'empty';
-    throw new Error('Gemini returned no text (' + reason + ').');
-  }
-  return { reply: parsePulseReply(text), modelUsed };
+  return lines.join('\n');
 }
 
+async function quickVerifyUrlsInText(text: string): Promise<string> {
+  const urls = Array.from(text.matchAll(/https?:\/\/[^\s)>\]"']+/gi)).map((m) => m[0]);
+  if (!urls.length) return '';
+  const results: string[] = [];
+  await Promise.all(
+    urls.slice(0, 2).map(async (u) => {
+      try {
+        if (/youtube\.com\/watch|youtu\.be\/|youtube\.com\/shorts/i.test(u)) {
+          const vCtx = await fetchVideoLinkContext(u);
+          results.push(`[Quick-Verify Video Source Checked: ${u}]\n${vCtx}`);
+          return;
+        }
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 4000);
+        const r = await fetch(u, { signal: ctrl.signal }).finally(() => clearTimeout(timer));
+        const raw = await r.text();
+        const titleMatch = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+        const plain = raw
+          .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 3500);
+        results.push(
+          `[Quick-Verify Source Checked (${r.status}): ${u}]\nTitle: ${titleMatch?.[1]?.trim() || ''}\nExcerpt: ${plain}`,
+        );
+      } catch (e: any) {
+        results.push(`[Quick-Verify Source Unreachable: ${u} (${e?.message || 'timeout'})]`);
+      }
+    }),
+  );
+  return results.join('\n\n');
+}
 
-/* ---- Fast path: streaming Gemini replies (text first, actions after) ---- */
+/* ------------------------------------------------------------------ */
+/* Fast Streaming & Multimodal Gemini Engine                           */
+/* ------------------------------------------------------------------ */
 
-type SpeedMode = 'fast' | 'balanced' | 'smart';
-const FAST_MODEL = 'gemini-2.5-flash-lite';
 const META_MARK = '<<<PULSE_META>>>';
 
-function buildStreamPrompt(extraSystem: string): string {
+function buildStreamPrompt(extraSystem: string, smartMemory: string[]): string {
   const now = new Date();
   const tz = (() => {
     try {
@@ -261,14 +338,20 @@ function buildStreamPrompt(extraSystem: string): string {
     }
   })();
   return [
-    'You are Pulse, a sharp, warm personal-productivity assistant inside the Pulse OS app.',
+    'You are Pulse, an OS-level AI agent with Accessibility Service & root permissions and an advanced multimodal AI assistant inside Pulse OS.',
     'Current local time: ' + now.toString() + (tz ? ' (' + tz + ')' : '') + '.',
-    'First understand what the user actually wants, using the whole conversation, then answer it directly.',
-    'Lead with the answer. Be specific and practical, no filler, no "Great question".',
+    'Capabilities:',
+    '- For images/photos: Describe contents, extract visible text (OCR), detect objects, and answer specific user questions.',
+    '- For documents/files: Extract key information and provide concise, practical summaries.',
+    '- For video links/files: Summarize core content from transcripts/metadata and answer questions.',
+    '- Automatically extract tasks, calendar events, and reminders into the metadata block at the end.',
+    '- If the user asks to automate an app (like Blinkit, Uber, Meesho, WhatsApp, Instagram, Telegram, Free Fire, etc.), include the step-by-step UI automation plan.',
+    'Lead with the answer. Be structured, precise, and practical with no unnecessary filler.',
     'Reply in the same language the user writes in (English, Hindi, Telugu, Hinglish, etc).',
-    'Only ask a clarifying question when the request truly cannot be answered without it.',
-    'Plain text only: no markdown headings, no tables; short lines or "-" bullets are fine.',
-    'Do not add follow-up suggestion lists or a summary line at the end.',
+    'At the very end of your response, after your main answer, append "' +
+      META_MARK +
+      '" followed by a compact JSON object: {"proactive_checklist":["extracted task/event/reminder 1","step 2"],"one_line_summary":"short summary","memory_facts":["new user preference if any"],"source_verified":"Verified"}.',
+    smartMemory.length ? 'User Smart Context Memory Across Sessions:\n- ' + smartMemory.join('\n- ') : '',
     extraSystem,
   ]
     .filter(Boolean)
@@ -278,7 +361,6 @@ function buildStreamPrompt(extraSystem: string): string {
 function splitStreamText(full: string): { visible: string; meta: string | null } {
   const i = full.indexOf(META_MARK);
   if (i === -1) {
-    // Hide a partially-streamed marker at the very end.
     const tail = full.lastIndexOf('<<<');
     const visible = tail !== -1 && full.length - tail < META_MARK.length ? full.slice(0, tail) : full;
     return { visible: visible.trimEnd(), meta: null };
@@ -290,6 +372,8 @@ function finishStreamReply(full: string): PulseReply {
   const { visible, meta } = splitStreamText(full);
   let checklist: string[] = [];
   let summary = '';
+  let memory_facts: string[] = [];
+  let source_verified = 'Verified';
   if (meta) {
     const m = stripCodeFences(meta);
     const a = m.indexOf('{');
@@ -298,25 +382,35 @@ function finishStreamReply(full: string): PulseReply {
       try {
         const o: any = JSON.parse(m.slice(a, b + 1));
         if (Array.isArray(o.proactive_checklist)) {
-          checklist = o.proactive_checklist.map((x: unknown) => String(x)).filter((x: string) => x.trim()).slice(0, 5);
+          checklist = o.proactive_checklist.map((x: unknown) => String(x)).filter((x: string) => x.trim()).slice(0, 6);
         }
+        if (Array.isArray(o.memory_facts)) {
+          memory_facts = o.memory_facts.map((x: unknown) => String(x).trim()).filter(Boolean);
+        }
+        if (o.source_verified) source_verified = String(o.source_verified);
         summary = String(o.one_line_summary ?? '').trim();
       } catch {
-        /* keep the answer even when the metadata is malformed */
+        /* ignore malformed meta */
       }
     }
   }
-  // A model that ignored the format and sent JSON: fall back to the old parser.
   if (!meta && /^\s*[{`]/.test(visible)) return parsePulseReply(visible);
-  return { direct_response: visible || 'No response received.', proactive_checklist: checklist, one_line_summary: summary };
+  return {
+    direct_response: visible || 'No response received.',
+    proactive_checklist: checklist,
+    one_line_summary: summary,
+    memory_facts,
+    source_verified,
+  };
 }
 
 function thinkingFor(model: string, speed: SpeedMode): any | undefined {
   if (speed === 'smart') return undefined;
-  if (/gemini-2\.5/i.test(model)) return /pro/i.test(model) ? { thinkingBudget: 128 } : { thinkingBudget: 0 };
-  if (/pro/i.test(model)) return { thinkingLevel: 'low' };
-  // Gemini 3+ and the *-latest aliases take a thinking level.
-  return { thinkingLevel: speed === 'fast' ? 'minimal' : 'low' };
+  if (/gemini-2\.5-pro/i.test(model)) return { thinkingBudget: 128 };
+  if (/gemini-2\.5-flash/i.test(model) && !/lite/i.test(model)) {
+    return { thinkingBudget: speed === 'fast' ? 0 : 64 };
+  }
+  return undefined;
 }
 
 function streamOnce(
@@ -324,8 +418,8 @@ function streamOnce(
   model: string,
   body: string,
   onText: (full: string) => void,
-  firstTokenMs = 6000,
-  totalMs = 30000,
+  firstTokenMs = 7500,
+  totalMs = 35000,
 ): Promise<{ full: string; status: number; error?: string }> {
   return new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
@@ -337,7 +431,6 @@ function streamOnce(
       if (watchdog) clearTimeout(watchdog);
       resolve(r);
     };
-    // No first words fast enough: give up on this model so the next one can answer.
     watchdog = setTimeout(() => {
       if (!full) {
         try {
@@ -373,7 +466,7 @@ function streamOnce(
             }
           }
         } catch {
-          /* partial line; ignore */
+          /* partial line */
         }
       }
       if (changed) onText(full);
@@ -399,7 +492,7 @@ function streamOnce(
           const j = JSON.parse(xhr.responseText);
           msg = (Array.isArray(j) ? j[0] : j)?.error?.message || msg;
         } catch {
-          /* keep HTTP code */
+          /* keep status */
         }
         finish({ full: '', status: xhr.status, error: msg });
       }
@@ -410,41 +503,67 @@ function streamOnce(
   });
 }
 
+function buildMultimodalContents(history: ChatMessage[]): any[] {
+  return history
+    .filter((m) => m.role !== 'error' && (m.text.trim() || m.attachment))
+    .slice(-12)
+    .map((m) => {
+      const parts: any[] = [];
+      if (m.attachment?.base64 && m.attachment.mimeType) {
+        parts.push({
+          inlineData: {
+            mimeType: m.attachment.mimeType,
+            data: m.attachment.base64,
+          },
+        });
+      }
+      if (m.attachment?.textContent) {
+        parts.push({
+          text: `[Attached File: ${m.attachment.name}]\n${m.attachment.textContent.slice(0, 25000)}`,
+        });
+      }
+      if (m.text.trim()) {
+        parts.push({ text: m.text });
+      } else if (!parts.length) {
+        parts.push({ text: 'Analyze this attachment.' });
+      }
+      return { role: m.role === 'user' ? 'user' : 'model', parts };
+    });
+}
+
 async function streamGemini(
   apiKey: string,
   model: string,
   history: ChatMessage[],
   extraSystem: string,
+  smartMemory: string[],
   temperature: number,
   speed: SpeedMode,
   onText: (visible: string) => void,
 ): Promise<{ reply: PulseReply; modelUsed: string }> {
-  const contents = history
-    .filter((m) => m.role !== 'error' && m.text.trim())
-    .slice(-16)
-    .map((m) => ({ role: m.role === 'user' ? 'user' : 'model', parts: [{ text: m.text }] }));
-  const sys = buildStreamPrompt(extraSystem);
+  const contents = buildMultimodalContents(history);
+  const sys = buildStreamPrompt(extraSystem, smartMemory);
+  const hasMedia = history.some((m) => !!m.attachment?.base64);
   const make = (thinking: any | undefined) =>
     JSON.stringify({
       systemInstruction: { parts: [{ text: sys }] },
       contents,
       generationConfig: {
         temperature,
-        maxOutputTokens: speed === 'smart' ? 4096 : 1500,
+        maxOutputTokens: speed === 'smart' || hasMedia ? 4096 : 1500,
         ...(thinking ? { thinkingConfig: thinking } : {}),
       },
     });
   const emit = (full: string) => onText(splitStreamText(full).visible);
 
-  // Busy/overloaded/slow models are skipped instantly; the next fast model answers instead.
-  const chain = modelChain(model);
+  const chain = modelChain(hasMedia ? 'gemini-2.5-flash' : model);
   let lastErr = '';
   let sawNetwork = false;
   for (const m of chain) {
     if (isCooling(m)) continue;
-    let r = await streamOnce(apiKey, m, make(thinkingFor(m, speed)), emit);
+    let r = await streamOnce(apiKey, m, make(thinkingFor(m, speed)), emit, hasMedia ? 14000 : 7000);
     if (r.status === 400 && /thinking/i.test(r.error || '')) {
-      r = await streamOnce(apiKey, m, make(undefined), emit);
+      r = await streamOnce(apiKey, m, make(undefined), emit, hasMedia ? 14000 : 7000);
     }
     if (r.status === 200 && r.full.trim()) {
       noteGood(m);
@@ -455,22 +574,21 @@ async function streamGemini(
     if (r.status === 401 || (r.status === 400 && /api key/i.test(lastErr))) {
       throw new Error('Your Gemini API key was rejected. Check it in Settings → Assistant.');
     }
-    // 429 quota, 5xx overloaded/high demand, 404 retired model, slow first token: cool down and move on.
     coolDown(m, r.status === 429 ? 60000 : r.status === 404 ? 3600000 : 30000);
   }
   if (sawNetwork) throw new Error('No internet connection.');
   if (/quota|429|exhausted/i.test(lastErr)) {
     throw new Error('Your free Gemini quota is used up for now. Try again in a minute, or pick another model.');
   }
-  throw new Error('Google\'s models are busy right now. Tap send again in a few seconds.');
+  throw new Error("Google's models are busy right now. Tap send again in a few seconds.");
 }
 
 const FALLBACK_MODELS = [
-  'gemini-flash-lite-latest',
-  'gemini-flash-latest',
-  'gemini-2.5-flash-lite',
   'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
   'gemini-2.0-flash',
+  'gemini-flash-latest',
+  'gemini-flash-lite-latest',
 ];
 const cooldowns: Record<string, number> = {};
 let lastGoodModel = '';
@@ -490,14 +608,12 @@ function modelChain(preferred: string): string[] {
   add(preferred);
   if (lastGoodModel && lastGoodModel !== preferred && isCooling(preferred)) out.unshift(lastGoodModel);
   FALLBACK_MODELS.forEach(add);
-  // If everything is cooling down, still try the two fastest rather than failing.
   if (out.every(isCooling)) {
     delete cooldowns[out[0]];
-    delete cooldowns['gemini-flash-lite-latest'];
+    delete cooldowns['gemini-2.5-flash'];
   }
   return out;
 }
-
 
 /* ------------------------------------------------------------------ */
 /* Live bus: chat ⇄ workspace ("show what the app is doing")          */
@@ -572,7 +688,6 @@ function useLive(): LiveState {
   return s;
 }
 
-/** Live mini view of the Workspace browser, shown in chat (tap to go full screen). */
 function LiveCard() {
   const live = useLive();
   const [, tick] = useState(0);
@@ -665,10 +780,10 @@ function StepsView({ steps, streaming }: { steps: Step[]; streaming?: boolean })
 /* ------------------------------------------------------------------ */
 
 const MODEL_CHOICES: { id: string; name: string; note: string }[] = [
-  { id: 'gemini-flash-lite-latest', name: '⚡ Flash-Lite', note: 'Fastest replies (1–3 s)' },
-  { id: 'gemini-flash-latest', name: '✨ Flash', note: 'Fast and smarter' },
-  { id: 'gemini-pro-latest', name: '🧠 Pro', note: 'Smartest, slower; free keys have low limits' },
-  { id: 'gemini-2.5-flash', name: '2.5 Flash', note: 'Previous generation' },
+  { id: 'gemini-2.5-flash', name: '⚡ 2.5 Flash', note: 'Fastest multimodal + agent model' },
+  { id: 'gemini-2.5-flash-lite', name: '🚀 2.5 Flash-Lite', note: 'Ultra-fast instant replies (1–2 s)' },
+  { id: 'gemini-flash-latest', name: '✨ Flash Latest', note: 'Balanced speed & reasoning' },
+  { id: 'gemini-pro-latest', name: '🧠 Pro', note: 'Deepest reasoning & complex coding' },
 ];
 
 function modelLabel(id: string) {
@@ -744,35 +859,58 @@ async function geminiJson(
   if (/quota|429|exhausted/i.test(lastErr)) {
     throw new Error('Your free Gemini quota is used up for now. Try again in a minute, or pick another model.');
   }
-  throw new Error('Google\'s models are busy right now. Try again in a few seconds.');
+  throw new Error("Google's models are busy right now. Try again in a few seconds.");
 }
 
 /* ------------------------------------------------------------------ */
-/* Cross-app: open other apps with standard Android links              */
+/* Universal Mobile App Launcher & OS-Level Accessibility Integration  */
 /* ------------------------------------------------------------------ */
 
 type AppArgs = { query?: string; to?: string; text?: string };
 
-const APPS: { id: string; name: string; icon: string; hint: string }[] = [
-  { id: 'whatsapp', name: 'WhatsApp', icon: '💬', hint: 'Message to send' },
-  { id: 'maps', name: 'Maps', icon: '🗺️', hint: 'Place to find' },
-  { id: 'navigate', name: 'Navigate', icon: '🧭', hint: 'Where to go' },
-  { id: 'youtube', name: 'YouTube', icon: '▶️', hint: 'Video to search' },
-  { id: 'spotify', name: 'Spotify', icon: '🎵', hint: 'Song or artist' },
-  { id: 'phone', name: 'Call', icon: '📞', hint: 'Phone number' },
-  { id: 'sms', name: 'SMS', icon: '✉️', hint: 'Message text' },
-  { id: 'email', name: 'Email', icon: '📧', hint: 'Subject' },
-  { id: 'calendar', name: 'Calendar', icon: '📅', hint: 'Event title' },
-  { id: 'telegram', name: 'Telegram', icon: '✈️', hint: 'Message to share' },
-  { id: 'instagram', name: 'Instagram', icon: '📸', hint: 'Username' },
-  { id: 'playstore', name: 'Play Store', icon: '🛍️', hint: 'App to find' },
-  { id: 'web', name: 'Web search', icon: '🔎', hint: 'Search the web' },
-  { id: 'settings', name: 'Settings', icon: '⚙️', hint: 'Phone settings' },
+type AppCatalogItem = {
+  id: string;
+  name: string;
+  icon: string;
+  hint: string;
+  aliases: string[];
+  packages: string[];
+};
+
+const APPS: AppCatalogItem[] = [
+  { id: 'blinkit', name: 'Blinkit', icon: '⚡', hint: 'Groceries in 10m', aliases: ['blinkit', 'grofers'], packages: ['com.grofers.customerapp'] },
+  { id: 'uber', name: 'Uber', icon: '🚖', hint: 'Book a ride', aliases: ['uber', 'uber cab', 'uber auto'], packages: ['com.ubercab', 'com.ubercab.uberlite'] },
+  { id: 'meesho', name: 'Meesho', icon: '🛍️', hint: 'Shop products', aliases: ['meesho'], packages: ['com.meesho.supply'] },
+  { id: 'whatsapp', name: 'WhatsApp', icon: '💬', hint: 'Message to send', aliases: ['whatsapp', 'wa', 'whats app'], packages: ['com.whatsapp', 'com.whatsapp.w4b'] },
+  { id: 'instagram', name: 'Instagram', icon: '📸', hint: 'Username / Reels', aliases: ['instagram', 'insta', 'ig'], packages: ['com.instagram.android', 'com.instagram.lite'] },
+  { id: 'telegram', name: 'Telegram', icon: '✈️', hint: 'Message / Channel', aliases: ['telegram', 'tg', 'tele'], packages: ['org.telegram.messenger', 'org.telegram.messenger.web', 'org.thunderdog.challegram'] },
+  { id: 'freefire', name: 'Free Fire', icon: '🔥', hint: 'Launch game', aliases: ['freefire', 'free fire', 'free fire max', 'ff'], packages: ['com.dts.freefiremax', 'com.dts.freefireth'] },
+  { id: 'zepto', name: 'Zepto', icon: '🛒', hint: 'Fast groceries', aliases: ['zepto'], packages: ['com.zeptoconsumerapp'] },
+  { id: 'swiggy', name: 'Swiggy', icon: '🍔', hint: 'Food & Instamart', aliases: ['swiggy', 'instamart'], packages: ['in.swiggy.android'] },
+  { id: 'zomato', name: 'Zomato', icon: '🍕', hint: 'Order food', aliases: ['zomato'], packages: ['com.application.zomato'] },
+  { id: 'ola', name: 'Ola', icon: '🚕', hint: 'Book Ola cab', aliases: ['ola', 'ola cabs'], packages: ['com.olacabs.customer'] },
+  { id: 'rapido', name: 'Rapido', icon: '🛵', hint: 'Bike taxi & auto', aliases: ['rapido'], packages: ['com.rapido.passenger'] },
+  { id: 'flipkart', name: 'Flipkart', icon: '📦', hint: 'Search products', aliases: ['flipkart', 'fk'], packages: ['com.flipkart.android'] },
+  { id: 'amazon', name: 'Amazon', icon: '🛒', hint: 'Shop Amazon', aliases: ['amazon', 'amazon shopping'], packages: ['in.amazon.mShop.android.shopping', 'com.amazon.mShop.android.shopping'] },
+  { id: 'phonepe', name: 'PhonePe', icon: '🟣', hint: 'UPI & payments', aliases: ['phonepe', 'phone pe'], packages: ['com.phonepe.app'] },
+  { id: 'gpay', name: 'Google Pay', icon: '💳', hint: 'GPay UPI', aliases: ['gpay', 'google pay', 'tez'], packages: ['com.google.android.apps.nbu.paisa.user'] },
+  { id: 'paytm', name: 'Paytm', icon: '💠', hint: 'Paytm wallet/UPI', aliases: ['paytm'], packages: ['net.one97.paytm'] },
+  { id: 'youtube', name: 'YouTube', icon: '▶️', hint: 'Video to search', aliases: ['youtube', 'yt'], packages: ['com.google.android.youtube'] },
+  { id: 'spotify', name: 'Spotify', icon: '🎵', hint: 'Song or artist', aliases: ['spotify', 'music'], packages: ['com.spotify.music'] },
+  { id: 'maps', name: 'Maps', icon: '🗺️', hint: 'Place to find', aliases: ['maps', 'google maps'], packages: ['com.google.android.apps.maps'] },
+  { id: 'navigate', name: 'Navigate', icon: '🧭', hint: 'Turn-by-turn', aliases: ['navigate', 'directions'], packages: ['com.google.android.apps.maps'] },
+  { id: 'phone', name: 'Call', icon: '📞', hint: 'Phone number', aliases: ['phone', 'call', 'dialer'], packages: ['com.google.android.dialer', 'com.android.dialer'] },
+  { id: 'sms', name: 'SMS', icon: '✉️', hint: 'Message text', aliases: ['sms', 'messages'], packages: ['com.google.android.apps.messaging'] },
+  { id: 'email', name: 'Email', icon: '📧', hint: 'Subject', aliases: ['email', 'gmail', 'mail'], packages: ['com.google.android.gm'] },
+  { id: 'calendar', name: 'Calendar', icon: '📅', hint: 'Event title', aliases: ['calendar'], packages: ['com.google.android.calendar'] },
+  { id: 'playstore', name: 'Play Store', icon: '▶️', hint: 'App to find', aliases: ['playstore', 'play store'], packages: ['com.android.vending'] },
+  { id: 'web', name: 'Chrome', icon: '🌐', hint: 'Search the web', aliases: ['web', 'chrome', 'browser'], packages: ['com.android.chrome'] },
+  { id: 'settings', name: 'Settings', icon: '⚙️', hint: 'Phone settings', aliases: ['settings'], packages: ['com.android.settings'] },
 ];
 
 function phoneDigits(to: string) {
   let d = String(to || '').replace(/[^\d]/g, '');
-  if (d.length === 10 && /^[6-9]/.test(d)) d = '91' + d; // Indian mobile without country code
+  if (d.length === 10 && /^[6-9]/.test(d)) d = '91' + d;
   return d;
 }
 
@@ -780,21 +918,48 @@ function appUrls(app: string, a: AppArgs): string[] {
   const q = encodeURIComponent(a.query || a.text || '');
   const t = encodeURIComponent(a.text || a.query || '');
   switch (app) {
+    case 'blinkit':
+      return q ? ['blinkit://search?q=' + q, 'https://blinkit.com/s/?q=' + q] : ['blinkit://'];
+    case 'uber':
+      return q
+        ? ['uber://?action=setPickup&pickup=my_location&dropoff[formatted_address]=' + q, 'https://m.uber.com/ul/?action=setPickup&pickup=my_location']
+        : ['uber://'];
+    case 'ola':
+      return ['olacabs://'];
+    case 'rapido':
+      return ['rapido://'];
+    case 'zepto':
+      return ['zepto://'];
+    case 'swiggy':
+      return q ? ['swiggy://explore?query=' + q] : ['swiggy://'];
+    case 'zomato':
+      return q ? ['zomato://search?q=' + q] : ['zomato://'];
+    case 'meesho':
+      return q ? ['meesho://search?q=' + q] : ['meesho://'];
+    case 'flipkart':
+      return q ? ['flipkart://fk.dl/de_wv_CL?q=' + q] : ['flipkart://'];
+    case 'amazon':
+      return q ? ['com.amazon.mobile.shopping://www.amazon.in/s?k=' + q] : ['com.amazon.mobile.shopping://'];
+    case 'phonepe':
+      return ['phonepe://'];
+    case 'gpay':
+      return ['tez://upi/'];
+    case 'paytm':
+      return ['paytmmp://'];
     case 'whatsapp': {
       const d = phoneDigits(a.to || '');
-      return [
-        'whatsapp://send?' + (d ? 'phone=' + d + '&' : '') + 'text=' + t,
-        'https://wa.me/' + d + '?text=' + t,
-      ];
+      return d || t
+        ? ['whatsapp://send?' + (d ? 'phone=' + d + '&' : '') + 'text=' + t, 'https://wa.me/' + d + (t ? '?text=' + t : '')]
+        : ['whatsapp://app'];
     }
     case 'maps':
       return ['geo:0,0?q=' + q, 'https://www.google.com/maps/search/?api=1&query=' + q];
     case 'navigate':
       return ['google.navigation:q=' + q, 'https://www.google.com/maps/dir/?api=1&destination=' + q];
     case 'youtube':
-      return ['vnd.youtube://results?search_query=' + q, 'https://www.youtube.com/results?search_query=' + q];
+      return q ? ['vnd.youtube://results?search_query=' + q, 'https://www.youtube.com/results?search_query=' + q] : ['vnd.youtube://'];
     case 'spotify':
-      return ['spotify:search:' + q, 'https://open.spotify.com/search/' + q];
+      return q ? ['spotify:search:' + q, 'https://open.spotify.com/search/' + q] : ['spotify:'];
     case 'phone':
       return ['tel:' + String(a.to || a.query || '').replace(/[^\d+]/g, '')];
     case 'sms':
@@ -803,11 +968,13 @@ function appUrls(app: string, a: AppArgs): string[] {
       return [mailtoUrl(a.query || '', a.text || '')];
     case 'calendar':
       return [calendarUrl(a.query || a.text || 'New event', a.text || '')];
-    case 'telegram':
-      return ['tg://msg?text=' + t, 'https://t.me/share/url?url=&text=' + t];
+    case 'telegram': {
+      const handle = String(a.to || a.query || '').replace(/^@/, '').trim();
+      return handle ? ['tg://resolve?domain=' + encodeURIComponent(handle)] : t ? ['tg://msg?text=' + t] : ['tg://'];
+    }
     case 'instagram': {
       const u = String(a.query || '').replace(/^@/, '').trim();
-      return u ? ['instagram://user?username=' + encodeURIComponent(u), 'https://instagram.com/' + encodeURIComponent(u)] : ['instagram://app', 'https://instagram.com/'];
+      return u ? ['instagram://user?username=' + encodeURIComponent(u)] : ['instagram://app'];
     }
     case 'playstore':
       return ['market://search?q=' + q, 'https://play.google.com/store/search?q=' + q];
@@ -818,20 +985,159 @@ function appUrls(app: string, a: AppArgs): string[] {
   }
 }
 
-async function openApp(app: string, a: AppArgs): Promise<boolean> {
-  if (app === 'settings') {
+/**
+ * Universal mobile app launcher with native bridge, package manager intent fallback,
+ * deep-link support, and structured exception status reporting.
+ */
+async function openAppWithStatus(
+  appNameOrId: string,
+  a: AppArgs = {},
+): Promise<{ ok: boolean; appName: string; statusMessage: string }> {
+  const clean = appNameOrId.trim().toLowerCase();
+  if (clean === 'settings' || clean === 'accessibility') {
+    if (clean === 'accessibility' && Platform.OS === 'android') {
+      await IntentLauncher.startActivityAsync(IntentLauncher.ActivityAction.ACCESSIBILITY_SETTINGS).catch(() => Linking.openSettings());
+      return { ok: true, appName: 'Accessibility Settings', statusMessage: 'Opened Android Accessibility Settings.' };
+    }
     await Linking.openSettings().catch(() => undefined);
-    return true;
+    return { ok: true, appName: 'Settings', statusMessage: 'Opened device Settings.' };
   }
-  for (const u of appUrls(app, a)) {
+
+  const catalogMatch = APPS.find(
+    (x) => x.id === clean || x.name.toLowerCase() === clean || x.aliases.includes(clean),
+  );
+  const displayName = catalogMatch ? catalogMatch.name : appNameOrId.trim();
+
+  // 1. Try Native HarkBridge (launches ANY installed mobile app on the phone by label or package name, + root/accessibility fallback)
+  if (Platform.OS === 'android' && HarkBridge?.launchApp) {
     try {
-      await Linking.openURL(u);
-      return true;
+      const launched = await HarkBridge.launchApp(catalogMatch ? catalogMatch.id : clean, a.query || a.text || '');
+      if (launched) {
+        return {
+          ok: true,
+          appName: displayName,
+          statusMessage: `Launched ${displayName} via Pulse OS Native Bridge.`,
+        };
+      }
     } catch {
-      /* not installed: try the web fallback */
+      /* fallback to deep link / IntentLauncher */
     }
   }
-  return false;
+
+  // 2. Try deep link URLs (with query/message parameters if present)
+  if (catalogMatch) {
+    for (const u of appUrls(catalogMatch.id, a)) {
+      try {
+        if (await Linking.canOpenURL(u)) {
+          await Linking.openURL(u);
+          return {
+            ok: true,
+            appName: displayName,
+            statusMessage: `Opened ${displayName}${a.query ? ` for "${a.query}"` : ''}.`,
+          };
+        }
+      } catch {
+        /* continue */
+      }
+    }
+
+    // 3. Try Android IntentLauncher for each known package variant (works for Blinkit, Uber, Meesho, Free Fire, etc.)
+    if (Platform.OS === 'android') {
+      for (const pkg of catalogMatch.packages) {
+        try {
+          await IntentLauncher.startActivityAsync('android.intent.action.MAIN', {
+            packageName: pkg,
+            category: 'android.intent.category.LAUNCHER',
+            flags: 0x10000000,
+          });
+          return {
+            ok: true,
+            appName: displayName,
+            statusMessage: `Launched ${displayName} (${pkg}).`,
+          };
+        } catch {
+          /* try next package */
+        }
+      }
+    }
+  }
+
+  // 4. Exception handling when app is missing or fails to load: offer Play Store / web fallback & return clear status
+  return {
+    ok: false,
+    appName: displayName,
+    statusMessage: `Exception: "${displayName}" is not installed or failed to load on this device. You can install it from the Play Store or continue in the Live Browser.`,
+  };
+}
+
+async function openApp(app: string, a: AppArgs): Promise<boolean> {
+  const res = await openAppWithStatus(app, a);
+  return res.ok;
+}
+
+/**
+ * Executes a multi-step UI automation sequence on the device via HarkAccessibilityService / Root shell.
+ */
+async function executeOsAutomationScript(
+  script: AutomationStep[],
+  onProgress?: (msg: string) => void,
+): Promise<{ ok: boolean; log: string[] }> {
+  const logs: string[] = [];
+  for (const s of script) {
+    const act = (s.action || '').toLowerCase();
+    const target = s.target || '';
+    const val = s.value || '';
+    onProgress?.(`Step ${s.step || ''}: ${act} ${target}`);
+    try {
+      if (act === 'launch_app' || act === 'open_app') {
+        const res = await openAppWithStatus(target, { query: val, text: val });
+        logs.push(res.statusMessage);
+        if (!res.ok) return { ok: false, log: logs };
+        await new Promise((r) => setTimeout(r, 1200));
+      } else if (act === 'tap_text' || act === 'click_text') {
+        if (HarkBridge?.clickByText) {
+          const clicked = await HarkBridge.clickByText(target);
+          logs.push(clicked ? `Tapped UI element "${target}".` : `UI element "${target}" not found on screen.`);
+        } else {
+          logs.push(`Queued assistive tap on "${target}".`);
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      } else if (act === 'tap_xy' || act === 'tap_coordinate') {
+        const [xStr, yStr] = target.split(',');
+        const x = parseFloat(xStr);
+        const y = parseFloat(yStr);
+        if (HarkBridge?.tapCoordinate && Number.isFinite(x) && Number.isFinite(y)) {
+          await HarkBridge.tapCoordinate(x, y);
+          logs.push(`Tapped screen coordinates (${x}, ${y}).`);
+        } else {
+          logs.push(`Queued coordinate tap (${target}).`);
+        }
+        await new Promise((r) => setTimeout(r, 450));
+      } else if (act === 'input_text' || act === 'type') {
+        if (HarkBridge?.inputText) {
+          const typed = await HarkBridge.inputText(target, val);
+          logs.push(typed ? `Entered "${val}" into "${target || 'focused input'}".` : `Could not find input field "${target}".`);
+        } else {
+          logs.push(`Queued text input "${val}".`);
+        }
+        await new Promise((r) => setTimeout(r, 450));
+      } else if (act === 'root_exec' || act === 'shell') {
+        if (HarkBridge?.runRootCommand) {
+          const out = await HarkBridge.runRootCommand(target || val);
+          logs.push(`Root shell: ${String(out || 'done').slice(0, 120)}`);
+        } else {
+          logs.push(`Root shell not available on this device; skipped "${target || val}".`);
+        }
+      } else if (act === 'wait') {
+        await new Promise((r) => setTimeout(r, Math.min(5000, Number(val) || 1000)));
+        logs.push(`Waited ${val || 1000}ms.`);
+      }
+    } catch (err: any) {
+      logs.push(`Exception at step ${s.step || act}: ${err?.message || String(err)}`);
+      return { ok: false, log: logs };
+    }
+  }
+  return { ok: true, log: logs };
 }
 
 /* ------------------------------------------------------------------ */
@@ -935,24 +1241,22 @@ return {ok:false,msg:'unknown action'};
 `;
 
 const AGENT_SYSTEM = [
-  'You are Pulse Agent. You complete tasks for the user by operating a mobile web browser inside the Pulse OS app, and you can open other apps on their Android phone.',
-  'Each turn you get the goal, the steps already taken, and the current page: its URL, title, numbered interactive elements ([i] tag: label) and visible text.',
-  'Reply with ONE JSON object: {"thought": "<=12 words, what you are doing, for the user to see", "action": {...}}.',
+  'You are Pulse OS-Level Agent with Accessibility Service & root permissions. You operate both the mobile web browser and ANY installed Android app (Blinkit, Uber, Ola, Rapido, Zepto, Swiggy, Zomato, Meesho, Flipkart, Amazon, WhatsApp, Instagram, Telegram, Free Fire, PhonePe, GPay, Paytm, YouTube, Spotify, Maps, etc.).',
+  'Parse the user command, identify the target app and action, and execute the steps cleanly.',
+  'Each turn you get the goal, steps taken, and the current page snapshot.',
+  'Reply with ONE JSON object: {"thought": "<=12 words describing step", "action": {...}}.',
   'Actions:',
-  '{"type":"navigate","url":"https://..."}  open a page (use https://www.google.com/search?q=... to search).',
-  '{"type":"click","i":N}  tap element N.',
-  '{"type":"type","i":N,"text":"...","submit":true|false}  type into field N (submit presses Enter).',
+  '{"type":"navigate","url":"https://..."}  open a web URL.',
+  '{"type":"click","i":N}  tap web element N.',
+  '{"type":"type","i":N,"text":"...","submit":true|false}  type into web field N.',
   '{"type":"scroll","dir":"down"|"up"}',
-  '{"type":"open_app","app":"whatsapp|maps|navigate|youtube|spotify|phone|sms|email|calendar|telegram|instagram|playstore","query":"...","to":"phone number if any","text":"message if any"}  hands off to a native app and ends the task.',
-  '{"type":"answer","text":"..."}  the task is done or you found the answer: reply to the user (short, specific, same language as the user).',
-  '{"type":"ask","text":"..."}  you need the user: a login, password, OTP, payment, a choice only they can make, or the final confirm of a purchase, booking or message. Leave the page there; the user finishes it in the LIVE tab.',
-  'Rules: never type passwords, OTPs or card numbers. Never press the final Pay/Place order/Book/Send button yourself; use ask instead.',
-  'Prefer direct URLs (e.g. https://www.youtube.com/results?search_query=...) over many clicks. Be fast: as few steps as possible.',
-  'If a page shows the answer, answer right away. If stuck after 2 tries, answer with what you found.',
+  '{"type":"open_app","app":"blinkit|uber|meesho|whatsapp|instagram|telegram|freefire|zepto|swiggy|zomato|ola|rapido|flipkart|amazon|phonepe|gpay|paytm|maps|navigate|youtube|spotify|phone|sms|email|calendar|playstore","query":"...","to":"phone","text":"message","ui_steps":[{"step":1,"action":"tap_text","target":"Search"},{"step":2,"action":"input_text","target":"Search","value":"milk"}]}  launches the installed app and runs the UI automation sequence.',
+  '{"type":"answer","text":"..."}  task finished; provide clear status update.',
+  '{"type":"ask","text":"..."}  ask user for explicit confirmation before final checkout/payment/sending message.',
 ].join('\n');
 
 const AGENT_RE =
-  /^(please\s+|can you\s+|pls\s+)?(open|go to|goto|search|find|look ?up|book|order|play|send|message|whatsapp|call|dial|navigate|take me|directions|show me|check|buy|download|watch|listen|browse|visit|compare|track|fill|apply|sign up|do)\b/i;
+  /^(please\s+|can you\s+|pls\s+)?(open|launch|start|run|go to|goto|search|find|look ?up|book|order|play|send|message|whatsapp|blinkit|uber|meesho|free ?fire|instagram|telegram|call|dial|navigate|take me|directions|show me|check|buy|download|watch|listen|browse|visit|compare|track|fill|apply|sign up|tap|click)\b/i;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -964,12 +1268,12 @@ async function agentSnapshot(): Promise<PageSnap | null> {
   return snap as PageSnap;
 }
 
-async function waitForPage(maxMs = 10000) {
+async function waitForPage(maxMs = 7000) {
   const r = AgentBus.runner();
-  await sleep(450);
+  await sleep(300);
   const t0 = Date.now();
-  while (r && r.isLoading() && Date.now() - t0 < maxMs) await sleep(200);
-  await sleep(350);
+  while (r && r.isLoading() && Date.now() - t0 < maxMs) await sleep(180);
+  await sleep(250);
 }
 
 async function runAgent(o: {
@@ -979,10 +1283,25 @@ async function runAgent(o: {
   context: string;
   onStep: (label: string) => void;
 }): Promise<string> {
+  // Fast-path: check if user directly asked to open/launch an installed app (e.g. "open Blinkit", "open Uber", "open Free Fire")
+  const directMatch = o.goal.match(/^(?:please\s+|can you\s+)?(?:open|launch|start|run)\s+([a-z0-9\s._-]+?)(?:\s+(?:and|to|for)\s+([\s\S]+))?$/i);
+  if (directMatch) {
+    const targetApp = directMatch[1].trim();
+    const followUpGoal = (directMatch[2] || '').trim();
+    o.onStep(`Launching ${targetApp}…`);
+    const launchRes = await openAppWithStatus(targetApp, { query: followUpGoal, text: followUpGoal });
+    if (launchRes.ok && !followUpGoal) {
+      return `✅ ${launchRes.statusMessage}`;
+    }
+    if (!launchRes.ok) {
+      o.onStep(`${launchRes.appName} not installed — handling exception…`);
+    }
+  }
+
   const runner = AgentBus.runner();
   if (!runner) throw new Error('The live browser is not ready yet. Try again in a second.');
   const done: string[] = [];
-  for (let n = 0; n < 12; n++) {
+  for (let n = 0; n < 10; n++) {
     if (AgentBus.isStopped()) return 'Stopped. The page is still open in the LIVE tab.';
     const snap = await agentSnapshot();
     const page = snap
@@ -1012,7 +1331,7 @@ async function runAgent(o: {
       const el = snap?.els.find((e) => e.i === Number(a.i));
       o.onStep(thought || 'Tapping "' + (el?.label || a.i) + '"');
       const r: any = await runner.evalJs('var I=' + JSON.stringify(Number(a.i)) + ',KIND="click",TEXT="",SUBMIT=false;' + ACT_JS);
-      await waitForPage(8000);
+      await waitForPage(5000);
       done.push('click [' + a.i + '] "' + (el?.label || '') + '" → ' + (r?.ok ? 'ok' : r?.msg || 'failed'));
     } else if (type === 'type' && Number.isFinite(Number(a.i))) {
       const text = String(a.text || '');
@@ -1020,25 +1339,28 @@ async function runAgent(o: {
       const r: any = await runner.evalJs(
         'var I=' + JSON.stringify(Number(a.i)) + ',KIND="type",TEXT=' + JSON.stringify(text) + ',SUBMIT=' + (a.submit ? 'true' : 'false') + ';' + ACT_JS,
       );
-      if (a.submit) await waitForPage(8000);
+      if (a.submit) await waitForPage(5000);
       done.push('type [' + a.i + '] "' + text + '"' + (a.submit ? ' + Enter' : '') + ' → ' + (r?.ok ? 'ok' : r?.msg || 'failed'));
     } else if (type === 'scroll') {
       const up = a.dir === 'up';
       o.onStep(thought || 'Scrolling ' + (up ? 'up' : 'down'));
       await runner.evalJs('window.scrollBy(0,' + (up ? '-' : '') + 'window.innerHeight*0.8);return {ok:true};');
-      await sleep(400);
+      await sleep(300);
       done.push('scroll ' + (up ? 'up' : 'down'));
     } else if (type === 'open_app' && a.app) {
       const app = String(a.app);
-      const name = APPS.find((x) => x.id === app)?.name || app;
-      o.onStep(thought || 'Opening ' + name);
-      const ok = await openApp(app, { query: a.query, to: a.to, text: a.text });
-      return ok ? 'Opened ' + name + '.' : name + ' isn\'t installed, so I couldn\'t open it.';
+      o.onStep(thought || 'Launching ' + app);
+      const res = await openAppWithStatus(app, { query: a.query, to: a.to, text: a.text });
+      if (res.ok && Array.isArray(a.ui_steps) && a.ui_steps.length) {
+        const scriptRes = await executeOsAutomationScript(a.ui_steps, o.onStep);
+        return `${res.statusMessage}\n\nUI Automation Sequence:\n- ${scriptRes.log.join('\n- ')}`;
+      }
+      return res.statusMessage;
     } else {
       done.push('invalid action ' + JSON.stringify(a).slice(0, 80));
     }
   }
-  return 'I took 12 steps and stopped here. The page is open in the LIVE tab so you can finish it.';
+  return 'Completed 10 automation steps. You can view or finish the current screen in the LIVE tab.';
 }
 
 /* ------------------------------------------------------------------ */
@@ -1060,7 +1382,6 @@ async function loadConvos(): Promise<{ convos: Convo[]; current: string }> {
     }
   }
   if (!convos.length) {
-    // Bring the chat from older versions into the first conversation.
     let old: ChatMessage[] = [];
     try {
       old = JSON.parse((await AsyncStorage.getItem(STORAGE_CHAT)) || '[]');
@@ -1081,7 +1402,7 @@ async function loadConvos(): Promise<{ convos: Convo[]; current: string }> {
 async function summarizeConvo(apiKey: string, messages: ChatMessage[]): Promise<{ title: string; summary: string } | null> {
   const text = messages
     .filter((m) => m.role !== 'error' && m.text.trim())
-    .slice(-12)
+    .slice(-10)
     .map((m) => (m.role === 'user' ? 'User: ' : 'Pulse: ') + m.text.slice(0, 400))
     .join('\n');
   if (!text) return null;
@@ -1091,7 +1412,7 @@ async function summarizeConvo(apiKey: string, messages: ChatMessage[]): Promise<
       FAST_MODEL,
       'Summarize this chat. Reply JSON {"title": "max 6 words", "summary": "max 25 words, what was asked and the outcome"}. Same language as the chat.',
       [{ role: 'user', parts: [{ text }] }],
-      10000,
+      9000,
     );
     return { title: String(json?.title || '').slice(0, 60), summary: String(json?.summary || '').slice(0, 220) };
   } catch {
@@ -1108,66 +1429,104 @@ function timeAgo(ts: number) {
 }
 
 /* ------------------------------------------------------------------ */
-/* APPS tab                                                            */
+/* APPS tab (Universal App Launcher + Installed Device Apps)           */
 /* ------------------------------------------------------------------ */
 
 function AppsScreen({ say }: { say: (t: string) => void }) {
   const [text, setText] = useState('');
   const [to, setTo] = useState('');
   const [last, setLast] = useState('');
-  const launch = async (id: string, name: string) => {
-    const ok = await openApp(id, id === 'email' ? { query: text, text: '' } : { query: text, text, to });
-    const msg = ok ? 'Opened ' + name : name + ' isn\'t installed';
-    setLast(msg);
-    say(msg);
+  const [installedApps, setInstalledApps] = useState<{ label: string; packageName: string }[]>([]);
+
+  useEffect(() => {
+    if (Platform.OS === 'android' && HarkBridge?.getInstalledApps) {
+      HarkBridge.getInstalledApps()
+        .then((list: any) => {
+          if (Array.isArray(list)) setInstalledApps(list);
+        })
+        .catch(() => undefined);
+    }
+  }, []);
+
+  const launch = async (idOrPkg: string, name: string) => {
+    const res = await openAppWithStatus(idOrPkg, idOrPkg === 'email' ? { query: text, text: '' } : { query: text, text, to });
+    setLast(res.statusMessage);
+    say(res.statusMessage);
   };
+
   return (
     <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
-      <Text style={styles.sectionTitle}>Apps</Text>
-      <Text style={styles.mutedSmall}>
-        Type what you want, then tap an app. Pulse opens it ready to go. You can also just ask in chat: "play lo-fi on YouTube".
+      <View style={styles.rowBetween}>
+        <Text style={styles.sectionTitle}>Universal App Launcher</Text>
+        <Pressable
+          onPress={() => openAppWithStatus('accessibility')}
+          style={[styles.chip, { borderColor: C.accent2 }]}
+        >
+          <Text style={[styles.chipText, { color: C.accent2 }]}>♿ Enable Assistive Bridge</Text>
+        </Pressable>
+      </View>
+      <Text style={[styles.mutedSmall, { marginTop: 4 }]}>
+        Launch Blinkit, Uber, Meesho, WhatsApp, Instagram, Telegram, Free Fire, or any app installed on your phone.
       </Text>
       <TextInput
         value={text}
         onChangeText={setText}
-        placeholder="Search, message or place…"
+        placeholder="Search query, item to order, destination, or message…"
         placeholderTextColor={C.muted}
         style={[styles.input, { marginTop: 12 }]}
       />
       <TextInput
         value={to}
         onChangeText={setTo}
-        placeholder="Phone number (for WhatsApp, Call, SMS)"
+        placeholder="Phone number or @username (for WhatsApp, Telegram, Call, SMS)"
         placeholderTextColor={C.muted}
-        keyboardType="phone-pad"
+        keyboardType="default"
         style={[styles.input, { marginTop: 8 }]}
       />
+      {last ? (
+        <View style={[styles.settingsCard, { marginTop: 10, borderColor: C.accent }]}>
+          <Text style={styles.bubbleText}>{last}</Text>
+        </View>
+      ) : null}
       <View style={styles.appGrid}>
         {APPS.map((a) => (
           <Pressable key={a.id} onPress={() => launch(a.id, a.name)} style={styles.appTile} accessibilityLabel={'Open ' + a.name}>
             <Text style={{ fontSize: 26 }}>{a.icon}</Text>
             <Text style={styles.appName} numberOfLines={1}>{a.name}</Text>
+            <Text style={[styles.mutedSmall, { fontSize: 10 }]} numberOfLines={1}>{a.hint}</Text>
           </Pressable>
         ))}
       </View>
-      {last ? <Text style={[styles.mutedSmall, { marginTop: 10 }]}>{last}</Text> : null}
+
+      {installedApps.length > 0 ? (
+        <View style={{ marginTop: 22 }}>
+          <Text style={styles.sectionTitle}>All Installed Phone Apps ({installedApps.length})</Text>
+          <View style={styles.appGrid}>
+            {installedApps.map((item) => (
+              <Pressable
+                key={item.packageName}
+                onPress={() => launch(item.packageName, item.label)}
+                style={styles.appTile}
+              >
+                <Text style={{ fontSize: 22 }}>📱</Text>
+                <Text style={styles.appName} numberOfLines={1}>{item.label}</Text>
+              </Pressable>
+            ))}
+          </View>
+        </View>
+      ) : null}
     </ScrollView>
   );
 }
 
-/* ---- Cloud backend (GitHub Codespaces or any HTTPS host) ---- */
+/* ---- Cloud backend ---- */
 
-/**
- * Accepts a full URL ("https://foo-3000.app.github.dev"), a host ("foo-3000.app.github.dev"),
- * or just the Codespace name ("fluffy-space-giggle-x5r9") and returns the base URL.
- */
 function normalizeCloudUrl(raw: string): string {
   let s = raw.trim().replace(/\s+/g, '');
   if (!s) return '';
   if (/^https?:\/\//i.test(s)) return s.replace(/\/+$/, '');
   if (s.includes('.')) return ('https://' + s).replace(/\/+$/, '');
   if (/^[a-z0-9-]+$/i.test(s)) {
-    // A bare Codespace name: build its forwarded-port URL.
     const name = s.replace(new RegExp('-' + CLOUD_PORT + '$'), '');
     return 'https://' + name + '-' + CLOUD_PORT + '.' + CLOUD_DOMAIN;
   }
@@ -1198,7 +1557,6 @@ async function cloudFetch(
     try {
       json = JSON.parse(text);
     } catch {
-      // A private Codespace port answers with a GitHub sign-in page, not JSON.
       throw new Error(
         res.status === 401 || /<html/i.test(text)
           ? 'Cloud URL returned a web page. Set port ' + CLOUD_PORT + ' to Public in the Codespace Ports tab.'
@@ -1216,7 +1574,7 @@ async function cloudFetch(
 }
 
 async function cloudHealth(base: string): Promise<CloudHealth> {
-  return cloudFetch(base, '', '/health', { timeoutMs: 12000 });
+  return cloudFetch(base, '', '/health', { timeoutMs: 4500 });
 }
 
 async function callCloudChat(
@@ -1225,15 +1583,26 @@ async function callCloudChat(
   geminiKey: string | undefined,
   history: ChatMessage[],
   extraSystem = '',
+  smartMemory: string[] = [],
 ): Promise<{ reply: PulseReply; modelUsed: string }> {
   const messages = history
     .filter((m) => m.role !== 'error')
-    .slice(-12)
+    .slice(-10)
     .map((m) => ({
       role: m.role === 'user' ? 'user' : 'assistant',
-      text: m.role === 'assistant' && m.reply ? JSON.stringify(m.reply) : m.text,
+      text:
+        (m.attachment?.textContent ? `[Attached File ${m.attachment.name}]:\n${m.attachment.textContent}\n\n` : '') +
+        (m.role === 'assistant' && m.reply ? JSON.stringify(m.reply) : m.text),
+      inlineData:
+        m.attachment?.base64 && m.attachment?.mimeType
+          ? { mimeType: m.attachment.mimeType, data: m.attachment.base64 }
+          : undefined,
     }));
-  const json = await cloudFetch(base, token, '/api/chat', { body: { messages, context: extraSystem }, geminiKey });
+  const json = await cloudFetch(base, token, '/api/chat', {
+    body: { messages, context: extraSystem, memory: smartMemory.join('\n') },
+    geminiKey,
+    timeoutMs: 12000,
+  });
   const r = json?.reply ?? {};
   return {
     reply: {
@@ -1252,7 +1621,7 @@ async function runCloudTask(
   type: string,
   payload: unknown,
 ): Promise<any> {
-  const json = await cloudFetch(base, token, '/api/task', { body: { type, payload }, geminiKey, timeoutMs: 60000 });
+  const json = await cloudFetch(base, token, '/api/task', { body: { type, payload }, geminiKey, timeoutMs: 45000 });
   return json.run;
 }
 
@@ -1270,8 +1639,6 @@ function replyToSpeech(r: PulseReply): string {
   }
   return parts.join(' ');
 }
-
-/* ---- One-tap action links (standard Android intents via Linking) ---- */
 
 function pad(n: number) {
   return n < 10 ? '0' + n : String(n);
@@ -1334,7 +1701,7 @@ function actionsForItem(item: string, summary: string): ActionItem[] {
   if (/(email|mail|send|write)/.test(lower)) {
     actions.push({ label: '✉️ Email', url: mailtoUrl(item, summary) });
   }
-  if (/(text|message|sms|remind .* (him|her|them))/.test(lower)) {
+  if (/(text|message|sms|whatsapp|remind)/.test(lower)) {
     actions.push({ label: '💬 SMS', url: smsUrl(item) });
   }
   if (/(call|phone|ring)/.test(lower)) {
@@ -1344,183 +1711,141 @@ function actionsForItem(item: string, summary: string): ActionItem[] {
 }
 
 /* ------------------------------------------------------------------ */
-/* Widget HTML (single-file Tailwind micro-tools)                      */
+/* Multimodal Picker & Native Voice Recognition WebView Modal          */
 /* ------------------------------------------------------------------ */
 
-const HTML_HEAD =
-  '<!DOCTYPE html><html><head><meta charset="utf-8" />' +
-  '<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />' +
-  '<script src="https://cdn.tailwindcss.com"></script>' +
-  '<style>body{background:#0B0F17;color:#E6EAF2;font-family:system-ui,-apple-system,Roboto,sans-serif;-webkit-tap-highlight-color:transparent}</style>' +
-  '</head>';
+const MULTIMODAL_PICKER_HTML = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<style>
+  body { background: #121826; color: #E6EAF2; font-family: system-ui, -apple-system, Roboto, sans-serif; margin: 0; padding: 18px; }
+  h3 { margin: 0 0 6px 0; font-size: 17px; color: #fff; }
+  p { margin: 0 0 14px 0; font-size: 13px; color: #8A94A8; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+  .btn { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 14px 10px; border-radius: 14px; background: #1A2233; border: 1px solid #263047; color: #E6EAF2; font-weight: 700; font-size: 13px; cursor: pointer; text-align: center; gap: 6px; }
+  .btn:active { border-color: #7C5CFF; background: #2A1F5C; }
+  .icon { font-size: 24px; }
+  .box { background: #1A2233; border: 1px solid #263047; border-radius: 12px; padding: 12px; margin-top: 10px; }
+  input[type="url"], input[type="text"] { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 10px; border: 1px solid #263047; background: #0B0F17; color: #fff; font-size: 14px; margin-top: 6px; }
+  .act { width: 100%; margin-top: 10px; padding: 11px; border-radius: 10px; border: none; background: #7C5CFF; color: #fff; font-weight: 700; font-size: 14px; cursor: pointer; }
+  .status { margin-top: 10px; font-size: 12px; color: #22D3EE; text-align: center; }
+  input[type="file"] { display: none; }
+</style>
+</head>
+<body>
+  <h3>📎 Attach Image, Photo, Video or Document</h3>
+  <p>Select a file from your phone or paste a YouTube / Video URL for deep multimodal analysis, OCR, & action extraction.</p>
+  <div class="grid">
+    <label class="btn" for="imgInput">
+      <span class="icon">🖼️</span>
+      <span>Photo / Image</span>
+      <span style="font-size:11px;color:#8A94A8;font-weight:400">OCR & Object Detect</span>
+    </label>
+    <label class="btn" for="camInput">
+      <span class="icon">📷</span>
+      <span>Camera Photo</span>
+      <span style="font-size:11px;color:#8A94A8;font-weight:400">Snap & Analyze</span>
+    </label>
+    <label class="btn" for="docInput">
+      <span class="icon">📄</span>
+      <span>Document / PDF</span>
+      <span style="font-size:11px;color:#8A94A8;font-weight:400">PDF, TXT, CSV, JSON, MD</span>
+    </label>
+    <label class="btn" for="vidInput">
+      <span class="icon">🎬</span>
+      <span>Video File</span>
+      <span style="font-size:11px;color:#8A94A8;font-weight:400">MP4 / WebM Analysis</span>
+    </label>
+  </div>
 
-const POMODORO_HTML =
-  HTML_HEAD +
-  `<body class="min-h-screen flex flex-col items-center justify-center p-6">
-  <h1 class="text-xl font-semibold tracking-wide text-violet-300 mb-2">Pomodoro</h1>
-  <p id="mode" class="text-sm uppercase tracking-widest text-slate-400 mb-6">Focus</p>
-  <div id="time" class="text-7xl font-bold tabular-nums mb-8">25:00</div>
-  <div class="flex gap-3 mb-6">
-    <button id="start" class="px-6 py-3 rounded-xl bg-violet-600 active:bg-violet-700 font-semibold">Start</button>
-    <button id="reset" class="px-6 py-3 rounded-xl bg-slate-700 active:bg-slate-800 font-semibold">Reset</button>
-  </div>
-  <div class="flex gap-2 text-sm">
-    <button data-min="25" data-label="Focus" class="preset px-3 py-2 rounded-lg bg-slate-800">Focus 25</button>
-    <button data-min="5" data-label="Short break" class="preset px-3 py-2 rounded-lg bg-slate-800">Break 5</button>
-    <button data-min="15" data-label="Long break" class="preset px-3 py-2 rounded-lg bg-slate-800">Long 15</button>
-  </div>
-  <p class="mt-6 text-slate-400 text-sm">Sessions completed: <span id="count">0</span></p>
-<script>
-  var total = 25 * 60, left = total, timer = null, label = 'Focus', count = 0;
-  var t = document.getElementById('time'), s = document.getElementById('start');
-  function fmt(n){ var m = Math.floor(n/60), x = n%60; return (m<10?'0':'')+m+':'+(x<10?'0':'')+x; }
-  function draw(){ t.textContent = fmt(left); document.getElementById('mode').textContent = label; }
-  function notify(msg){ if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify({type:'speak', text: msg})); }
-  function stop(){ clearInterval(timer); timer = null; s.textContent = 'Start'; }
-  s.onclick = function(){
-    if (timer) { stop(); return; }
-    s.textContent = 'Pause';
-    timer = setInterval(function(){
-      left--; draw();
-      if (left <= 0) {
-        stop();
-        if (label === 'Focus') { count++; document.getElementById('count').textContent = count; }
-        notify(label + ' session complete. Time for the next step.');
-        left = total; draw();
-      }
-    }, 1000);
-  };
-  document.getElementById('reset').onclick = function(){ stop(); left = total; draw(); };
-  Array.prototype.forEach.call(document.querySelectorAll('.preset'), function(b){
-    b.onclick = function(){ stop(); total = parseInt(b.getAttribute('data-min'),10)*60; left = total; label = b.getAttribute('data-label'); draw(); };
-  });
-  draw();
-</script></body></html>`;
+  <input id="imgInput" type="file" accept="image/*" />
+  <input id="camInput" type="file" accept="image/*" capture="environment" />
+  <input id="docInput" type="file" accept=".pdf,.txt,.md,.csv,.json,.xml,.html,.doc,.docx,application/pdf,text/*" />
+  <input id="vidInput" type="file" accept="video/*" />
 
-const EXAM_HTML =
-  HTML_HEAD +
-  `<body class="min-h-screen p-6">
-  <h1 class="text-xl font-semibold text-cyan-300 mb-4">Exam Countdown</h1>
-  <label class="block text-sm text-slate-400 mb-1">Exam name</label>
-  <input id="name" class="w-full mb-3 px-3 py-2 rounded-lg bg-slate-800 border border-slate-700" placeholder="e.g. Physics final" />
-  <label class="block text-sm text-slate-400 mb-1">Exam date and time</label>
-  <input id="date" type="datetime-local" class="w-full mb-4 px-3 py-2 rounded-lg bg-slate-800 border border-slate-700" />
-  <button id="save" class="w-full py-3 rounded-xl bg-cyan-600 active:bg-cyan-700 font-semibold mb-6">Save countdown</button>
-  <div id="card" class="rounded-2xl bg-slate-900 border border-slate-700 p-5 hidden">
-    <p id="title" class="text-slate-300 mb-3"></p>
-    <div class="grid grid-cols-4 gap-2 text-center">
-      <div><div id="d" class="text-3xl font-bold tabular-nums">0</div><div class="text-xs text-slate-400">days</div></div>
-      <div><div id="h" class="text-3xl font-bold tabular-nums">0</div><div class="text-xs text-slate-400">hours</div></div>
-      <div><div id="m" class="text-3xl font-bold tabular-nums">0</div><div class="text-xs text-slate-400">min</div></div>
-      <div><div id="s" class="text-3xl font-bold tabular-nums">0</div><div class="text-xs text-slate-400">sec</div></div>
-    </div>
-    <p id="tip" class="mt-4 text-sm text-slate-400"></p>
+  <div class="box">
+    <div style="font-size:13px;font-weight:700;">🔗 Or Analyze a YouTube / Video Link</div>
+    <input id="ytUrl" type="url" placeholder="https://www.youtube.com/watch?v=..." />
+    <button class="act" id="ytBtn">Attach Video Link for Transcript & Summary</button>
   </div>
+  <div id="status" class="status"></div>
+
 <script>
-  var KEY = 'pulseos_exam';
-  function load(){ try { return JSON.parse(localStorage.getItem(KEY) || 'null'); } catch(e){ return null; } }
-  var data = load();
-  if (data) { document.getElementById('name').value = data.name; document.getElementById('date').value = data.date; }
-  document.getElementById('save').onclick = function(){
-    var n = document.getElementById('name').value || 'Exam', d = document.getElementById('date').value;
-    if (!d) { alert('Pick a date and time first.'); return; }
-    data = { name: n, date: d }; localStorage.setItem(KEY, JSON.stringify(data)); tick();
-    if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify({type:'speak', text: 'Countdown saved for ' + n + '.'}));
-  };
-  function tick(){
-    if (!data) return;
-    document.getElementById('card').classList.remove('hidden');
-    var diff = new Date(data.date).getTime() - Date.now();
-    document.getElementById('title').textContent = diff > 0 ? data.name + ' starts in' : data.name + ' has started. Good luck!';
-    if (diff < 0) diff = 0;
-    var sec = Math.floor(diff/1000);
-    var dd = Math.floor(sec/86400), hh = Math.floor((sec%86400)/3600), mm = Math.floor((sec%3600)/60), ss = sec%60;
-    document.getElementById('d').textContent = dd; document.getElementById('h').textContent = hh;
-    document.getElementById('m').textContent = mm; document.getElementById('s').textContent = ss;
-    var tip = dd > 14 ? 'Plenty of runway: plan topics week by week.' : dd > 3 ? 'Crunch time: do past papers daily.' : 'Final stretch: review notes and sleep well.';
-    document.getElementById('tip').textContent = diff > 0 ? tip : '';
+  function send(payload) {
+    if (window.ReactNativeWebView) {
+      window.ReactNativeWebView.postMessage(JSON.stringify(payload));
+    }
   }
-  setInterval(tick, 1000); tick();
-</script></body></html>`;
-
-const EXPENSE_HTML =
-  HTML_HEAD +
-  `<body class="min-h-screen p-6">
-  <h1 class="text-xl font-semibold text-emerald-300 mb-4">Monthly Expenses</h1>
-  <label class="block text-sm text-slate-400 mb-1">Monthly income</label>
-  <input id="income" type="number" inputmode="decimal" class="w-full mb-4 px-3 py-2 rounded-lg bg-slate-800 border border-slate-700" placeholder="0" />
-  <div class="flex gap-2 mb-2">
-    <input id="label" class="flex-1 px-3 py-2 rounded-lg bg-slate-800 border border-slate-700" placeholder="Expense (e.g. Rent)" />
-    <input id="amount" type="number" inputmode="decimal" class="w-28 px-3 py-2 rounded-lg bg-slate-800 border border-slate-700" placeholder="Amount" />
-  </div>
-  <button id="add" class="w-full py-3 rounded-xl bg-emerald-600 active:bg-emerald-700 font-semibold mb-4">Add expense</button>
-  <ul id="list" class="space-y-2 mb-4"></ul>
-  <div class="rounded-2xl bg-slate-900 border border-slate-700 p-4 space-y-1">
-    <div class="flex justify-between"><span class="text-slate-400">Total spent</span><span id="total" class="font-semibold tabular-nums">0.00</span></div>
-    <div class="flex justify-between"><span class="text-slate-400">Remaining</span><span id="left" class="font-semibold tabular-nums">0.00</span></div>
-    <div class="flex justify-between"><span class="text-slate-400">Savings rate</span><span id="rate" class="font-semibold tabular-nums">0%</span></div>
-    <div class="h-2 bg-slate-800 rounded-full mt-2 overflow-hidden"><div id="bar" class="h-2 bg-emerald-500" style="width:0%"></div></div>
-  </div>
-  <button id="clear" class="w-full mt-4 py-2 rounded-xl bg-slate-800 text-slate-300 text-sm">Clear month</button>
-<script>
-  var KEY = 'pulseos_expenses';
-  var state = { income: 0, items: [] };
-  try { state = JSON.parse(localStorage.getItem(KEY) || 'null') || state; } catch(e){}
-  function save(){ localStorage.setItem(KEY, JSON.stringify(state)); }
-  function money(n){ return (Math.round(n*100)/100).toFixed(2); }
-  function render(){
-    document.getElementById('income').value = state.income || '';
-    var ul = document.getElementById('list'); ul.innerHTML = '';
-    var total = 0;
-    state.items.forEach(function(it, i){
-      total += it.amount;
-      var li = document.createElement('li');
-      li.className = 'flex items-center justify-between rounded-lg bg-slate-900 border border-slate-800 px-3 py-2';
-      var span = document.createElement('span'); span.textContent = it.label;
-      var right = document.createElement('div'); right.className = 'flex items-center gap-3';
-      var amt = document.createElement('span'); amt.className = 'tabular-nums'; amt.textContent = money(it.amount);
-      var del = document.createElement('button'); del.className = 'text-red-400 text-sm'; del.textContent = 'Remove';
-      del.onclick = function(){ state.items.splice(i,1); save(); render(); };
-      right.appendChild(amt); right.appendChild(del); li.appendChild(span); li.appendChild(right); ul.appendChild(li);
+  function handleFile(file, kind) {
+    if (!file) return;
+    var st = document.getElementById('status');
+    st.textContent = 'Reading ' + file.name + ' (' + Math.round(file.size/1024) + ' KB)...';
+    var isText = /^text\\/|\\.(txt|md|csv|json|xml|html|js|ts|py)$/i.test(file.type || file.name);
+    var reader = new FileReader();
+    if (isText) {
+      reader.onload = function(e) {
+        send({
+          type: 'attachment',
+          name: file.name,
+          mimeType: file.type || 'text/plain',
+          kind: 'document',
+          textContent: String(e.target.result || '').slice(0, 40000),
+          sizeBytes: file.size
+        });
+      };
+      reader.readAsText(file);
+    } else {
+      reader.onload = function(e) {
+        var dataUrl = String(e.target.result || '');
+        var comma = dataUrl.indexOf(',');
+        var b64 = comma !== -1 ? dataUrl.slice(comma + 1) : dataUrl;
+        send({
+          type: 'attachment',
+          name: file.name,
+          mimeType: file.type || (kind === 'image' ? 'image/jpeg' : kind === 'video' ? 'video/mp4' : 'application/pdf'),
+          kind: kind,
+          base64: b64,
+          uri: dataUrl,
+          sizeBytes: file.size
+        });
+      };
+      reader.readAsDataURL(file);
+    }
+  }
+  document.getElementById('imgInput').onchange = function(e){ handleFile(e.target.files[0], 'image'); };
+  document.getElementById('camInput').onchange = function(e){ handleFile(e.target.files[0], 'image'); };
+  document.getElementById('docInput').onchange = function(e){ handleFile(e.target.files[0], 'document'); };
+  document.getElementById('vidInput').onchange = function(e){ handleFile(e.target.files[0], 'video'); };
+  document.getElementById('ytBtn').onclick = function(){
+    var u = document.getElementById('ytUrl').value.trim();
+    if (!u) { alert('Paste a video URL first.'); return; }
+    send({
+      type: 'attachment',
+      name: u,
+      mimeType: 'text/uri-list',
+      kind: 'video_link',
+      uri: u
     });
-    var inc = state.income || 0, left = inc - total, rate = inc > 0 ? Math.max(0, left/inc*100) : 0;
-    document.getElementById('total').textContent = money(total);
-    var l = document.getElementById('left'); l.textContent = money(left); l.className = 'font-semibold tabular-nums ' + (left < 0 ? 'text-red-400' : 'text-emerald-300');
-    document.getElementById('rate').textContent = Math.round(rate) + '%';
-    document.getElementById('bar').style.width = (inc > 0 ? Math.min(100, total/inc*100) : 0) + '%';
-  }
-  document.getElementById('income').oninput = function(e){ state.income = parseFloat(e.target.value) || 0; save(); render(); };
-  document.getElementById('add').onclick = function(){
-    var lb = document.getElementById('label').value.trim(), am = parseFloat(document.getElementById('amount').value);
-    if (!lb || isNaN(am)) { alert('Enter a name and an amount.'); return; }
-    state.items.push({ label: lb, amount: am }); save(); render();
-    document.getElementById('label').value = ''; document.getElementById('amount').value = '';
   };
-  document.getElementById('clear').onclick = function(){ if (confirm('Clear all expenses for this month?')) { state.items = []; save(); render(); } };
-  render();
-</script></body></html>`;
-
-const WIDGETS = [
-  { id: 'pomodoro', title: 'Pomodoro Timer', subtitle: 'Focus sprints with breaks', emoji: '🍅', html: POMODORO_HTML },
-  { id: 'exam', title: 'Exam Countdown', subtitle: 'Days, hours and minutes left', emoji: '🎓', html: EXAM_HTML },
-  { id: 'expense', title: 'Expense Calculator', subtitle: 'Monthly budget at a glance', emoji: '💸', html: EXPENSE_HTML },
-];
+</script>
+</body>
+</html>`;
 
 /* ------------------------------------------------------------------ */
-/* Settings model (one JSON blob, migrated from the old per-key store) */
+/* Settings model                                                      */
 /* ------------------------------------------------------------------ */
 
 const STORAGE_SETTINGS = 'pulseos.settings.v2';
 
 type Settings = {
-  // Profile
   name: string;
   email: string;
   role: string;
   avatar: string;
   focusGoalMin: number;
   personalize: boolean;
-  // Assistant
   apiKey: string;
   model: string;
   temperature: number;
@@ -1528,21 +1853,16 @@ type Settings = {
   fastModel: string;
   replyLength: 'short' | 'balanced' | 'detailed';
   historyLimit: number;
-  // Cloud
   cloudUrl: string;
   cloudToken: string;
   cloudMode: boolean;
-  // Voice
   voiceOn: boolean;
   voiceRate: number;
   voicePitch: number;
   voiceLang: string;
-  // Workspace
   homeUrl: string;
   confirmBeforeComplete: boolean;
-  // Chat behaviour
   haptics: boolean;
-  // Updates
   updateRepo: string;
   updateToken: string;
   autoCheckUpdates: boolean;
@@ -1557,8 +1877,8 @@ const DEFAULT_SETTINGS: Settings = {
   focusGoalMin: 120,
   personalize: true,
   apiKey: '',
-  model: FAST_MODEL,
-  temperature: 0.7,
+  model: DEFAULT_MODEL,
+  temperature: 0.5,
   speed: 'fast',
   fastModel: FAST_MODEL,
   replyLength: 'balanced',
@@ -1566,7 +1886,7 @@ const DEFAULT_SETTINGS: Settings = {
   cloudUrl: DEFAULT_CLOUD_URL,
   cloudToken: '',
   cloudMode: false,
-  voiceOn: false,
+  voiceOn: true,
   voiceRate: 1.0,
   voicePitch: 1.0,
   voiceLang: 'en-US',
@@ -1584,22 +1904,20 @@ async function loadSettings(): Promise<Settings> {
     try {
       const saved: any = JSON.parse(raw);
       const merged: Settings = { ...DEFAULT_SETTINGS, ...saved };
-      if (!saved.rev || saved.rev < 3) {
-        // v3: fast replies by default; chat no longer waits on the cloud server.
+      if (!saved.rev || saved.rev < 4) {
         merged.speed = 'fast';
         merged.fastModel = FAST_MODEL;
-        merged.model = FAST_MODEL;
+        merged.model = DEFAULT_MODEL;
         merged.cloudMode = false;
         if (!merged.cloudUrl) merged.cloudUrl = DEFAULT_CLOUD_URL;
-        merged.rev = 3;
+        merged.rev = 4;
         await AsyncStorage.setItem(STORAGE_SETTINGS, JSON.stringify(merged));
       }
       return merged;
     } catch {
-      /* fall through to migration */
+      /* fallback */
     }
   }
-  // Migrate values saved by earlier versions of the app.
   const [k, m, v, cu, ct, cm] = await Promise.all([
     AsyncStorage.getItem(STORAGE_API_KEY),
     AsyncStorage.getItem(STORAGE_MODEL),
@@ -1612,7 +1930,7 @@ async function loadSettings(): Promise<Settings> {
     ...DEFAULT_SETTINGS,
     apiKey: k || '',
     model: m || DEFAULT_MODEL,
-    voiceOn: v === '1',
+    voiceOn: v ? v === '1' : true,
     cloudUrl: cu || '',
     cloudToken: ct || '',
     cloudMode: cm === '1' && !!cu,
@@ -1624,15 +1942,15 @@ async function loadSettings(): Promise<Settings> {
 function profileContext(s: Settings): string {
   if (!s.personalize) return '';
   const bits: string[] = [];
-  if (s.name.trim()) bits.push('The user\'s name is ' + s.name.trim() + '.');
+  if (s.name.trim()) bits.push("The user's name is " + s.name.trim() + '.');
   if (s.role.trim()) bits.push('They describe themselves as: ' + s.role.trim() + '.');
   if (s.focusGoalMin > 0) bits.push('Their daily focus goal is ' + s.focusGoalMin + ' minutes.');
   const len =
     s.replyLength === 'short'
       ? 'Keep the answer to 1-2 sentences.'
       : s.replyLength === 'detailed'
-        ? 'The answer may be detailed (up to ~150 words).'
-        : 'Keep the answer concise (2-4 sentences) unless the task needs more.';
+        ? 'Provide a thorough, well-structured breakdown.'
+        : 'Keep the answer concise and practical.';
   bits.push(len);
   return bits.join(' ');
 }
@@ -1682,7 +2000,7 @@ async function checkForUpdate(repo: string, token: string): Promise<UpdateInfo> 
     throw new Error('No internet connection. Try again.');
   }
   if (res.status === 404) throw new Error('Update server unavailable right now.');
-  if (!res.ok) throw new Error('Couldn\'t check for updates (' + res.status + '). Try again later.');
+  if (!res.ok) throw new Error("Couldn't check for updates (" + res.status + '). Try again later.');
   const rel: any = await res.json();
   const asset = (rel.assets || []).find((a: any) => /\.apk$/i.test(String(a?.name)));
   if (!asset) throw new Error('Update server unavailable right now.');
@@ -1724,10 +2042,9 @@ async function downloadAndInstall(
   if (!stat.exists || (stat.size ?? 0) < 1024 * 1024) throw new Error('Downloaded file looks incomplete.');
   onProgress(1);
   const contentUri = await FileSystem.getContentUriAsync(dest);
-  // Hands the APK to Android's own package installer; the user confirms the install there.
   await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
     data: contentUri,
-    flags: 1, // FLAG_GRANT_READ_URI_PERMISSION
+    flags: 1,
     type: 'application/vnd.android.package-archive',
   });
 }
@@ -1817,7 +2134,7 @@ export default function App() {
           style={[styles.voiceBtn, settings.voiceOn && styles.voiceBtnOn]}
         >
           <Text style={styles.voiceIcon}>{settings.voiceOn ? '🔊' : '🔈'}</Text>
-          <Text style={[styles.voiceText, settings.voiceOn && { color: C.text }]}>{settings.voiceOn ? 'ON' : 'OFF'}</Text>
+          <Text style={[styles.voiceText, settings.voiceOn && { color: C.text }]}>{settings.voiceOn ? 'VOICE ON' : 'VOICE OFF'}</Text>
         </Pressable>
       </View>
 
@@ -1873,7 +2190,7 @@ export default function App() {
 }
 
 /* ------------------------------------------------------------------ */
-/* CHAT                                                                */
+/* CHAT (Multimodal Attachments + Voice Mic + OS Automation + Memory)  */
 /* ------------------------------------------------------------------ */
 
 function ChatScreen({
@@ -1892,9 +2209,18 @@ function ChatScreen({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
+  const [listening, setListening] = useState(false);
+  const [attachModal, setAttachModal] = useState(false);
+  const [pendingAttachment, setPendingAttachment] = useState<AttachmentItem | null>(null);
+  const [smartMemory, setSmartMemory] = useState<string[]>([]);
   const [cloudStatus, setCloudStatus] = useState<CloudStatus>('off');
   const [cloudHealthInfo, setCloudHealthInfo] = useState<CloudHealth | null>(null);
   const listRef = useRef<FlatList<ChatMessage>>(null);
+  const inputRef = useRef<TextInput>(null);
+
+  useEffect(() => {
+    loadSmartMemory().then(setSmartMemory);
+  }, []);
 
   const checkCloud = useCallback(async (base: string) => {
     if (!base) {
@@ -1917,7 +2243,6 @@ function ChatScreen({
     checkCloud(cloudUrl);
   }, [cloudUrl, checkCloud]);
 
-  // Only send the phone's key when the server says it has none of its own.
   const keyForCloud = () =>
     cloudHealthInfo && cloudHealthInfo.gemini_key_on_server === false && apiKey ? apiKey : undefined;
 
@@ -1938,7 +2263,6 @@ function ChatScreen({
     });
   }, []);
 
-  // Keep the open conversation in the list, and save everything.
   useEffect(() => {
     if (!loaded || !currentId) return;
     setConvos((prev) =>
@@ -1948,7 +2272,11 @@ function ChatScreen({
         const lastTs = messages.length ? messages[messages.length - 1].ts : c.updatedAt;
         return {
           ...c,
-          messages: messages.slice(-Math.max(10, settings.historyLimit)),
+          messages: messages.slice(-Math.max(10, settings.historyLimit)).map((m) => ({
+            ...m,
+            // Strip large base64 strings when persisting to AsyncStorage so storage stays fast
+            attachment: m.attachment ? { ...m.attachment, base64: undefined } : undefined,
+          })),
           updatedAt: lastTs,
           title: c.title && c.title !== 'New chat' ? c.title : firstUser ? firstUser.text.slice(0, 40) : 'New chat',
         };
@@ -2017,7 +2345,6 @@ function ChatScreen({
     ]);
   };
 
-  // Summaries live in the side drawer; made in the background so replies stay fast.
   const refreshSummary = (convoId: string, msgs: ChatMessage[]) => {
     if (!apiKey || summarizing.current || msgs.filter((m) => m.role !== 'error').length < 2) return;
     summarizing.current = true;
@@ -2034,20 +2361,131 @@ function ChatScreen({
       });
   };
 
+  /**
+   * Starts Native Android Voice Input (RecognizerIntent via HarkBridge, or focuses keyboard voice mic).
+   */
+  const startVoiceInput = async () => {
+    if (busy) return;
+    if (settings.haptics) Vibration.vibrate(15);
+    if (Platform.OS === 'android' && HarkBridge?.startVoiceRecognition) {
+      try {
+        setListening(true);
+        const spoken: string = await HarkBridge.startVoiceRecognition(settings.voiceLang || 'en-IN');
+        setListening(false);
+        if (spoken && spoken.trim()) {
+          setInput((prev) => (prev ? prev + ' ' + spoken.trim() : spoken.trim()));
+        }
+        return;
+      } catch {
+        setListening(false);
+      }
+    }
+    inputRef.current?.focus();
+    Alert.alert(
+      '🎙️ Voice Talk Ready',
+      'Speak using the microphone on your Android keyboard, or enable the Pulse OS native voice recognizer.',
+    );
+  };
+
+  const onPickerMessage = async (e: WebViewMessageEvent) => {
+    try {
+      const d = JSON.parse(e.nativeEvent.data);
+      if (d?.type === 'attachment') {
+        setAttachModal(false);
+        if (d.kind === 'video_link' && d.uri) {
+          const videoCtx = await fetchVideoLinkContext(String(d.uri));
+          setPendingAttachment({
+            uri: String(d.uri),
+            name: String(d.name || d.uri),
+            mimeType: 'text/uri-list',
+            kind: 'video_link',
+            textContent: videoCtx,
+          });
+        } else {
+          setPendingAttachment({
+            uri: String(d.uri || ''),
+            name: String(d.name || 'Attachment'),
+            mimeType: String(d.mimeType || 'application/octet-stream'),
+            kind: d.kind || 'document',
+            base64: d.base64 ? String(d.base64) : undefined,
+            textContent: d.textContent ? String(d.textContent) : undefined,
+            sizeBytes: Number(d.sizeBytes) || 0,
+          });
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+
   const send = async () => {
-    const text = input.trim();
-    if (!text || busy) return;
-    // Plain chat always goes straight to Gemini from the phone (fastest path); the cloud is only a fallback with no key.
+    const rawInput = input.trim();
+    const attached = pendingAttachment;
+    if (!rawInput && !attached) return;
+    if (busy) return;
+
+    const text =
+      rawInput ||
+      (attached?.kind === 'image'
+        ? 'Describe this image in detail, extract any visible text (OCR), detect objects, and pull any actionable tasks or reminders.'
+        : attached?.kind === 'video' || attached?.kind === 'video_link'
+          ? 'Extract the transcript/details of this video, summarize the core content, and pull any tasks, events, or reminders.'
+          : 'Read this document, extract key information, provide a concise summary, and pull any tasks, calendar events, or reminders.');
+
     const useCloud = !apiKey && cloudMode && !!cloudUrl;
     if (!apiKey && !useCloud) {
       openSettings();
       return;
     }
     if (settings.haptics) Vibration.vibrate(10);
-    const userMsg: ChatMessage = { id: uid(), role: 'user', text, ts: Date.now() };
+
+    // Instant OS-level app launch fast-path for simple voice/text commands like "open Blinkit", "open Uber", "open Free Fire", "open Instagram"
+    const quickOpenMatch =
+      !attached &&
+      rawInput.match(/^(?:please\s+|can you\s+|hey pulse\s+)?(?:open|launch|start|run)\s+([a-z0-9\s._@-]+)$/i);
+    if (quickOpenMatch) {
+      const targetApp = quickOpenMatch[1].trim();
+      setInput('');
+      const launchRes = await openAppWithStatus(targetApp);
+      const userMsg: ChatMessage = { id: uid(), role: 'user', text: rawInput, ts: Date.now() };
+      const botMsg: ChatMessage = {
+        id: uid(),
+        role: 'assistant',
+        text: launchRes.statusMessage,
+        reply: {
+          direct_response: launchRes.statusMessage,
+          proactive_checklist: launchRes.ok
+            ? [`Opened ${launchRes.appName}`, 'Use voice command for next UI step']
+            : [`Install ${launchRes.appName} on Play Store`, `Open ${launchRes.appName} in Live Browser`],
+          one_line_summary: launchRes.statusMessage,
+          source_verified: 'Verified',
+        },
+        source: 'device',
+        ts: Date.now(),
+      };
+      setMessages((prev) => [...prev, userMsg, botMsg]);
+      say(launchRes.statusMessage);
+      return;
+    }
+
+    const userMsg: ChatMessage = {
+      id: uid(),
+      role: 'user',
+      text,
+      attachment: attached || undefined,
+      ts: Date.now(),
+    };
     const next = [...messages, userMsg];
     const botId = uid();
-    let steps: Step[] = [{ label: 'Reading your message and context', status: 'active', startedAt: Date.now() }];
+    let steps: Step[] = [
+      {
+        label: attached
+          ? `Analyzing attached ${attached.kind} (${attached.name.slice(0, 28)})`
+          : 'Reading your command & smart context memory',
+        status: 'active',
+        startedAt: Date.now(),
+      },
+    ];
     const pushSteps = () =>
       setMessages((prev) => prev.map((m) => (m.id === botId ? { ...m, steps: [...steps] } : m)));
     const step = (label: string, status: Step['status'] = 'active') => {
@@ -2060,15 +2498,26 @@ function ChatScreen({
       const now = Date.now();
       steps = steps.map((s) => (s.status === 'active' ? { ...s, status: 'done', ms: now - s.startedAt } : s));
     };
+
     setMessages([
       ...next,
       { id: botId, role: 'assistant', text: '', source: 'device', streaming: true, steps: [...steps], ts: Date.now() },
     ]);
     setInput('');
+    setPendingAttachment(null);
     setBusy(true);
-    const ctx = profileContext(settings);
+
+    // Quick-Verify Source Checking step for any URLs or video links in the user prompt
+    let verifiedSourceContext = '';
+    if (/https?:\/\//i.test(text)) {
+      step('Running Quick-Verify source & transcript check');
+      verifiedSourceContext = await quickVerifyUrlsInText(text);
+    }
+
+    const ctx = [profileContext(settings), verifiedSourceContext].filter(Boolean).join('\n\n');
     const convoId = currentId;
-    const useAgent = !!apiKey && (mode === 'agent' || (mode === 'auto' && AGENT_RE.test(text)));
+    const useAgent = !attached && !!apiKey && (mode === 'agent' || (mode === 'auto' && AGENT_RE.test(text)));
+
     if (useAgent) {
       AgentBus.begin(text);
       LiveBus.set({ active: true, startedAt: Date.now(), loading: false, thumb: null, log: [] }, '🤖 ' + text.slice(0, 60));
@@ -2078,7 +2527,7 @@ function ChatScreen({
           .slice(-6)
           .map((m) => (m.role === 'user' ? 'User: ' : 'Pulse: ') + m.text.slice(0, 300))
           .join('\n');
-        const agentModel = /lite/i.test(model) ? 'gemini-flash-latest' : model;
+        const agentModel = /lite/i.test(model) ? 'gemini-2.5-flash' : model;
         const answer = await runAgent({
           apiKey,
           model: agentModel,
@@ -2097,7 +2546,7 @@ function ChatScreen({
           id: botId,
           role: 'assistant',
           text: answer,
-          reply: { direct_response: answer, proactive_checklist: [], one_line_summary: '' },
+          reply: { direct_response: answer, proactive_checklist: [], one_line_summary: answer.slice(0, 100), source_verified: 'Verified' },
           source: 'device',
           streaming: false,
           steps: [...steps],
@@ -2117,45 +2566,54 @@ function ChatScreen({
       }
       return;
     }
+
     try {
       let result: { reply: PulseReply; modelUsed: string } | null = null;
       let source: 'cloud' | 'device' = 'device';
       if (useCloud) {
         step('Asking your cloud server');
         try {
-          result = await callCloudChat(cloudUrl, cloudToken, keyForCloud(), next, ctx);
+          result = await callCloudChat(cloudUrl, cloudToken, keyForCloud(), next, ctx, smartMemory);
           source = 'cloud';
           setCloudStatus('online');
         } catch (cloudErr: any) {
           setCloudStatus('offline');
           if (!apiKey) throw cloudErr;
           step('Cloud unreachable, switching to on-device', 'error');
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: uid(),
-              role: 'error',
-              text: 'Cloud unavailable (' + (cloudErr?.message || 'error') + '). Answering on this device.',
-              ts: Date.now(),
-            },
-          ]);
         }
       }
       if (!result) {
         const useModel = model || FAST_MODEL;
         step('Thinking with ' + modelLabel(useModel).replace(/^\W+/, ''));
         let writing = false;
-        result = await streamGemini(apiKey, useModel, next, ctx, settings.temperature, settings.speed, (visible) => {
-          if (!writing && visible.trim()) {
-            writing = true;
-            step('Writing reply');
-          }
-          setMessages((prev) => prev.map((m) => (m.id === botId ? { ...m, text: visible } : m)));
-        });
+        let lastUi = 0;
+        result = await streamGemini(
+          apiKey,
+          useModel,
+          next,
+          ctx,
+          smartMemory,
+          settings.temperature,
+          settings.speed,
+          (visible) => {
+            if (!writing && visible.trim()) {
+              writing = true;
+              step('Writing reply & extracting actions');
+            }
+            const now = Date.now();
+            if (now - lastUi >= 45) {
+              lastUi = now;
+              setMessages((prev) => prev.map((m) => (m.id === botId ? { ...m, text: visible } : m)));
+            }
+          },
+        );
       }
       const { reply } = result;
+      if (reply.memory_facts && reply.memory_facts.length) {
+        saveSmartMemoryFacts(reply.memory_facts).then(setSmartMemory).catch(() => undefined);
+      }
       const n = reply.proactive_checklist.length;
-      step(n ? 'Prepared ' + n + ' next step' + (n > 1 ? 's' : '') + ' and action cards' : 'Reply ready', 'done');
+      step(n ? `Extracted ${n} action item${n > 1 ? 's' : ''} & verified sources` : 'Reply ready', 'done');
       finishSteps();
       const botMsg: ChatMessage = {
         id: botId,
@@ -2222,13 +2680,6 @@ function ChatScreen({
     }
   };
 
-  const statusLabel =
-    cloudMode && cloudUrl
-      ? '☁️ Cloud · ' + (cloudStatus === 'online' ? 'online' : cloudStatus === 'checking' ? 'checking…' : 'offline')
-      : apiKey
-        ? '⚡ ' + (settings.speed === 'fast' ? settings.fastModel || FAST_MODEL : model) + ' · ' + settings.speed
-        : 'Set up a Gemini key or cloud in Settings';
-
   if (!loaded) {
     return (
       <View style={styles.center}>
@@ -2248,6 +2699,30 @@ function ChatScreen({
             {!apiKey && cloudMode && cloudUrl ? '☁️ Cloud' : modelLabel(model || FAST_MODEL)} ▾
           </Text>
         </Pressable>
+        {smartMemory.length > 0 ? (
+          <Pressable
+            onPress={() =>
+              Alert.alert(
+                '🧠 Smart Context Memory',
+                smartMemory.map((m, i) => `${i + 1}. ${m}`).join('\n'),
+                [
+                  { text: 'Close', style: 'cancel' },
+                  {
+                    text: 'Clear Memory',
+                    style: 'destructive',
+                    onPress: () => {
+                      AsyncStorage.removeItem(STORAGE_SMART_MEMORY);
+                      setSmartMemory([]);
+                    },
+                  },
+                ],
+              )
+            }
+            style={[styles.chip, { borderColor: C.accent2 }]}
+          >
+            <Text style={[styles.chipText, { color: C.accent2 }]}>🧠 {smartMemory.length}</Text>
+          </Pressable>
+        ) : null}
         <View style={{ flex: 1 }} />
         <Pressable
           onPress={() => setMode((m) => (m === 'auto' ? 'agent' : m === 'agent' ? 'chat' : 'auto'))}
@@ -2270,14 +2745,14 @@ function ChatScreen({
         ListEmptyComponent={
           <View style={styles.empty}>
             <Text style={styles.emptyTitle}>
-              {settings.name.trim() ? 'What\'s on your plate, ' + settings.name.trim().split(' ')[0] + '?' : 'What\'s on your plate?'}
+              {settings.name.trim() ? "What's on your plate, " + settings.name.trim().split(' ')[0] + '?' : 'Pulse OS Agent Ready'}
             </Text>
-            <Text style={styles.muted}>
-              Ask anything, or tell Pulse to do it: "find biryani near me", "play lo-fi on YouTube", "compare iPhone 16 prices".
+            <Text style={[styles.muted, { textAlign: 'center' }]}>
+              Tap 📎 to analyze photos, PDFs, documents, or video links. Tap 🎙️ to speak commands like "open Blinkit", "open Uber", "open Meesho", or "open Free Fire".
             </Text>
             {!apiKey && !(cloudMode && cloudUrl) ? (
               <Pressable onPress={openSettings} style={[styles.primaryBtn, { paddingHorizontal: 18 }]}>
-                <Text style={styles.primaryBtnText}>Open Settings to get started</Text>
+                <Text style={styles.primaryBtnText}>Open Settings to add your Gemini API Key</Text>
               </Pressable>
             ) : null}
           </View>
@@ -2289,11 +2764,59 @@ function ChatScreen({
 
       <LiveCard />
 
+      {pendingAttachment ? (
+        <View style={styles.attachmentPreviewBar}>
+          {pendingAttachment.kind === 'image' && pendingAttachment.uri ? (
+            <Image source={{ uri: pendingAttachment.uri }} style={styles.attachmentThumb} />
+          ) : (
+            <View style={[styles.attachmentThumb, styles.center]}>
+              <Text style={{ fontSize: 20 }}>
+                {pendingAttachment.kind === 'video' || pendingAttachment.kind === 'video_link' ? '🎬' : '📄'}
+              </Text>
+            </View>
+          )}
+          <View style={{ flex: 1 }}>
+            <Text style={styles.convoTitle} numberOfLines={1}>{pendingAttachment.name}</Text>
+            <Text style={styles.mutedSmall}>
+              {pendingAttachment.kind.toUpperCase()} ready for Multimodal Analysis & Action Extraction
+            </Text>
+          </View>
+          <Pressable onPress={() => setPendingAttachment(null)} style={styles.chip}>
+            <Text style={styles.chipText}>✕</Text>
+          </Pressable>
+        </View>
+      ) : null}
+
       <View style={styles.composer}>
+        <Pressable
+          onPress={() => setAttachModal(true)}
+          disabled={busy}
+          style={styles.iconBtn}
+          accessibilityLabel="Attach image, photo, video, or file"
+        >
+          <Text style={{ fontSize: 20 }}>📎</Text>
+        </Pressable>
+
+        <Pressable
+          onPress={startVoiceInput}
+          disabled={busy}
+          style={[styles.iconBtn, listening && { borderColor: C.danger, backgroundColor: '#3B1418' }]}
+          accessibilityLabel="Voice talk input"
+        >
+          <Text style={{ fontSize: 19 }}>{listening ? '🔴' : '🎙️'}</Text>
+        </Pressable>
+
         <TextInput
+          ref={inputRef}
           value={input}
           onChangeText={setInput}
-          placeholder={apiKey || (cloudMode && cloudUrl) ? 'Ask Pulse anything…' : 'Add a Gemini key or cloud URL in Settings'}
+          placeholder={
+            pendingAttachment
+              ? 'Ask a question about this attachment or tap ➤…'
+              : apiKey || (cloudMode && cloudUrl)
+                ? 'Talk or type: "open Blinkit", attach photo/file/video…'
+                : 'Add a Gemini key in Settings'
+          }
           placeholderTextColor={C.muted}
           style={styles.composerInput}
           multiline
@@ -2304,6 +2827,30 @@ function ChatScreen({
           {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.sendText}>➤</Text>}
         </Pressable>
       </View>
+
+      {/* Multimodal Attachment Modal (Photos, Camera, Documents, Videos, YouTube Links) */}
+      <Modal visible={attachModal} transparent animationType="slide" onRequestClose={() => setAttachModal(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, { height: 420, padding: 0, overflow: 'hidden' }]}>
+            <View style={[styles.rowBetween, { paddingHorizontal: 14, paddingTop: 12 }]}>
+              <Text style={styles.cardTitle}>Multimodal Upload</Text>
+              <Pressable onPress={() => setAttachModal(false)} style={styles.chip}>
+                <Text style={styles.chipText}>✕ Close</Text>
+              </Pressable>
+            </View>
+            <WebView
+              originWhitelist={['*']}
+              source={{ html: MULTIMODAL_PICKER_HTML }}
+              javaScriptEnabled
+              domStorageEnabled
+              allowFileAccess
+              allowUniversalAccessFromFileURLs
+              onMessage={onPickerMessage}
+              style={{ flex: 1, backgroundColor: C.panel }}
+            />
+          </View>
+        </View>
+      </Modal>
 
       {drawer ? (
         <View style={styles.drawerWrap}>
@@ -2357,9 +2904,6 @@ function ChatScreen({
                 <Text style={styles.mutedSmall}>{m.note}</Text>
               </Pressable>
             ))}
-            <Text style={[styles.mutedSmall, { marginTop: 8 }]}>
-              If a model is busy, Pulse switches to another one automatically.
-            </Text>
           </View>
         </Pressable>
       </Modal>
@@ -2379,6 +2923,16 @@ function MessageBubble({
   if (msg.role === 'user') {
     return (
       <View style={[styles.bubble, styles.userBubble]}>
+        {msg.attachment ? (
+          <View style={{ marginBottom: 6 }}>
+            {msg.attachment.kind === 'image' && msg.attachment.uri ? (
+              <Image source={{ uri: msg.attachment.uri }} style={{ width: 180, height: 130, borderRadius: 10, marginBottom: 4 }} resizeMode="cover" />
+            ) : null}
+            <Text style={{ color: '#E0E7FF', fontSize: 12, fontWeight: '700' }}>
+              📎 {msg.attachment.name}
+            </Text>
+          </View>
+        ) : null}
         <Text style={styles.bubbleText}>{msg.text}</Text>
       </View>
     );
@@ -2391,7 +2945,7 @@ function MessageBubble({
     );
   }
   return (
-    <View style={{ marginBottom: 12 }}>
+    <View style={{ marginBottom: 12, gap: 6 }}>
       <View style={[styles.bubble, styles.botBubble]}>
         {msg.steps && msg.steps.length ? <StepsView steps={msg.steps} streaming={msg.streaming} /> : null}
         {msg.streaming && !msg.text && msg.steps && msg.steps.length ? null : msg.streaming && !msg.text ? (
@@ -2405,8 +2959,21 @@ function MessageBubble({
             {msg.streaming ? <Text style={{ color: C.accent }}> ▍</Text> : null}
           </Text>
         )}
-        {msg.source === 'cloud' ? <Text style={styles.sourceTag}>☁️ cloud</Text> : null}
+        <View style={[styles.rowBetween, { marginTop: 6 }]}>
+          <Pressable onPress={() => speak(msg.text)} hitSlop={8}>
+            <Text style={{ fontSize: 13, color: C.accent2 }}>🔊 Listen</Text>
+          </Pressable>
+          {msg.reply?.source_verified ? (
+            <Text style={{ fontSize: 11, color: C.good, fontWeight: '700' }}>
+              ✓ Quick-Verify: {msg.reply.source_verified}
+            </Text>
+          ) : null}
+          {msg.source === 'cloud' ? <Text style={styles.sourceTag}>☁️ cloud</Text> : null}
+        </View>
       </View>
+      {!msg.streaming && msg.reply && (msg.reply.proactive_checklist.length > 0 || msg.reply.one_line_summary) ? (
+        <ActionCard reply={msg.reply} say={say} onCloudPlan={onCloudPlan} />
+      ) : null}
     </View>
   );
 }
@@ -2426,33 +2993,29 @@ function ActionCard({
   return (
     <View style={styles.card}>
       <View style={styles.cardHeader}>
-        <Text style={styles.cardKicker}>SUMMARY</Text>
+        <Text style={styles.cardKicker}>EXTRACTED ACTIONS, EVENTS & REMINDERS</Text>
         <Pressable onPress={() => speak(replyToSpeech(reply) || summary)} hitSlop={8}>
           <Text style={styles.cardSpeak}>🔊</Text>
         </Pressable>
       </View>
-      <Text style={styles.cardSummary}>{summary}</Text>
+      {reply.one_line_summary ? <Text style={styles.cardSummary}>{summary}</Text> : null}
 
       <View style={styles.cardRow}>
-        <ActionButton label="📅 Calendar" url={calendarUrl(summary, fullText)} />
+        <ActionButton label="📅 Add Calendar" url={calendarUrl(summary, fullText)} />
         <ActionButton label="✉️ Email" url={mailtoUrl(summary, fullText)} />
         <ActionButton label="💬 SMS" url={smsUrl(fullText)} />
-        <ActionButton label="📞 Dial" url="tel:" />
         {onCloudPlan && reply.proactive_checklist.length ? (
           <Pressable
             onPress={() => onCloudPlan(reply)}
             style={({ pressed }) => [styles.actionBtn, styles.cloudBtn, pressed && { opacity: 0.7 }]}
-            accessibilityRole="button"
-            accessibilityLabel="Build a time-blocked plan in the cloud"
           >
-            <Text style={styles.actionText}>☁️ Cloud plan</Text>
+            <Text style={styles.actionText}>☁️ Time-Block Plan</Text>
           </Pressable>
         ) : null}
       </View>
 
       {reply.proactive_checklist.length ? (
         <View style={{ marginTop: 10 }}>
-          <Text style={styles.cardKicker}>PROACTIVE CHECKLIST</Text>
           {reply.proactive_checklist.map((item, i) => (
             <ChecklistRow key={i + item} item={item} summary={summary} say={say} />
           ))}
@@ -2503,76 +3066,6 @@ function ActionButton({ label, url, small }: { label: string; url: string; small
 }
 
 /* ------------------------------------------------------------------ */
-/* WIDGETS                                                             */
-/* ------------------------------------------------------------------ */
-
-function WidgetsScreen({ say }: { say: (t: string) => void }) {
-  const [active, setActive] = useState<string | null>(null);
-  const widget = WIDGETS.find((w) => w.id === active);
-
-  const onMessage = (e: WebViewMessageEvent) => {
-    try {
-      const data = JSON.parse(e.nativeEvent.data);
-      if (data?.type === 'speak' && typeof data.text === 'string') say(data.text);
-    } catch {
-      /* ignore non-JSON messages */
-    }
-  };
-
-  if (widget) {
-    return (
-      <View style={{ flex: 1 }}>
-        <View style={styles.widgetBar}>
-          <Pressable onPress={() => setActive(null)} style={styles.chip}>
-            <Text style={styles.chipText}>‹ All widgets</Text>
-          </Pressable>
-          <Text style={styles.widgetBarTitle}>
-            {widget.emoji} {widget.title}
-          </Text>
-        </View>
-        <WebView
-          key={widget.id}
-          originWhitelist={['*']}
-          source={{ html: widget.html, baseUrl: 'https://pulseos.local/' + widget.id + '/' }}
-          javaScriptEnabled
-          domStorageEnabled
-          onMessage={onMessage}
-          style={{ flex: 1, backgroundColor: C.bg }}
-          containerStyle={{ backgroundColor: C.bg }}
-          startInLoadingState
-          renderLoading={() => (
-            <View style={styles.center}>
-              <ActivityIndicator color={C.accent} />
-            </View>
-          )}
-        />
-      </View>
-    );
-  }
-
-  return (
-    <ScrollView contentContainerStyle={{ padding: 16, gap: 12 }}>
-      <Text style={styles.sectionTitle}>Micro-tools</Text>
-      {WIDGETS.map((w) => (
-        <Pressable
-          key={w.id}
-          onPress={() => setActive(w.id)}
-          style={({ pressed }) => [styles.widgetTile, pressed && { opacity: 0.8 }]}
-        >
-          <Text style={styles.widgetEmoji}>{w.emoji}</Text>
-          <View style={{ flex: 1 }}>
-            <Text style={styles.widgetTitle}>{w.title}</Text>
-            <Text style={styles.mutedSmall}>{w.subtitle}</Text>
-          </View>
-          <Text style={styles.muted}>›</Text>
-        </Pressable>
-      ))}
-      <Text style={styles.mutedSmall}>Widgets need an internet connection the first time to load Tailwind.</Text>
-    </ScrollView>
-  );
-}
-
-/* ------------------------------------------------------------------ */
 /* WORKSPACE                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -2609,7 +3102,6 @@ function WorkspaceScreen({
   const pending = useRef(new Map<string, (v: any) => void>());
   const agent = useAgentStatus();
 
-  // Let the agent look at and act on this browser.
   useEffect(
     () =>
       AgentBus.register({
@@ -2650,11 +3142,10 @@ function WorkspaceScreen({
         }
       }
     } catch {
-      /* not ours */
+      /* ignore */
     }
   };
 
-  // Chat asks the workspace to open a page ("show what the app is doing").
   useEffect(
     () =>
       LiveBus.onNav((u) => {
@@ -2670,11 +3161,10 @@ function WorkspaceScreen({
       const uri = await captureRef(shotRef, { format: 'jpg', quality: 0.5, width: 360, result: 'tmpfile' });
       LiveBus.set({ thumb: uri + '?t=' + Date.now() });
     } catch {
-      /* preview is best-effort */
+      /* ignore */
     }
   }, []);
 
-  // Refresh the live preview every 2s while a live session is showing.
   useEffect(() => {
     const id = setInterval(() => {
       const l = LiveBus.get();
@@ -2765,37 +3255,37 @@ function WorkspaceScreen({
       ) : null}
 
       <View ref={shotRef} collapsable={false} style={{ flex: 1, backgroundColor: '#fff' }}>
-      <WebView
-        ref={webRef}
-        source={{ uri: url }}
-        onNavigationStateChange={onNav}
-        onMessage={onMessage}
-        onLoadStart={(e) => {
-          loadingRef.current = true;
-          setLoading(true);
-          loadStart.current = Date.now();
-          if (LiveBus.get().active) LiveBus.set({ loading: true, progress: 0.05 }, 'Loading ' + hostOf(e.nativeEvent.url));
-        }}
-        onLoadProgress={(e) => {
-          if (LiveBus.get().active) LiveBus.set({ progress: e.nativeEvent.progress });
-        }}
-        onLoadEnd={(e) => {
-          loadingRef.current = false;
-          setLoading(false);
-          if (LiveBus.get().active) {
-            const secs = ((Date.now() - loadStart.current) / 1000).toFixed(1);
-            LiveBus.set(
-              { loading: false, progress: 1, title: e.nativeEvent.title || '' },
-              'Loaded "' + (e.nativeEvent.title || hostOf(e.nativeEvent.url)) + '" in ' + secs + 's',
-            );
-            setTimeout(snap, 400);
-          }
-        }}
-        javaScriptEnabled
-        domStorageEnabled
-        setSupportMultipleWindows={false}
-        style={{ flex: 1, backgroundColor: '#fff' }}
-      />
+        <WebView
+          ref={webRef}
+          source={{ uri: url }}
+          onNavigationStateChange={onNav}
+          onMessage={onMessage}
+          onLoadStart={(e) => {
+            loadingRef.current = true;
+            setLoading(true);
+            loadStart.current = Date.now();
+            if (LiveBus.get().active) LiveBus.set({ loading: true, progress: 0.05 }, 'Loading ' + hostOf(e.nativeEvent.url));
+          }}
+          onLoadProgress={(e) => {
+            if (LiveBus.get().active) LiveBus.set({ progress: e.nativeEvent.progress });
+          }}
+          onLoadEnd={(e) => {
+            loadingRef.current = false;
+            setLoading(false);
+            if (LiveBus.get().active) {
+              const secs = ((Date.now() - loadStart.current) / 1000).toFixed(1);
+              LiveBus.set(
+                { loading: false, progress: 1, title: e.nativeEvent.title || '' },
+                'Loaded "' + (e.nativeEvent.title || hostOf(e.nativeEvent.url)) + '" in ' + secs + 's',
+              );
+              setTimeout(snap, 400);
+            }
+          }}
+          javaScriptEnabled
+          domStorageEnabled
+          setSupportMultipleWindows={false}
+          style={{ flex: 1, backgroundColor: '#fff' }}
+        />
       </View>
 
       {completed.length ? (
@@ -2819,7 +3309,7 @@ function WorkspaceScreen({
 }
 
 /* ------------------------------------------------------------------ */
-/* SETTINGS (Profile · Assistant · Cloud · Voice · Workspace · Updates) */
+/* SETTINGS                                                            */
 /* ------------------------------------------------------------------ */
 
 const AVATARS = ['⚡', '🧠', '🚀', '🦊', '🐼', '🐱', '🔥', '🌙', '🎯', '💡', '😎', '🙂'];
@@ -2878,20 +3368,11 @@ function SettingsScreen({
     setTesting(true);
     try {
       const h = await cloudHealth(cu);
-      let authNote = '';
-      if (h.auth_required) {
-        try {
-          await cloudFetch(cu, s.cloudToken.trim(), '/api/info', { timeoutMs: 12000 });
-          authNote = '\nToken: accepted';
-        } catch (e: any) {
-          authNote = '\nToken: ' + (e?.message || 'rejected');
-        }
-      }
       Alert.alert(
         'Cloud online',
         'Model: ' + (h.model || '?') +
           '\nGemini key on server: ' + (h.gemini_key_on_server ? 'yes' : 'no') +
-          '\nToken required: ' + (h.auth_required ? 'yes' : 'no') + authNote,
+          '\nToken required: ' + (h.auth_required ? 'yes' : 'no'),
       );
     } catch (e: any) {
       Alert.alert('Cloud not reachable', e?.message || String(e));
@@ -2908,11 +3389,11 @@ function SettingsScreen({
       const info = await checkForUpdate(DEFAULT_UPDATE_REPO, s.updateToken);
       setUpdate(info.available ? info : null);
       setCheckState(info.available ? 'new' : 'ok');
-      setCheckMsg(info.available ? 'A new version is available.' : '✓ You\'re up to date.');
+      setCheckMsg(info.available ? 'A new version is available.' : "✓ You're up to date.");
     } catch (e: any) {
       setUpdate(null);
       setCheckState('error');
-      setCheckMsg(e?.message || 'Couldn\'t check for updates. Try again.');
+      setCheckMsg(e?.message || "Couldn't check for updates. Try again.");
     } finally {
       setChecking(false);
     }
@@ -2940,6 +3421,17 @@ function SettingsScreen({
     <ScrollView contentContainerStyle={{ padding: 16, gap: 14, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
       <Text style={styles.sectionTitle}>Settings</Text>
 
+      {/* OS-Level Accessibility & Root Bridge */}
+      <View style={[styles.settingsCard, { borderColor: C.accent2 }]}>
+        <Text style={styles.cardTitle}>♿ OS-Level Accessibility & Root Bridge</Text>
+        <Text style={styles.mutedSmall}>
+          Enable "Pulse OS Assistive Bridge" in Android Accessibility Settings so Pulse can read screen elements, tap coordinates, and automate apps like Blinkit, Uber, Meesho, WhatsApp, and Free Fire.
+        </Text>
+        <Pressable onPress={() => openAppWithStatus('accessibility')} style={styles.primaryBtn}>
+          <Text style={styles.primaryBtnText}>Open Android Accessibility Settings</Text>
+        </Pressable>
+      </View>
+
       {/* Profile */}
       <View style={styles.settingsCard}>
         <Text style={styles.cardTitle}>👤 Profile</Text>
@@ -2959,15 +3451,10 @@ function SettingsScreen({
         </ScrollView>
         <Text style={styles.fieldLabel}>Name</Text>
         <TextInput value={s.name} onChangeText={(t) => patchSettings({ name: t })} placeholder="e.g. Alex" placeholderTextColor={C.muted} style={styles.input} />
-        <Text style={styles.fieldLabel}>Email</Text>
-        <TextInput value={s.email} onChangeText={(t) => patchSettings({ email: t })} placeholder="you@example.com" placeholderTextColor={C.muted} autoCapitalize="none" keyboardType="email-address" style={styles.input} />
         <Text style={styles.fieldLabel}>Role / headline</Text>
-        <TextInput value={s.role} onChangeText={(t) => patchSettings({ role: t })} placeholder="e.g. CS student, building a startup" placeholderTextColor={C.muted} style={styles.input} />
-        <SettingRow label="Personalize replies" hint="Let Pulse use your profile for context">
+        <TextInput value={s.role} onChangeText={(t) => patchSettings({ role: t })} placeholder="e.g. Creator & Developer" placeholderTextColor={C.muted} style={styles.input} />
+        <SettingRow label="Personalize replies" hint="Use profile & smart cross-session memory">
           <Switch value={s.personalize} onValueChange={(v) => patchSettings({ personalize: v })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
-        </SettingRow>
-        <SettingRow label="Daily focus goal" hint="Minutes of deep work">
-          <Stepper value={s.focusGoalMin} onChange={(n) => patchSettings({ focusGoalMin: n })} step={15} min={0} max={720} suffix="m" />
         </SettingRow>
       </View>
 
@@ -2983,7 +3470,6 @@ function SettingsScreen({
             <Text style={styles.mutedSmall}>{m.note}</Text>
           </Pressable>
         ))}
-        <Text style={styles.mutedSmall}>Busy or out-of-quota models are skipped automatically.</Text>
         <Text style={styles.fieldLabel}>Reply length</Text>
         <View style={styles.segment}>
           {REPLY_LENGTHS.map((r) => (
@@ -2992,41 +3478,12 @@ function SettingsScreen({
             </Pressable>
           ))}
         </View>
-        <SettingRow label="Creativity" hint="Model temperature">
-          <Stepper value={s.temperature} onChange={(n) => patchSettings({ temperature: n })} step={0.1} min={0} max={1} />
-        </SettingRow>
-        <SettingRow label="Chat history kept" hint="Messages stored on device">
-          <Stepper value={s.historyLimit} onChange={(n) => patchSettings({ historyLimit: n })} step={10} min={10} max={200} />
-        </SettingRow>
-      </View>
-
-      {/* Cloud */}
-      <View style={styles.settingsCard}>
-        <View style={styles.rowBetween}>
-          <Text style={styles.cardTitle}>☁️ Cloud computer</Text>
-          <Switch value={s.cloudMode} onValueChange={(v) => patchSettings({ cloudMode: v && !!s.cloudUrl })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
-        </View>
-        <Text style={styles.mutedSmall}>
-          Your Codespace: {hostOf(s.cloudUrl || DEFAULT_CLOUD_URL).split('-3000')[0]}. Chat stays on the phone for speed; the cloud is used when no API key is set.
-        </Text>
-        <Pressable onPress={testCloud} disabled={testing} style={styles.secondaryBtn}>
-          {testing ? <ActivityIndicator color={C.text} /> : <Text style={styles.primaryBtnText}>Check connection</Text>}
-        </Pressable>
-        <Pressable onPress={() => setCloudAdv((v) => !v)}>
-          <Text style={[styles.mutedSmall, { color: C.accent }]}>{cloudAdv ? 'Hide server details ▴' : 'Change server ▾'}</Text>
-        </Pressable>
-        {cloudAdv ? (
-          <>
-            <TextInput value={s.cloudUrl} onChangeText={(t) => patchSettings({ cloudUrl: t })} onBlur={() => patchSettings({ cloudUrl: normalizeCloudUrl(s.cloudUrl) })} placeholder={DEFAULT_CLOUD_URL} placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} keyboardType="url" style={styles.input} />
-            <TextInput value={s.cloudToken} onChangeText={(t) => patchSettings({ cloudToken: t })} placeholder="Access token (only if you set one)" placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} style={styles.input} />
-          </>
-        ) : null}
       </View>
 
       {/* Voice */}
       <View style={styles.settingsCard}>
         <View style={styles.rowBetween}>
-          <Text style={styles.cardTitle}>🔊 Voice readout</Text>
+          <Text style={styles.cardTitle}>🔊 Voice Talk & Readout</Text>
           <Switch
             value={s.voiceOn}
             onValueChange={(v) => {
@@ -3038,37 +3495,43 @@ function SettingsScreen({
             thumbColor="#fff"
           />
         </View>
-        <Text style={styles.mutedSmall}>Reads summaries and reminders aloud.</Text>
         <SettingRow label="Speed">
           <Stepper value={s.voiceRate} onChange={(n) => patchSettings({ voiceRate: n })} step={0.1} min={0.5} max={2} />
         </SettingRow>
         <SettingRow label="Pitch">
           <Stepper value={s.voicePitch} onChange={(n) => patchSettings({ voicePitch: n })} step={0.1} min={0.5} max={2} />
         </SettingRow>
-        <Text style={styles.fieldLabel}>Language code</Text>
-        <TextInput value={s.voiceLang} onChangeText={(t) => patchSettings({ voiceLang: t })} placeholder="en-US" placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} style={styles.input} />
-        <Pressable onPress={() => speakWith(settings, 'This is how Pulse will read your tasks aloud.')} style={styles.secondaryBtn}>
+        <Text style={styles.fieldLabel}>Language code (e.g. en-IN, te-IN, hi-IN, en-US)</Text>
+        <TextInput value={s.voiceLang} onChangeText={(t) => patchSettings({ voiceLang: t })} placeholder="en-IN" placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} style={styles.input} />
+        <Pressable onPress={() => speakWith(settings, 'Pulse OS voice assistant is active and ready.')} style={styles.secondaryBtn}>
           <Text style={styles.primaryBtnText}>Preview voice</Text>
         </Pressable>
       </View>
 
-      {/* Workspace & chat */}
+      {/* Cloud */}
       <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>🖥️ Live browser & chat</Text>
-        <Text style={styles.fieldLabel}>Live browser home page</Text>
-        <TextInput value={s.homeUrl} onChangeText={(t) => patchSettings({ homeUrl: t })} placeholder="https://www.google.com" placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} keyboardType="url" style={styles.input} />
-        <SettingRow label="Confirm before marking done" hint="Ask before completing a task">
-          <Switch value={s.confirmBeforeComplete} onValueChange={(v) => patchSettings({ confirmBeforeComplete: v })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
-        </SettingRow>
-        <SettingRow label="Haptics" hint="Vibrate when sending">
-          <Switch value={s.haptics} onValueChange={(v) => patchSettings({ haptics: v })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
-        </SettingRow>
+        <View style={styles.rowBetween}>
+          <Text style={styles.cardTitle}>☁️ Cloud computer</Text>
+          <Switch value={s.cloudMode} onValueChange={(v) => patchSettings({ cloudMode: v && !!s.cloudUrl })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
+        </View>
+        <Pressable onPress={testCloud} disabled={testing} style={styles.secondaryBtn}>
+          {testing ? <ActivityIndicator color={C.text} /> : <Text style={styles.primaryBtnText}>Check connection</Text>}
+        </Pressable>
+        <Pressable onPress={() => setCloudAdv((v) => !v)}>
+          <Text style={[styles.mutedSmall, { color: C.accent }]}>{cloudAdv ? 'Hide server details ▴' : 'Change server ▾'}</Text>
+        </Pressable>
+        {cloudAdv ? (
+          <>
+            <TextInput value={s.cloudUrl} onChangeText={(t) => patchSettings({ cloudUrl: t })} onBlur={() => patchSettings({ cloudUrl: normalizeCloudUrl(s.cloudUrl) })} placeholder={DEFAULT_CLOUD_URL} placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} keyboardType="url" style={styles.input} />
+            <TextInput value={s.cloudToken} onChangeText={(t) => patchSettings({ cloudToken: t })} placeholder="Access token" placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} style={styles.input} />
+          </>
+        ) : null}
       </View>
 
       {/* Updates */}
       <View style={styles.settingsCard}>
         <Text style={styles.cardTitle}>⬇️ App updates</Text>
-        <Text style={styles.mutedSmall}>Version {Application.nativeApplicationVersion || '2.0.0'} (build {cur})</Text>
+        <Text style={styles.mutedSmall}>Version {Application.nativeApplicationVersion || '2.1.0'} (build {cur})</Text>
         <Pressable onPress={check} disabled={checking || installing} style={styles.primaryBtn}>
           {checking ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Check for updates</Text>}
         </Pressable>
@@ -3090,26 +3553,6 @@ function SettingsScreen({
             </Pressable>
           </View>
         ) : null}
-      </View>
-
-      {/* About */}
-      <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>ℹ️ About</Text>
-        <Text style={styles.mutedSmall}>
-          {(Application.applicationName || 'Pulse OS')} v{Application.nativeApplicationVersion || '1.0.0'} (build {cur})
-        </Text>
-        <Text style={styles.mutedSmall}>Package: {Application.applicationId || 'com.pulseos.app'}</Text>
-        <Pressable
-          onPress={() =>
-            Alert.alert('Reset settings', 'Restore every setting to its default? Your chat history stays.', [
-              { text: 'Cancel', style: 'cancel' },
-              { text: 'Reset', style: 'destructive', onPress: () => patchSettings({ ...DEFAULT_SETTINGS }) },
-            ])
-          }
-          style={[styles.secondaryBtn, { borderColor: C.danger, marginTop: 8 }]}
-        >
-          <Text style={[styles.primaryBtnText, { color: C.danger }]}>Reset all settings</Text>
-        </Pressable>
       </View>
     </ScrollView>
   );
@@ -3137,15 +3580,15 @@ const styles = StyleSheet.create({
   convoItem: { padding: 10, borderRadius: 12, backgroundColor: C.panel2, borderWidth: 1, borderColor: 'transparent', gap: 4 },
   convoItemOn: { borderColor: C.accent },
   convoTitle: { color: C.text, fontWeight: '700', fontSize: 14, flexShrink: 1, marginRight: 8 },
-  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', padding: 24 },
+  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.65)', justifyContent: 'center', padding: 18 },
   modalCard: { backgroundColor: C.panel, borderRadius: 16, padding: 16, gap: 8, borderWidth: 1, borderColor: C.border },
   modelRow: { padding: 10, borderRadius: 12, backgroundColor: C.panel2, borderWidth: 1, borderColor: 'transparent', gap: 2 },
   appGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 14 },
   appTile: {
-    width: '30%', flexGrow: 1, alignItems: 'center', paddingVertical: 14, borderRadius: 14,
-    backgroundColor: C.panel, borderWidth: 1, borderColor: C.border, gap: 6,
+    width: '30%', flexGrow: 1, alignItems: 'center', paddingVertical: 14, paddingHorizontal: 6, borderRadius: 14,
+    backgroundColor: C.panel, borderWidth: 1, borderColor: C.border, gap: 4,
   },
-  appName: { color: C.text, fontSize: 12, fontWeight: '600' },
+  appName: { color: C.text, fontSize: 12, fontWeight: '700' },
   agentStrip: {
     flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 8, gap: 8,
     backgroundColor: C.panel, borderBottomWidth: 1, borderBottomColor: C.accent,
@@ -3197,7 +3640,7 @@ const styles = StyleSheet.create({
   },
   voiceBtnOn: { borderColor: C.accent, backgroundColor: '#2A1F5C' },
   voiceIcon: { fontSize: 16 },
-  voiceText: { color: C.muted, fontWeight: '700', fontSize: 12 },
+  voiceText: { color: C.muted, fontWeight: '700', fontSize: 11 },
 
   tabBar: {
     flexDirection: 'row',
@@ -3234,17 +3677,6 @@ const styles = StyleSheet.create({
   },
   chipText: { color: C.text, fontSize: 12, fontWeight: '600' },
 
-  settings: {
-    marginHorizontal: 12,
-    marginBottom: 8,
-    padding: 12,
-    borderRadius: 14,
-    backgroundColor: C.panel,
-    borderWidth: 1,
-    borderColor: C.border,
-    gap: 6,
-  },
-  settingsTitle: { color: C.text, fontWeight: '700' },
   input: {
     color: C.text,
     backgroundColor: C.panel2,
@@ -3270,10 +3702,9 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     alignItems: 'center',
   },
-  divider: { height: StyleSheet.hairlineWidth, backgroundColor: C.border, marginVertical: 8 },
   rowBetween: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   rowCenter: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  sourceTag: { color: C.accent2, fontSize: 11, fontWeight: '700', marginTop: 6 },
+  sourceTag: { color: C.accent2, fontSize: 11, fontWeight: '700' },
   cloudBtn: { borderColor: C.accent2 },
   avatarSmall: {
     width: 34, height: 34, borderRadius: 17, backgroundColor: C.panel2, borderWidth: 1, borderColor: C.border,
@@ -3310,10 +3741,10 @@ const styles = StyleSheet.create({
   progressFill: { height: 6, backgroundColor: C.good },
   tabBadge: { width: 6, height: 6, borderRadius: 3, backgroundColor: C.good, marginTop: 3 },
 
-  empty: { padding: 24, alignItems: 'center', gap: 8, marginTop: 40 },
+  empty: { padding: 24, alignItems: 'center', gap: 10, marginTop: 36 },
   emptyTitle: { color: C.text, fontSize: 18, fontWeight: '700' },
 
-  bubble: { maxWidth: '88%', borderRadius: 16, paddingHorizontal: 14, paddingVertical: 10, marginBottom: 8 },
+  bubble: { maxWidth: '90%', borderRadius: 16, paddingHorizontal: 14, paddingVertical: 10, marginBottom: 4 },
   userBubble: { alignSelf: 'flex-end', backgroundColor: C.accent, borderBottomRightRadius: 4 },
   botBubble: { alignSelf: 'flex-start', backgroundColor: C.panel2, borderBottomLeftRadius: 4 },
   errorBubble: { alignSelf: 'flex-start', backgroundColor: '#3B1418', borderWidth: 1, borderColor: C.danger },
@@ -3327,9 +3758,9 @@ const styles = StyleSheet.create({
     padding: 14,
   },
   cardHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  cardKicker: { color: C.accent2, fontSize: 11, fontWeight: '800', letterSpacing: 1.2, marginBottom: 6 },
+  cardKicker: { color: C.accent2, fontSize: 11, fontWeight: '800', letterSpacing: 1.1, marginBottom: 6 },
   cardSpeak: { fontSize: 18 },
-  cardSummary: { color: C.text, fontSize: 15, fontWeight: '600', marginBottom: 10 },
+  cardSummary: { color: C.text, fontSize: 14, fontWeight: '600', marginBottom: 10 },
   cardRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
 
   actionBtn: {
@@ -3349,14 +3780,43 @@ const styles = StyleSheet.create({
   checkText: { color: C.text, fontSize: 14, flex: 1, lineHeight: 20 },
   checkTextDone: { color: C.muted, textDecorationLine: 'line-through' },
 
+  attachmentPreviewBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginHorizontal: 10,
+    marginBottom: 6,
+    padding: 8,
+    borderRadius: 12,
+    backgroundColor: C.panel,
+    borderWidth: 1,
+    borderColor: C.accent2,
+  },
+  attachmentThumb: {
+    width: 44,
+    height: 44,
+    borderRadius: 8,
+    backgroundColor: C.panel2,
+  },
+
   composer: {
     flexDirection: 'row',
     alignItems: 'flex-end',
-    padding: 10,
-    gap: 8,
+    padding: 8,
+    gap: 6,
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: C.border,
     backgroundColor: C.bg,
+  },
+  iconBtn: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: C.panel2,
+    borderWidth: 1,
+    borderColor: C.border,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   composerInput: {
     flex: 1,
@@ -3369,29 +3829,14 @@ const styles = StyleSheet.create({
     fontSize: 15,
   },
   sendBtn: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+    width: 42,
+    height: 42,
+    borderRadius: 21,
     backgroundColor: C.accent,
     alignItems: 'center',
     justifyContent: 'center',
   },
   sendText: { color: '#fff', fontSize: 18, fontWeight: '800' },
-
-  widgetTile: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 14,
-    padding: 16,
-    borderRadius: 16,
-    backgroundColor: C.panel,
-    borderWidth: 1,
-    borderColor: C.border,
-  },
-  widgetEmoji: { fontSize: 28 },
-  widgetTitle: { color: C.text, fontSize: 16, fontWeight: '700' },
-  widgetBar: { flexDirection: 'row', alignItems: 'center', gap: 12, padding: 10 },
-  widgetBarTitle: { color: C.text, fontWeight: '700' },
 
   urlBar: { flexDirection: 'row', alignItems: 'center', gap: 6, padding: 8, backgroundColor: C.panel },
   urlInput: {

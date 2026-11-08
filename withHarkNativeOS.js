@@ -1,4 +1,4 @@
-const { withAndroidManifest, withStringsXml, withDangerousMod } = require('@expo/config-plugins');
+const { withAndroidManifest, withStringsXml, withMainApplication, withDangerousMod } = require('@expo/config-plugins');
 const fs = require('fs');
 const path = require('path');
 
@@ -6,11 +6,20 @@ const SERVICE_NAME = '.HarkAccessibilityService';
 const SERVICE_LABEL = 'Pulse OS Assistive Bridge';
 const SERVICE_DESC_KEY = 'hark_accessibility_service_description';
 const SERVICE_DESC_VALUE =
-  'Pulse OS Assistive Screen Reader and Voice Navigation helps users inspect on-screen elements, trigger user-confirmed hands-free taps, and open apps like Meesho, WhatsApp, Instagram, Telegram, and Free Fire by voice command.';
+  'Pulse OS Assistive Screen Reader, Voice Navigation, and OS-Level App Automation (Blinkit, Uber, Meesho, WhatsApp, Instagram, Telegram, Free Fire, and all installed apps).';
 
 function withHarkAccessibilityManifest(config) {
   return withAndroidManifest(config, (config) => {
     const manifest = config.modResults.manifest;
+
+    if (!manifest['uses-permission']) manifest['uses-permission'] = [];
+    const ensurePerm = (name) => {
+      if (!manifest['uses-permission'].some((p) => p?.$?.['android:name'] === name)) {
+        manifest['uses-permission'].push({ $: { 'android:name': name } });
+      }
+    };
+    ensurePerm('android.permission.RECORD_AUDIO');
+    ensurePerm('android.permission.QUERY_ALL_PACKAGES');
 
     if (!manifest.queries) manifest.queries = [];
     const queriesBlock = manifest.queries[0] || { package: [], intent: [] };
@@ -18,7 +27,20 @@ function withHarkAccessibilityManifest(config) {
     if (!queriesBlock.intent) queriesBlock.intent = [];
 
     const requiredPackages = [
+      'com.grofers.customerapp',
+      'com.ubercab',
+      'com.ubercab.uberlite',
+      'com.olacabs.customer',
+      'com.rapido.passenger',
+      'com.zeptoconsumerapp',
+      'in.swiggy.android',
+      'com.application.zomato',
       'com.meesho.supply',
+      'com.flipkart.android',
+      'in.amazon.mShop.android.shopping',
+      'com.phonepe.app',
+      'com.google.android.apps.nbu.paisa.user',
+      'net.one97.paytm',
       'com.whatsapp',
       'com.whatsapp.w4b',
       'com.instagram.android',
@@ -28,8 +50,6 @@ function withHarkAccessibilityManifest(config) {
       'org.thunderdog.challegram',
       'com.dts.freefiremax',
       'com.dts.freefireth',
-      'com.flipkart.android',
-      'in.amazon.mShop.android.shopping',
       'com.google.android.youtube',
       'com.spotify.music',
       'com.android.chrome',
@@ -101,6 +121,20 @@ function withHarkAccessibilityStrings(config) {
   });
 }
 
+function withHarkMainApplicationPackage(config) {
+  return withMainApplication(config, (config) => {
+    let src = config.modResults.contents;
+    if (!src.includes('HarkBridgePackage')) {
+      src = src.replace(
+        /PackageList\(this\)\.packages\.apply\s*\{/,
+        'PackageList(this).packages.apply {\n              add(HarkBridgePackage())',
+      );
+      config.modResults.contents = src;
+    }
+    return config;
+  });
+}
+
 function withHarkKotlinFiles(config) {
   return withDangerousMod(config, [
     'android',
@@ -130,16 +164,11 @@ function withHarkKotlinFiles(config) {
 
       const kotlinDir = path.join(androidRoot, 'app/src/main/java', packagePath);
       fs.mkdirSync(kotlinDir, { recursive: true });
-      const ktSourcePath = path.join(
-        config.modRequest.projectRoot,
-        'android/app/src/main/java',
-        packagePath,
-        'HarkAccessibilityService.kt',
-      );
-      if (!fs.existsSync(ktSourcePath)) {
-        fs.writeFileSync(
-          path.join(kotlinDir, 'HarkAccessibilityService.kt'),
-          `package ${packageName}
+
+      // 1. Write HarkAccessibilityService.kt
+      fs.writeFileSync(
+        path.join(kotlinDir, 'HarkAccessibilityService.kt'),
+        `package ${packageName}
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
@@ -151,10 +180,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import java.util.ArrayDeque
 
 class HarkAccessibilityService : AccessibilityService() {
     companion object {
@@ -163,19 +190,29 @@ class HarkAccessibilityService : AccessibilityService() {
             private set
 
         val KNOWN_APP_PACKAGES: Map<String, List<String>> = mapOf(
+            "blinkit" to listOf("com.grofers.customerapp"),
+            "uber" to listOf("com.ubercab", "com.ubercab.uberlite"),
+            "ola" to listOf("com.olacabs.customer"),
+            "rapido" to listOf("com.rapido.passenger"),
+            "zepto" to listOf("com.zeptoconsumerapp"),
+            "swiggy" to listOf("in.swiggy.android"),
+            "zomato" to listOf("com.application.zomato"),
             "meesho" to listOf("com.meesho.supply"),
+            "flipkart" to listOf("com.flipkart.android"),
+            "amazon" to listOf("in.amazon.mShop.android.shopping", "com.amazon.mShop.android.shopping"),
+            "phonepe" to listOf("com.phonepe.app"),
+            "gpay" to listOf("com.google.android.apps.nbu.paisa.user"),
+            "paytm" to listOf("net.one97.paytm"),
             "whatsapp" to listOf("com.whatsapp", "com.whatsapp.w4b"),
             "instagram" to listOf("com.instagram.android", "com.instagram.lite"),
             "telegram" to listOf("org.telegram.messenger", "org.telegram.messenger.web", "org.thunderdog.challegram"),
             "freefire" to listOf("com.dts.freefiremax", "com.dts.freefireth"),
             "free fire" to listOf("com.dts.freefiremax", "com.dts.freefireth"),
-            "flipkart" to listOf("com.flipkart.android"),
-            "amazon" to listOf("in.amazon.mShop.android.shopping", "com.amazon.mShop.android.shopping"),
             "youtube" to listOf("com.google.android.youtube"),
+            "spotify" to listOf("com.spotify.music"),
             "chrome" to listOf("com.android.chrome"),
             "gmail" to listOf("com.google.android.gm"),
-            "maps" to listOf("com.google.android.apps.maps"),
-            "spotify" to listOf("com.spotify.music")
+            "maps" to listOf("com.google.android.apps.maps")
         )
     }
 
@@ -225,32 +262,225 @@ class HarkAccessibilityService : AccessibilityService() {
 
     fun inputTextIntoNode(targetLabel: String?, textToEnter: String): Boolean {
         val root = rootInActiveWindow ?: return false
-        val targetNode = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
+        val targetNode = if (!targetLabel.isNullOrBlank()) {
+            root.findAccessibilityNodeInfosByText(targetLabel)?.firstOrNull { it.isEditable }
+                ?: root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        } else {
+            root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        } ?: return false
+
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, textToEnter)
         }
         targetNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
         return targetNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
     }
+}
+`,
+        'utf8',
+      );
 
-    fun launchAppByNameOrPackage(nameOrPackage: String): Boolean {
-        val lower = nameOrPackage.trim().lowercase()
-        val candidates = KNOWN_APP_PACKAGES[lower] ?: listOf(nameOrPackage.trim())
-        for (pkg in candidates) {
-            val intent = packageManager.getLaunchIntentForPackage(pkg)
-            if (intent != null) {
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                startActivity(intent)
-                return true
+      // 2. Write HarkBridgeModule.kt & HarkBridgePackage.kt for JS <-> Native OS Bridge (Voice Recognizer, All Installed Apps, Root Shell, Accessibility Taps)
+      fs.writeFileSync(
+        path.join(kotlinDir, 'HarkBridgeModule.kt'),
+        `package ${packageName}
+
+import android.app.Activity
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import android.speech.RecognizerIntent
+import com.facebook.react.bridge.*
+import java.io.BufferedReader
+import java.io.InputStreamReader
+
+class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
+    ReactContextBaseJavaModule(reactContext), ActivityEventListener {
+
+    private var voicePromise: Promise? = null
+    private val VOICE_REQ_CODE = 9412
+
+    init {
+        reactContext.addActivityEventListener(this)
+    }
+
+    override fun getName(): String = "HarkBridge"
+
+    @ReactMethod
+    fun startVoiceRecognition(lang: String?, promise: Promise) {
+        val activity = currentActivity
+        if (activity == null) {
+            promise.reject("NO_ACTIVITY", "Activity not available")
+            return
+        }
+        voicePromise = promise
+        try {
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (lang.isNullOrBlank()) "en-IN" else lang)
+                putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak to Pulse OS…")
+            }
+            activity.startActivityForResult(intent, VOICE_REQ_CODE)
+        } catch (e: Exception) {
+            voicePromise = null
+            promise.reject("VOICE_ERR", e.message)
+        }
+    }
+
+    override fun onActivityResult(activity: Activity?, requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == VOICE_REQ_CODE) {
+            val p = voicePromise
+            voicePromise = null
+            if (p != null) {
+                if (resultCode == Activity.RESULT_OK && data != null) {
+                    val matches = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                    p.resolve(matches?.firstOrNull() ?: "")
+                } else {
+                    p.resolve("")
+                }
             }
         }
-        return false
+    }
+
+    override fun onNewIntent(intent: Intent?) {}
+
+    @ReactMethod
+    fun getInstalledApps(promise: Promise) {
+        try {
+            val pm = reactContext.packageManager
+            val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
+                addCategory(Intent.CATEGORY_LAUNCHER)
+            }
+            val apps = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.queryIntentActivities(mainIntent, PackageManager.ResolveInfoFlags.of(0L))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.queryIntentActivities(mainIntent, 0)
+            }
+            val arr = Arguments.createArray()
+            val seen = mutableSetOf<String>()
+            for (info in apps) {
+                val pkg = info.activityInfo?.packageName ?: continue
+                if (seen.contains(pkg) || pkg == reactContext.packageName) continue
+                seen.add(pkg)
+                val label = info.loadLabel(pm)?.toString()?.trim() ?: pkg
+                val map = Arguments.createMap()
+                map.putString("label", label)
+                map.putString("packageName", pkg)
+                arr.pushMap(map)
+            }
+            promise.resolve(arr)
+        } catch (e: Exception) {
+            promise.reject("ERR_APPS", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun launchApp(nameOrPkg: String, query: String?, promise: Promise) {
+        try {
+            val clean = nameOrPkg.trim()
+            val lower = clean.lowercase()
+            val pm = reactContext.packageManager
+
+            val candidates = mutableListOf<String>()
+            HarkAccessibilityService.KNOWN_APP_PACKAGES[lower]?.let { candidates.addAll(it) }
+            if (clean.contains(".")) candidates.add(clean)
+
+            for (pkg in candidates) {
+                val intent = pm.getLaunchIntentForPackage(pkg)
+                if (intent != null) {
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                    reactContext.startActivity(intent)
+                    promise.resolve(true)
+                    return
+                }
+            }
+
+            // Search all installed launcher apps on the phone by label
+            val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
+                addCategory(Intent.CATEGORY_LAUNCHER)
+            }
+            val apps = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.queryIntentActivities(mainIntent, PackageManager.ResolveInfoFlags.of(0L))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.queryIntentActivities(mainIntent, 0)
+            }
+            val matched = apps.firstOrNull { info ->
+                val label = info.loadLabel(pm)?.toString()?.lowercase() ?: ""
+                label == lower || label.contains(lower) || lower.contains(label)
+            }
+            val matchedPkg = matched?.activityInfo?.packageName
+            if (!matchedPkg.isNullOrEmpty()) {
+                val intent = pm.getLaunchIntentForPackage(matchedPkg)
+                if (intent != null) {
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                    reactContext.startActivity(intent)
+                    promise.resolve(true)
+                    return
+                }
+            }
+            promise.resolve(false)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun clickByText(text: String, promise: Promise) {
+        val ok = HarkAccessibilityService.instance?.clickNodeByText(text) ?: false
+        promise.resolve(ok)
+    }
+
+    @ReactMethod
+    fun tapCoordinate(x: Double, y: Double, promise: Promise) {
+        val svcOk = HarkAccessibilityService.instance?.tapCoordinate(x.toFloat(), y.toFloat()) ?: false
+        if (svcOk) {
+            promise.resolve(true)
+            return
+        }
+        // Fallback to root/shell input tap if device has su
+        try {
+            val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", "input tap \${x.toInt()} \${y.toInt()}"))
+            val code = proc.waitFor()
+            promise.resolve(code == 0)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun inputText(targetLabel: String?, text: String, promise: Promise) {
+        val ok = HarkAccessibilityService.instance?.inputTextIntoNode(targetLabel, text) ?: false
+        promise.resolve(ok)
+    }
+
+    @ReactMethod
+    fun runRootCommand(cmd: String, promise: Promise) {
+        try {
+            val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+            val reader = BufferedReader(InputStreamReader(proc.inputStream))
+            val out = reader.readText()
+            proc.waitFor()
+            promise.resolve(out)
+        } catch (e: Exception) {
+            promise.reject("ROOT_ERR", e.message)
+        }
+    }
+}
+
+class HarkBridgePackage : com.facebook.react.ReactPackage {
+    override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> {
+        return listOf(HarkBridgeModule(reactContext))
+    }
+
+    override fun createViewManagers(reactContext: ReactApplicationContext): List<com.facebook.react.uimanager.ViewManager<*, *>> {
+        return emptyList()
     }
 }
 `,
-          'utf8',
-        );
-      }
+        'utf8',
+      );
 
       return config;
     },
@@ -260,6 +490,7 @@ class HarkAccessibilityService : AccessibilityService() {
 module.exports = function withHarkNativeOS(config) {
   config = withHarkAccessibilityManifest(config);
   config = withHarkAccessibilityStrings(config);
+  config = withHarkMainApplicationPackage(config);
   config = withHarkKotlinFiles(config);
   return config;
 };

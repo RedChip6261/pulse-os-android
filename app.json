@@ -2,7 +2,7 @@
   "expo": {
     "name": "Pulse OS Max",
     "slug": "pulse-os",
-    "version": "2.1.0",
+    "version": "2.2.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "backgroundColor": "#0B0F17",
@@ -20,7 +20,7 @@
     },
     "android": {
       "package": "com.pulseos.app",
-      "versionCode": 3,
+      "versionCode": 4,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#0B0F17"
@@ -28,6 +28,8 @@
       "permissions": [
         "android.permission.INTERNET",
         "android.permission.VIBRATE",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.QUERY_ALL_PACKAGES",
         "android.permission.REQUEST_INSTALL_PACKAGES"
       ],
       "softwareKeyboardLayoutMode": "resize"
