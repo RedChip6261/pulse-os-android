@@ -5,6 +5,8 @@ import {
   FlatList,
   KeyboardAvoidingView,
   Linking,
+  Animated,
+  Modal,
   Platform,
   Pressable,
   SafeAreaView,
@@ -62,6 +64,7 @@ const CLOUD_DOMAIN = 'app.github.dev';
 const DEFAULT_MODEL = 'gemini-flash-latest';
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
 const DEFAULT_UPDATE_REPO = 'RedChip6261/pulse-os-android';
+const DEFAULT_CLOUD_URL = 'https://scaling-space-telegram-jjg94w99g6pj255vv-3000.app.github.dev';
 
 const SYSTEM_PROMPT = [
   'You are Pulse, a proactive personal-productivity assistant inside the Pulse OS mobile app.',
@@ -74,7 +77,7 @@ const SYSTEM_PROMPT = [
   '"one_line_summary": a single short sentence summarising the task or plan.',
 ].join(' ');
 
-type Tab = 'CHAT' | 'WIDGETS' | 'WORKSPACE' | 'SETTINGS';
+type Tab = 'CHAT' | 'APPS' | 'LIVE' | 'SETTINGS';
 
 type PulseReply = {
   direct_response: string;
@@ -265,9 +268,7 @@ function buildStreamPrompt(extraSystem: string): string {
     'Reply in the same language the user writes in (English, Hindi, Telugu, Hinglish, etc).',
     'Only ask a clarifying question when the request truly cannot be answered without it.',
     'Plain text only: no markdown headings, no tables; short lines or "-" bullets are fine.',
-    'After the answer, on a new line write exactly ' + META_MARK + ' and then one compact JSON object:',
-    '{"proactive_checklist": [2-4 short follow-up actions, max 10 words each], "one_line_summary": "one short sentence"}.',
-    'Never put anything after the JSON.',
+    'Do not add follow-up suggestion lists or a summary line at the end.',
     extraSystem,
   ]
     .filter(Boolean)
@@ -313,6 +314,7 @@ function finishStreamReply(full: string): PulseReply {
 function thinkingFor(model: string, speed: SpeedMode): any | undefined {
   if (speed === 'smart') return undefined;
   if (/gemini-2\.5/i.test(model)) return /pro/i.test(model) ? { thinkingBudget: 128 } : { thinkingBudget: 0 };
+  if (/pro/i.test(model)) return { thinkingLevel: 'low' };
   // Gemini 3+ and the *-latest aliases take a thinking level.
   return { thinkingLevel: speed === 'fast' ? 'minimal' : 'low' };
 }
@@ -322,9 +324,30 @@ function streamOnce(
   model: string,
   body: string,
   onText: (full: string) => void,
+  firstTokenMs = 6000,
+  totalMs = 30000,
 ): Promise<{ full: string; status: number; error?: string }> {
   return new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
+    let done = false;
+    let watchdog: ReturnType<typeof setTimeout> | null = null;
+    const finish = (r: { full: string; status: number; error?: string }) => {
+      if (done) return;
+      done = true;
+      if (watchdog) clearTimeout(watchdog);
+      resolve(r);
+    };
+    // No first words fast enough: give up on this model so the next one can answer.
+    watchdog = setTimeout(() => {
+      if (!full) {
+        try {
+          xhr.abort();
+        } catch {
+          /* ignore */
+        }
+        finish({ full: '', status: 0, error: 'slow' });
+      }
+    }, firstTokenMs);
     let seen = 0;
     let buffer = '';
     let full = '';
@@ -358,7 +381,7 @@ function streamOnce(
     xhr.open('POST', GEMINI_BASE + encodeURIComponent(model) + ':streamGenerateContent?alt=sse');
     xhr.setRequestHeader('Content-Type', 'application/json');
     xhr.setRequestHeader('x-goog-api-key', apiKey);
-    xhr.timeout = 60000;
+    xhr.timeout = totalMs;
     xhr.onprogress = () => {
       if (xhr.status === 200) pump();
     };
@@ -369,7 +392,7 @@ function streamOnce(
       if (xhr.status === 200) {
         buffer += '\n';
         pump();
-        resolve({ full, status: 200 });
+        finish({ full, status: 200 });
       } else {
         let msg = 'HTTP ' + xhr.status;
         try {
@@ -378,11 +401,11 @@ function streamOnce(
         } catch {
           /* keep HTTP code */
         }
-        resolve({ full: '', status: xhr.status, error: msg });
+        finish({ full: '', status: xhr.status, error: msg });
       }
     };
-    xhr.onerror = () => resolve({ full: '', status: 0, error: 'Network error' });
-    xhr.ontimeout = () => resolve({ full, status: full ? 200 : 0, error: full ? undefined : 'Timed out' });
+    xhr.onerror = () => finish({ full: '', status: 0, error: 'Network error' });
+    xhr.ontimeout = () => finish({ full, status: full ? 200 : 0, error: full ? undefined : 'Timed out' });
     xhr.send(body);
   });
 }
@@ -413,15 +436,66 @@ async function streamGemini(
     });
   const emit = (full: string) => onText(splitStreamText(full).visible);
 
-  let r = await streamOnce(apiKey, model, make(thinkingFor(model, speed)), emit);
-  if (r.status === 400 && /thinking/i.test(r.error || '')) {
-    // This model doesn't accept that thinking setting: retry with the model's default.
-    r = await streamOnce(apiKey, model, make(undefined), emit);
+  // Busy/overloaded/slow models are skipped instantly; the next fast model answers instead.
+  const chain = modelChain(model);
+  let lastErr = '';
+  let sawNetwork = false;
+  for (const m of chain) {
+    if (isCooling(m)) continue;
+    let r = await streamOnce(apiKey, m, make(thinkingFor(m, speed)), emit);
+    if (r.status === 400 && /thinking/i.test(r.error || '')) {
+      r = await streamOnce(apiKey, m, make(undefined), emit);
+    }
+    if (r.status === 200 && r.full.trim()) {
+      noteGood(m);
+      return { reply: finishStreamReply(r.full), modelUsed: m };
+    }
+    lastErr = r.error || 'HTTP ' + r.status;
+    if (r.error === 'Network error') sawNetwork = true;
+    if (r.status === 401 || (r.status === 400 && /api key/i.test(lastErr))) {
+      throw new Error('Your Gemini API key was rejected. Check it in Settings → Assistant.');
+    }
+    // 429 quota, 5xx overloaded/high demand, 404 retired model, slow first token: cool down and move on.
+    coolDown(m, r.status === 429 ? 60000 : r.status === 404 ? 3600000 : 30000);
   }
-  if (r.status === 200 && r.full.trim()) return { reply: finishStreamReply(r.full), modelUsed: model };
-  if (r.status === 0 && r.error === 'Network error') throw new Error('No internet connection.');
-  // Model missing or another error: the non-streaming path knows how to find a working model.
-  return callGemini(apiKey, model, history, extraSystem, temperature);
+  if (sawNetwork) throw new Error('No internet connection.');
+  if (/quota|429|exhausted/i.test(lastErr)) {
+    throw new Error('Your free Gemini quota is used up for now. Try again in a minute, or pick another model.');
+  }
+  throw new Error('Google\'s models are busy right now. Tap send again in a few seconds.');
+}
+
+const FALLBACK_MODELS = [
+  'gemini-flash-lite-latest',
+  'gemini-flash-latest',
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+];
+const cooldowns: Record<string, number> = {};
+let lastGoodModel = '';
+function isCooling(m: string) {
+  return (cooldowns[m] || 0) > Date.now();
+}
+function coolDown(m: string, ms: number) {
+  cooldowns[m] = Date.now() + ms;
+}
+function noteGood(m: string) {
+  lastGoodModel = m;
+  delete cooldowns[m];
+}
+function modelChain(preferred: string): string[] {
+  const out: string[] = [];
+  const add = (m: string) => m && !out.includes(m) && out.push(m);
+  add(preferred);
+  if (lastGoodModel && lastGoodModel !== preferred && isCooling(preferred)) out.unshift(lastGoodModel);
+  FALLBACK_MODELS.forEach(add);
+  // If everything is cooling down, still try the two fastest rather than failing.
+  if (out.every(isCooling)) {
+    delete cooldowns[out[0]];
+    delete cooldowns['gemini-flash-lite-latest'];
+  }
+  return out;
 }
 
 
@@ -583,6 +657,501 @@ function StepsView({ steps, streaming }: { steps: Step[]; streaming?: boolean })
           ))
         : null}
     </View>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Models, JSON calls with automatic fallback                          */
+/* ------------------------------------------------------------------ */
+
+const MODEL_CHOICES: { id: string; name: string; note: string }[] = [
+  { id: 'gemini-flash-lite-latest', name: '⚡ Flash-Lite', note: 'Fastest replies (1–3 s)' },
+  { id: 'gemini-flash-latest', name: '✨ Flash', note: 'Fast and smarter' },
+  { id: 'gemini-pro-latest', name: '🧠 Pro', note: 'Smartest, slower; free keys have low limits' },
+  { id: 'gemini-2.5-flash', name: '2.5 Flash', note: 'Previous generation' },
+];
+
+function modelLabel(id: string) {
+  const m = MODEL_CHOICES.find((x) => x.id === id);
+  return m ? m.name : id;
+}
+
+async function geminiJson(
+  apiKey: string,
+  preferred: string,
+  system: string,
+  contents: any[],
+  timeoutMs = 15000,
+): Promise<{ json: any; model: string }> {
+  let lastErr = '';
+  for (const m of modelChain(preferred)) {
+    if (isCooling(m)) continue;
+    let thinking: any | undefined = thinkingFor(m, 'fast');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+      try {
+        const res = await fetch(GEMINI_BASE + encodeURIComponent(m) + ':generateContent', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: system }] },
+            contents,
+            generationConfig: {
+              temperature: 0.2,
+              responseMimeType: 'application/json',
+              ...(thinking ? { thinkingConfig: thinking } : {}),
+            },
+          }),
+          signal: ctrl.signal,
+        });
+        const j: any = await res.json().catch(() => null);
+        if (!res.ok) {
+          const msg: string = j?.error?.message || 'HTTP ' + res.status;
+          lastErr = msg;
+          if (res.status === 401 || (res.status === 400 && /api key/i.test(msg))) {
+            throw new Error('KEY_REJECTED');
+          }
+          if (res.status === 400 && /thinking/i.test(msg) && thinking) {
+            thinking = undefined;
+            continue;
+          }
+          coolDown(m, res.status === 429 ? 60000 : res.status === 404 ? 3600000 : 30000);
+          break;
+        }
+        const text: string = j?.candidates?.[0]?.content?.parts
+          ?.filter((p: any) => !p?.thought)
+          .map((p: any) => p?.text ?? '')
+          .join('') ?? '';
+        const clean = stripCodeFences(text);
+        const a = clean.indexOf('{');
+        const b = clean.lastIndexOf('}');
+        const json = JSON.parse(a !== -1 && b > a ? clean.slice(a, b + 1) : clean);
+        noteGood(m);
+        return { json, model: m };
+      } catch (e: any) {
+        if (e?.message === 'KEY_REJECTED') {
+          throw new Error('Your Gemini API key was rejected. Check it in Settings → Assistant.');
+        }
+        lastErr = e?.name === 'AbortError' ? 'slow' : e?.message || String(e);
+        coolDown(m, 30000);
+        break;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+  }
+  if (/quota|429|exhausted/i.test(lastErr)) {
+    throw new Error('Your free Gemini quota is used up for now. Try again in a minute, or pick another model.');
+  }
+  throw new Error('Google\'s models are busy right now. Try again in a few seconds.');
+}
+
+/* ------------------------------------------------------------------ */
+/* Cross-app: open other apps with standard Android links              */
+/* ------------------------------------------------------------------ */
+
+type AppArgs = { query?: string; to?: string; text?: string };
+
+const APPS: { id: string; name: string; icon: string; hint: string }[] = [
+  { id: 'whatsapp', name: 'WhatsApp', icon: '💬', hint: 'Message to send' },
+  { id: 'maps', name: 'Maps', icon: '🗺️', hint: 'Place to find' },
+  { id: 'navigate', name: 'Navigate', icon: '🧭', hint: 'Where to go' },
+  { id: 'youtube', name: 'YouTube', icon: '▶️', hint: 'Video to search' },
+  { id: 'spotify', name: 'Spotify', icon: '🎵', hint: 'Song or artist' },
+  { id: 'phone', name: 'Call', icon: '📞', hint: 'Phone number' },
+  { id: 'sms', name: 'SMS', icon: '✉️', hint: 'Message text' },
+  { id: 'email', name: 'Email', icon: '📧', hint: 'Subject' },
+  { id: 'calendar', name: 'Calendar', icon: '📅', hint: 'Event title' },
+  { id: 'telegram', name: 'Telegram', icon: '✈️', hint: 'Message to share' },
+  { id: 'instagram', name: 'Instagram', icon: '📸', hint: 'Username' },
+  { id: 'playstore', name: 'Play Store', icon: '🛍️', hint: 'App to find' },
+  { id: 'web', name: 'Web search', icon: '🔎', hint: 'Search the web' },
+  { id: 'settings', name: 'Settings', icon: '⚙️', hint: 'Phone settings' },
+];
+
+function phoneDigits(to: string) {
+  let d = String(to || '').replace(/[^\d]/g, '');
+  if (d.length === 10 && /^[6-9]/.test(d)) d = '91' + d; // Indian mobile without country code
+  return d;
+}
+
+function appUrls(app: string, a: AppArgs): string[] {
+  const q = encodeURIComponent(a.query || a.text || '');
+  const t = encodeURIComponent(a.text || a.query || '');
+  switch (app) {
+    case 'whatsapp': {
+      const d = phoneDigits(a.to || '');
+      return [
+        'whatsapp://send?' + (d ? 'phone=' + d + '&' : '') + 'text=' + t,
+        'https://wa.me/' + d + '?text=' + t,
+      ];
+    }
+    case 'maps':
+      return ['geo:0,0?q=' + q, 'https://www.google.com/maps/search/?api=1&query=' + q];
+    case 'navigate':
+      return ['google.navigation:q=' + q, 'https://www.google.com/maps/dir/?api=1&destination=' + q];
+    case 'youtube':
+      return ['vnd.youtube://results?search_query=' + q, 'https://www.youtube.com/results?search_query=' + q];
+    case 'spotify':
+      return ['spotify:search:' + q, 'https://open.spotify.com/search/' + q];
+    case 'phone':
+      return ['tel:' + String(a.to || a.query || '').replace(/[^\d+]/g, '')];
+    case 'sms':
+      return ['sms:' + String(a.to || '').replace(/[^\d+]/g, '') + '?body=' + t];
+    case 'email':
+      return [mailtoUrl(a.query || '', a.text || '')];
+    case 'calendar':
+      return [calendarUrl(a.query || a.text || 'New event', a.text || '')];
+    case 'telegram':
+      return ['tg://msg?text=' + t, 'https://t.me/share/url?url=&text=' + t];
+    case 'instagram': {
+      const u = String(a.query || '').replace(/^@/, '').trim();
+      return u ? ['instagram://user?username=' + encodeURIComponent(u), 'https://instagram.com/' + encodeURIComponent(u)] : ['instagram://app', 'https://instagram.com/'];
+    }
+    case 'playstore':
+      return ['market://search?q=' + q, 'https://play.google.com/store/search?q=' + q];
+    case 'web':
+      return [searchUrl(a.query || a.text || '')];
+    default:
+      return [];
+  }
+}
+
+async function openApp(app: string, a: AppArgs): Promise<boolean> {
+  if (app === 'settings') {
+    await Linking.openSettings().catch(() => undefined);
+    return true;
+  }
+  for (const u of appUrls(app, a)) {
+    try {
+      await Linking.openURL(u);
+      return true;
+    } catch {
+      /* not installed: try the web fallback */
+    }
+  }
+  return false;
+}
+
+/* ------------------------------------------------------------------ */
+/* Agent: Pulse drives its own in-app browser (LIVE tab)               */
+/* ------------------------------------------------------------------ */
+
+type PageSnap = { url: string; title: string; els: { i: number; tag: string; label: string }[]; text: string };
+type AgentRunner = {
+  evalJs: (body: string) => Promise<any>;
+  navigate: (url: string) => void;
+  isLoading: () => boolean;
+};
+type AgentStatus = { running: boolean; goal: string; step: string };
+
+const AgentBus = (() => {
+  let runner: AgentRunner | null = null;
+  let stopped = false;
+  let status: AgentStatus = { running: false, goal: '', step: '' };
+  const subs = new Set<(s: AgentStatus) => void>();
+  const emit = () => subs.forEach((f) => f(status));
+  return {
+    register(r: AgentRunner) {
+      runner = r;
+      return () => {
+        if (runner === r) runner = null;
+      };
+    },
+    runner: () => runner,
+    begin(goal: string) {
+      stopped = false;
+      status = { running: true, goal, step: 'Starting…' };
+      emit();
+    },
+    step(step: string) {
+      status = { ...status, step };
+      emit();
+    },
+    end() {
+      status = { running: false, goal: status.goal, step: '' };
+      emit();
+    },
+    stop() {
+      stopped = true;
+      status = { ...status, step: 'Stopping…' };
+      emit();
+    },
+    isStopped: () => stopped,
+    get: () => status,
+    on(f: (s: AgentStatus) => void) {
+      subs.add(f);
+      return () => {
+        subs.delete(f);
+      };
+    },
+  };
+})();
+
+function useAgentStatus(): AgentStatus {
+  const [s, setS] = useState<AgentStatus>(AgentBus.get());
+  useEffect(() => AgentBus.on(setS), []);
+  return s;
+}
+
+const SNAPSHOT_JS = String.raw`
+var out=[];var n=0;
+document.querySelectorAll('[data-pulse-id]').forEach(function(e){e.removeAttribute('data-pulse-id')});
+var q='a[href],button,input:not([type=hidden]),textarea,select,[role=button],[role=link],[role=tab],[role=option],[role=menuitem],[role=checkbox],[onclick],[contenteditable=true]';
+var els=document.querySelectorAll(q);var vh=window.innerHeight*2.5;
+for(var k=0;k<els.length&&n<70;k++){
+  var e=els[k];var r=e.getBoundingClientRect();
+  if(r.width<2||r.height<2||r.bottom<-50||r.top>vh)continue;
+  var st=getComputedStyle(e);if(st.visibility==='hidden'||st.display==='none')continue;
+  var lab=(e.getAttribute('aria-label')||e.innerText||e.value||e.getAttribute('placeholder')||e.getAttribute('title')||e.getAttribute('name')||e.getAttribute('alt')||'').replace(/\s+/g,' ').trim().slice(0,70);
+  var tag=e.tagName.toLowerCase();if(tag==='input')tag='input['+(e.type||'text')+']';
+  if(!lab&&tag==='a'){var img=e.querySelector('img');lab=img?(img.alt||'image link'):'';}
+  if(!lab&&tag.indexOf('input')<0&&tag!=='textarea'&&tag!=='select')continue;
+  e.setAttribute('data-pulse-id',String(n));out.push({i:n,tag:tag,label:lab});n++;
+}
+return {url:location.href,title:document.title,els:out,text:(document.body?document.body.innerText:'').replace(/\n{2,}/g,'\n').slice(0,2500)};
+`;
+
+const ACT_JS = String.raw`
+var e=document.querySelector('[data-pulse-id="'+I+'"]');
+if(!e)return {ok:false,msg:'element '+I+' not found; take a new look at the page'};
+e.scrollIntoView({block:'center'});
+var old=e.style.outline;e.style.outline='3px solid #7C5CFF';setTimeout(function(){e.style.outline=old},1500);
+if(KIND==='click'){if(e.focus)e.focus();e.click();return {ok:true};}
+if(KIND==='type'){
+  e.focus();
+  if(e.isContentEditable){e.innerText=TEXT;}
+  else{var proto=e.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:(e.tagName==='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype);
+    var d=Object.getOwnPropertyDescriptor(proto,'value');if(d&&d.set){d.set.call(e,TEXT);}else{e.value=TEXT;}}
+  e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));
+  if(SUBMIT){
+    if(e.form){if(e.form.requestSubmit)e.form.requestSubmit();else e.form.submit();}
+    else{['keydown','keypress','keyup'].forEach(function(t){e.dispatchEvent(new KeyboardEvent(t,{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));});}
+  }
+  return {ok:true};
+}
+return {ok:false,msg:'unknown action'};
+`;
+
+const AGENT_SYSTEM = [
+  'You are Pulse Agent. You complete tasks for the user by operating a mobile web browser inside the Pulse OS app, and you can open other apps on their Android phone.',
+  'Each turn you get the goal, the steps already taken, and the current page: its URL, title, numbered interactive elements ([i] tag: label) and visible text.',
+  'Reply with ONE JSON object: {"thought": "<=12 words, what you are doing, for the user to see", "action": {...}}.',
+  'Actions:',
+  '{"type":"navigate","url":"https://..."}  open a page (use https://www.google.com/search?q=... to search).',
+  '{"type":"click","i":N}  tap element N.',
+  '{"type":"type","i":N,"text":"...","submit":true|false}  type into field N (submit presses Enter).',
+  '{"type":"scroll","dir":"down"|"up"}',
+  '{"type":"open_app","app":"whatsapp|maps|navigate|youtube|spotify|phone|sms|email|calendar|telegram|instagram|playstore","query":"...","to":"phone number if any","text":"message if any"}  hands off to a native app and ends the task.',
+  '{"type":"answer","text":"..."}  the task is done or you found the answer: reply to the user (short, specific, same language as the user).',
+  '{"type":"ask","text":"..."}  you need the user: a login, password, OTP, payment, a choice only they can make, or the final confirm of a purchase, booking or message. Leave the page there; the user finishes it in the LIVE tab.',
+  'Rules: never type passwords, OTPs or card numbers. Never press the final Pay/Place order/Book/Send button yourself; use ask instead.',
+  'Prefer direct URLs (e.g. https://www.youtube.com/results?search_query=...) over many clicks. Be fast: as few steps as possible.',
+  'If a page shows the answer, answer right away. If stuck after 2 tries, answer with what you found.',
+].join('\n');
+
+const AGENT_RE =
+  /^(please\s+|can you\s+|pls\s+)?(open|go to|goto|search|find|look ?up|book|order|play|send|message|whatsapp|call|dial|navigate|take me|directions|show me|check|buy|download|watch|listen|browse|visit|compare|track|fill|apply|sign up|do)\b/i;
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+async function agentSnapshot(): Promise<PageSnap | null> {
+  const r = AgentBus.runner();
+  if (!r) return null;
+  const snap: any = await r.evalJs(SNAPSHOT_JS);
+  if (!snap || snap.error) return null;
+  return snap as PageSnap;
+}
+
+async function waitForPage(maxMs = 10000) {
+  const r = AgentBus.runner();
+  await sleep(450);
+  const t0 = Date.now();
+  while (r && r.isLoading() && Date.now() - t0 < maxMs) await sleep(200);
+  await sleep(350);
+}
+
+async function runAgent(o: {
+  apiKey: string;
+  model: string;
+  goal: string;
+  context: string;
+  onStep: (label: string) => void;
+}): Promise<string> {
+  const runner = AgentBus.runner();
+  if (!runner) throw new Error('The live browser is not ready yet. Try again in a second.');
+  const done: string[] = [];
+  for (let n = 0; n < 12; n++) {
+    if (AgentBus.isStopped()) return 'Stopped. The page is still open in the LIVE tab.';
+    const snap = await agentSnapshot();
+    const page = snap
+      ? 'URL: ' + snap.url + '\nTitle: ' + snap.title + '\nElements:\n' +
+        snap.els.map((e) => '[' + e.i + '] ' + e.tag + ': ' + e.label).join('\n') +
+        '\nVisible text:\n' + snap.text
+      : 'No page is open yet (blank).';
+    const prompt =
+      'Goal: ' + o.goal +
+      (o.context ? '\nRecent chat:\n' + o.context : '') +
+      '\nSteps so far:\n' + (done.length ? done.map((d, i) => i + 1 + '. ' + d).join('\n') : '(none)') +
+      '\n\nCurrent page:\n' + page;
+    const { json } = await geminiJson(o.apiKey, o.model, AGENT_SYSTEM, [{ role: 'user', parts: [{ text: prompt }] }]);
+    const a: any = json?.action || {};
+    const thought = String(json?.thought || '').trim();
+    const type = String(a.type || '');
+    if (type === 'answer' || type === 'ask') {
+      return String(a.text || thought || 'Done.');
+    }
+    if (type === 'navigate' && a.url) {
+      const url = normalizeUrl(String(a.url));
+      o.onStep(thought || 'Opening ' + hostOf(url));
+      runner.navigate(url);
+      await waitForPage();
+      done.push('navigate ' + url);
+    } else if (type === 'click' && Number.isFinite(Number(a.i))) {
+      const el = snap?.els.find((e) => e.i === Number(a.i));
+      o.onStep(thought || 'Tapping "' + (el?.label || a.i) + '"');
+      const r: any = await runner.evalJs('var I=' + JSON.stringify(Number(a.i)) + ',KIND="click",TEXT="",SUBMIT=false;' + ACT_JS);
+      await waitForPage(8000);
+      done.push('click [' + a.i + '] "' + (el?.label || '') + '" → ' + (r?.ok ? 'ok' : r?.msg || 'failed'));
+    } else if (type === 'type' && Number.isFinite(Number(a.i))) {
+      const text = String(a.text || '');
+      o.onStep(thought || 'Typing "' + text.slice(0, 30) + '"');
+      const r: any = await runner.evalJs(
+        'var I=' + JSON.stringify(Number(a.i)) + ',KIND="type",TEXT=' + JSON.stringify(text) + ',SUBMIT=' + (a.submit ? 'true' : 'false') + ';' + ACT_JS,
+      );
+      if (a.submit) await waitForPage(8000);
+      done.push('type [' + a.i + '] "' + text + '"' + (a.submit ? ' + Enter' : '') + ' → ' + (r?.ok ? 'ok' : r?.msg || 'failed'));
+    } else if (type === 'scroll') {
+      const up = a.dir === 'up';
+      o.onStep(thought || 'Scrolling ' + (up ? 'up' : 'down'));
+      await runner.evalJs('window.scrollBy(0,' + (up ? '-' : '') + 'window.innerHeight*0.8);return {ok:true};');
+      await sleep(400);
+      done.push('scroll ' + (up ? 'up' : 'down'));
+    } else if (type === 'open_app' && a.app) {
+      const app = String(a.app);
+      const name = APPS.find((x) => x.id === app)?.name || app;
+      o.onStep(thought || 'Opening ' + name);
+      const ok = await openApp(app, { query: a.query, to: a.to, text: a.text });
+      return ok ? 'Opened ' + name + '.' : name + ' isn\'t installed, so I couldn\'t open it.';
+    } else {
+      done.push('invalid action ' + JSON.stringify(a).slice(0, 80));
+    }
+  }
+  return 'I took 12 steps and stopped here. The page is open in the LIVE tab so you can finish it.';
+}
+
+/* ------------------------------------------------------------------ */
+/* Conversations (side drawer with summaries)                          */
+/* ------------------------------------------------------------------ */
+
+type Convo = { id: string; title: string; summary: string; updatedAt: number; messages: ChatMessage[] };
+const STORAGE_CONVOS = 'pulseos.convos.v1';
+const STORAGE_CONVO_CURRENT = 'pulseos.convos.current';
+
+async function loadConvos(): Promise<{ convos: Convo[]; current: string }> {
+  const [raw, cur] = await Promise.all([AsyncStorage.getItem(STORAGE_CONVOS), AsyncStorage.getItem(STORAGE_CONVO_CURRENT)]);
+  let convos: Convo[] = [];
+  if (raw) {
+    try {
+      convos = JSON.parse(raw);
+    } catch {
+      convos = [];
+    }
+  }
+  if (!convos.length) {
+    // Bring the chat from older versions into the first conversation.
+    let old: ChatMessage[] = [];
+    try {
+      old = JSON.parse((await AsyncStorage.getItem(STORAGE_CHAT)) || '[]');
+    } catch {
+      old = [];
+    }
+    const firstUser = old.find((m) => m.role === 'user');
+    convos = [{ id: uid(), title: firstUser ? firstUser.text.slice(0, 40) : 'New chat', summary: '', updatedAt: Date.now(), messages: old }];
+  }
+  convos = convos.map((c) => ({
+    ...c,
+    messages: (c.messages || []).filter((m) => !(m.streaming && !m.text.trim())).map((m) => ({ ...m, streaming: false })),
+  }));
+  const current = convos.find((c) => c.id === cur) ? (cur as string) : convos[0].id;
+  return { convos, current };
+}
+
+async function summarizeConvo(apiKey: string, messages: ChatMessage[]): Promise<{ title: string; summary: string } | null> {
+  const text = messages
+    .filter((m) => m.role !== 'error' && m.text.trim())
+    .slice(-12)
+    .map((m) => (m.role === 'user' ? 'User: ' : 'Pulse: ') + m.text.slice(0, 400))
+    .join('\n');
+  if (!text) return null;
+  try {
+    const { json } = await geminiJson(
+      apiKey,
+      FAST_MODEL,
+      'Summarize this chat. Reply JSON {"title": "max 6 words", "summary": "max 25 words, what was asked and the outcome"}. Same language as the chat.',
+      [{ role: 'user', parts: [{ text }] }],
+      10000,
+    );
+    return { title: String(json?.title || '').slice(0, 60), summary: String(json?.summary || '').slice(0, 220) };
+  } catch {
+    return null;
+  }
+}
+
+function timeAgo(ts: number) {
+  const s = Math.round((Date.now() - ts) / 1000);
+  if (s < 60) return 'now';
+  if (s < 3600) return Math.round(s / 60) + 'm';
+  if (s < 86400) return Math.round(s / 3600) + 'h';
+  return Math.round(s / 86400) + 'd';
+}
+
+/* ------------------------------------------------------------------ */
+/* APPS tab                                                            */
+/* ------------------------------------------------------------------ */
+
+function AppsScreen({ say }: { say: (t: string) => void }) {
+  const [text, setText] = useState('');
+  const [to, setTo] = useState('');
+  const [last, setLast] = useState('');
+  const launch = async (id: string, name: string) => {
+    const ok = await openApp(id, id === 'email' ? { query: text, text: '' } : { query: text, text, to });
+    const msg = ok ? 'Opened ' + name : name + ' isn\'t installed';
+    setLast(msg);
+    say(msg);
+  };
+  return (
+    <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
+      <Text style={styles.sectionTitle}>Apps</Text>
+      <Text style={styles.mutedSmall}>
+        Type what you want, then tap an app. Pulse opens it ready to go. You can also just ask in chat: "play lo-fi on YouTube".
+      </Text>
+      <TextInput
+        value={text}
+        onChangeText={setText}
+        placeholder="Search, message or place…"
+        placeholderTextColor={C.muted}
+        style={[styles.input, { marginTop: 12 }]}
+      />
+      <TextInput
+        value={to}
+        onChangeText={setTo}
+        placeholder="Phone number (for WhatsApp, Call, SMS)"
+        placeholderTextColor={C.muted}
+        keyboardType="phone-pad"
+        style={[styles.input, { marginTop: 8 }]}
+      />
+      <View style={styles.appGrid}>
+        {APPS.map((a) => (
+          <Pressable key={a.id} onPress={() => launch(a.id, a.name)} style={styles.appTile} accessibilityLabel={'Open ' + a.name}>
+            <Text style={{ fontSize: 26 }}>{a.icon}</Text>
+            <Text style={styles.appName} numberOfLines={1}>{a.name}</Text>
+          </Pressable>
+        ))}
+      </View>
+      {last ? <Text style={[styles.mutedSmall, { marginTop: 10 }]}>{last}</Text> : null}
+    </ScrollView>
   );
 }
 
@@ -977,6 +1546,7 @@ type Settings = {
   updateRepo: string;
   updateToken: string;
   autoCheckUpdates: boolean;
+  rev?: number;
 };
 
 const DEFAULT_SETTINGS: Settings = {
@@ -987,13 +1557,13 @@ const DEFAULT_SETTINGS: Settings = {
   focusGoalMin: 120,
   personalize: true,
   apiKey: '',
-  model: DEFAULT_MODEL,
+  model: FAST_MODEL,
   temperature: 0.7,
-  speed: 'balanced',
+  speed: 'fast',
   fastModel: FAST_MODEL,
   replyLength: 'balanced',
   historyLimit: 60,
-  cloudUrl: '',
+  cloudUrl: DEFAULT_CLOUD_URL,
   cloudToken: '',
   cloudMode: false,
   voiceOn: false,
@@ -1012,7 +1582,19 @@ async function loadSettings(): Promise<Settings> {
   const raw = await AsyncStorage.getItem(STORAGE_SETTINGS);
   if (raw) {
     try {
-      return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+      const saved: any = JSON.parse(raw);
+      const merged: Settings = { ...DEFAULT_SETTINGS, ...saved };
+      if (!saved.rev || saved.rev < 3) {
+        // v3: fast replies by default; chat no longer waits on the cloud server.
+        merged.speed = 'fast';
+        merged.fastModel = FAST_MODEL;
+        merged.model = FAST_MODEL;
+        merged.cloudMode = false;
+        if (!merged.cloudUrl) merged.cloudUrl = DEFAULT_CLOUD_URL;
+        merged.rev = 3;
+        await AsyncStorage.setItem(STORAGE_SETTINGS, JSON.stringify(merged));
+      }
+      return merged;
     } catch {
       /* fall through to migration */
     }
@@ -1177,7 +1759,7 @@ export default function App() {
     });
   }, []);
 
-  useEffect(() => LiveBus.onFocus(() => setTab('WORKSPACE')), []);
+  useEffect(() => LiveBus.onFocus(() => setTab('LIVE')), []);
 
   const patchSettings = useCallback((patch: Partial<Settings>) => {
     const next = { ...settingsRef.current, ...patch };
@@ -1207,8 +1789,8 @@ export default function App() {
 
   const tabs: { id: Tab; icon: string }[] = [
     { id: 'CHAT', icon: '💬' },
-    { id: 'WIDGETS', icon: '🧩' },
-    { id: 'WORKSPACE', icon: '🌐' },
+    { id: 'APPS', icon: '📱' },
+    { id: 'LIVE', icon: '🖥️' },
     { id: 'SETTINGS', icon: '⚙️' },
   ];
 
@@ -1251,13 +1833,13 @@ export default function App() {
         <View style={[styles.fill, tab !== 'CHAT' && styles.hidden]}>
           <ChatScreen say={say} settings={settings} patchSettings={patchSettings} openSettings={() => setTab('SETTINGS')} />
         </View>
-        <View style={[styles.fill, tab !== 'WIDGETS' && styles.hidden]}>
-          <WidgetsScreen say={say} />
+        <View style={[styles.fill, tab !== 'APPS' && styles.hidden]}>
+          <AppsScreen say={say} />
         </View>
         <View
-          style={[styles.fill, tab !== 'WORKSPACE' && styles.offscreen]}
-          pointerEvents={tab === 'WORKSPACE' ? 'auto' : 'none'}
-          importantForAccessibility={tab === 'WORKSPACE' ? 'auto' : 'no-hide-descendants'}
+          style={[styles.fill, tab !== 'LIVE' && styles.offscreen]}
+          pointerEvents={tab === 'LIVE' ? 'auto' : 'none'}
+          importantForAccessibility={tab === 'LIVE' ? 'auto' : 'no-hide-descendants'}
         >
           <WorkspaceScreen say={say} homeUrl={settings.homeUrl} confirmFirst={settings.confirmBeforeComplete} />
         </View>
@@ -1339,38 +1921,124 @@ function ChatScreen({
   const keyForCloud = () =>
     cloudHealthInfo && cloudHealthInfo.gemini_key_on_server === false && apiKey ? apiKey : undefined;
 
+  const [convos, setConvos] = useState<Convo[]>([]);
+  const [currentId, setCurrentId] = useState('');
+  const [drawer, setDrawer] = useState(false);
+  const [modelPicker, setModelPicker] = useState(false);
+  const [mode, setMode] = useState<'auto' | 'agent' | 'chat'>('auto');
+  const drawerX = useRef(new Animated.Value(-320)).current;
+  const summarizing = useRef(false);
+
   useEffect(() => {
-    AsyncStorage.getItem(STORAGE_CHAT).then((h) => {
-      if (h) {
-        try {
-          setMessages(
-            (JSON.parse(h) as ChatMessage[])
-              .filter((m) => !(m.streaming && !m.text.trim()))
-              .map((m) => ({ ...m, streaming: false })),
-          );
-        } catch {
-          setMessages([]);
-        }
-      }
+    loadConvos().then(({ convos: list, current }) => {
+      setConvos(list);
+      setCurrentId(current);
+      setMessages(list.find((c) => c.id === current)?.messages || []);
       setLoaded(true);
     });
   }, []);
 
+  // Keep the open conversation in the list, and save everything.
   useEffect(() => {
-    if (loaded) AsyncStorage.setItem(STORAGE_CHAT, JSON.stringify(messages.slice(-Math.max(10, settings.historyLimit))));
-  }, [messages, loaded, settings.historyLimit]);
+    if (!loaded || !currentId) return;
+    setConvos((prev) =>
+      prev.map((c) => {
+        if (c.id !== currentId) return c;
+        const firstUser = messages.find((m) => m.role === 'user');
+        const lastTs = messages.length ? messages[messages.length - 1].ts : c.updatedAt;
+        return {
+          ...c,
+          messages: messages.slice(-Math.max(10, settings.historyLimit)),
+          updatedAt: lastTs,
+          title: c.title && c.title !== 'New chat' ? c.title : firstUser ? firstUser.text.slice(0, 40) : 'New chat',
+        };
+      }),
+    );
+  }, [messages, loaded, currentId, settings.historyLimit]);
 
-  const clearChat = () => {
-    Alert.alert('Clear chat', 'Delete the whole conversation?', [
+  useEffect(() => {
+    if (!loaded) return;
+    AsyncStorage.setItem(STORAGE_CONVOS, JSON.stringify(convos.slice(0, 50)));
+    AsyncStorage.setItem(STORAGE_CONVO_CURRENT, currentId);
+  }, [convos, currentId, loaded]);
+
+  const showDrawer = (open: boolean) => {
+    if (open) setDrawer(true);
+    Animated.timing(drawerX, { toValue: open ? 0 : -320, duration: 200, useNativeDriver: true }).start(() => {
+      if (!open) setDrawer(false);
+    });
+  };
+
+  const newChat = () => {
+    if (busy) return;
+    const cur = convos.find((c) => c.id === currentId);
+    if (cur && !messages.length) {
+      showDrawer(false);
+      return;
+    }
+    const c: Convo = { id: uid(), title: 'New chat', summary: '', updatedAt: Date.now(), messages: [] };
+    setConvos((prev) => [c, ...prev]);
+    setCurrentId(c.id);
+    setMessages([]);
+    showDrawer(false);
+  };
+
+  const openConvo = (id: string) => {
+    if (busy) return;
+    const c = convos.find((x) => x.id === id);
+    if (!c) return;
+    setCurrentId(id);
+    setMessages(c.messages);
+    showDrawer(false);
+  };
+
+  const deleteConvo = (id: string) => {
+    Alert.alert('Delete chat', 'Delete this conversation?', [
       { text: 'Cancel', style: 'cancel' },
-      { text: 'Clear', style: 'destructive', onPress: () => setMessages([]) },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: () => {
+          const rest = convos.filter((c) => c.id !== id);
+          if (!rest.length) {
+            const c: Convo = { id: uid(), title: 'New chat', summary: '', updatedAt: Date.now(), messages: [] };
+            setConvos([c]);
+            setCurrentId(c.id);
+            setMessages([]);
+            return;
+          }
+          setConvos(rest);
+          if (id === currentId) {
+            setCurrentId(rest[0].id);
+            setMessages(rest[0].messages);
+          }
+        },
+      },
     ]);
+  };
+
+  // Summaries live in the side drawer; made in the background so replies stay fast.
+  const refreshSummary = (convoId: string, msgs: ChatMessage[]) => {
+    if (!apiKey || summarizing.current || msgs.filter((m) => m.role !== 'error').length < 2) return;
+    summarizing.current = true;
+    summarizeConvo(apiKey, msgs)
+      .then((r) => {
+        if (r && (r.title || r.summary)) {
+          setConvos((prev) =>
+            prev.map((c) => (c.id === convoId ? { ...c, title: r.title || c.title, summary: r.summary || c.summary } : c)),
+          );
+        }
+      })
+      .finally(() => {
+        summarizing.current = false;
+      });
   };
 
   const send = async () => {
     const text = input.trim();
     if (!text || busy) return;
-    const useCloud = cloudMode && !!cloudUrl;
+    // Plain chat always goes straight to Gemini from the phone (fastest path); the cloud is only a fallback with no key.
+    const useCloud = !apiKey && cloudMode && !!cloudUrl;
     if (!apiKey && !useCloud) {
       openSettings();
       return;
@@ -1399,11 +2067,55 @@ function ChatScreen({
     setInput('');
     setBusy(true);
     const ctx = profileContext(settings);
-    const wantsWeb = /^(search|look up|lookup|google|find|browse|open|show me)\b|\bsearch (for|the web)\b/i.test(text);
-    if (wantsWeb) {
-      const q = text.replace(/^(please\s+)?(search( for)?|look ?up|google|find|browse|open|show me)\s+/i, '');
-      step('Opening ' + (q.length > 40 ? q.slice(0, 40) + '…' : q) + ' in Workspace');
-      LiveBus.open(searchUrl(q || text));
+    const convoId = currentId;
+    const useAgent = !!apiKey && (mode === 'agent' || (mode === 'auto' && AGENT_RE.test(text)));
+    if (useAgent) {
+      AgentBus.begin(text);
+      LiveBus.set({ active: true, startedAt: Date.now(), loading: false, thumb: null, log: [] }, '🤖 ' + text.slice(0, 60));
+      try {
+        const recent = messages
+          .filter((m) => m.role !== 'error' && m.text.trim())
+          .slice(-6)
+          .map((m) => (m.role === 'user' ? 'User: ' : 'Pulse: ') + m.text.slice(0, 300))
+          .join('\n');
+        const agentModel = /lite/i.test(model) ? 'gemini-flash-latest' : model;
+        const answer = await runAgent({
+          apiKey,
+          model: agentModel,
+          goal: text + (ctx ? '\n(' + ctx + ')' : ''),
+          context: recent,
+          onStep: (label) => {
+            step(label);
+            AgentBus.step(label);
+            LiveBus.set({}, label);
+          },
+        });
+        step('Done', 'done');
+        finishSteps();
+        LiveBus.set({}, '✅ ' + answer.slice(0, 80));
+        const final: ChatMessage = {
+          id: botId,
+          role: 'assistant',
+          text: answer,
+          reply: { direct_response: answer, proactive_checklist: [], one_line_summary: '' },
+          source: 'device',
+          streaming: false,
+          steps: [...steps],
+          ts: Date.now(),
+        };
+        setMessages((prev) => prev.map((m) => (m.id === botId ? final : m)));
+        refreshSummary(convoId, [...next, final]);
+        say(answer);
+      } catch (e: any) {
+        setMessages((prev) => [
+          ...prev.filter((m) => m.id !== botId),
+          { id: uid(), role: 'error', text: e?.message || String(e), ts: Date.now() },
+        ]);
+      } finally {
+        AgentBus.end();
+        setBusy(false);
+      }
+      return;
     }
     try {
       let result: { reply: PulseReply; modelUsed: string } | null = null;
@@ -1430,8 +2142,8 @@ function ChatScreen({
         }
       }
       if (!result) {
-        const useModel = settings.speed === 'fast' ? settings.fastModel || FAST_MODEL : model;
-        step('Thinking (' + useModel + ', ' + settings.speed + ')');
+        const useModel = model || FAST_MODEL;
+        step('Thinking with ' + modelLabel(useModel).replace(/^\W+/, ''));
         let writing = false;
         result = await streamGemini(apiKey, useModel, next, ctx, settings.temperature, settings.speed, (visible) => {
           if (!writing && visible.trim()) {
@@ -1440,9 +2152,6 @@ function ChatScreen({
           }
           setMessages((prev) => prev.map((m) => (m.id === botId ? { ...m, text: visible } : m)));
         });
-        if (result.modelUsed && result.modelUsed !== useModel) {
-          patchSettings(settings.speed === 'fast' ? { fastModel: result.modelUsed } : { model: result.modelUsed });
-        }
       }
       const { reply } = result;
       const n = reply.proactive_checklist.length;
@@ -1459,7 +2168,8 @@ function ChatScreen({
         ts: Date.now(),
       };
       setMessages((prev) => (prev.some((m) => m.id === botId) ? prev.map((m) => (m.id === botId ? botMsg : m)) : [...prev, botMsg]));
-      say(replyToSpeech(reply));
+      refreshSummary(convoId, [...next, botMsg]);
+      say(reply.direct_response.slice(0, 400));
     } catch (e: any) {
       setMessages((prev) => [
         ...prev.filter((m) => m.id !== botId),
@@ -1530,26 +2240,25 @@ function ChatScreen({
   return (
     <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
       <View style={styles.chatToolbar}>
-        <Pressable onPress={() => cloudUrl && checkCloud(cloudUrl)} style={{ flex: 1 }}>
-          <Text
-            style={[
-              styles.muted,
-              cloudMode && cloudStatus === 'online' && { color: C.good },
-              cloudMode && cloudStatus === 'offline' && { color: C.danger },
-            ]}
-            numberOfLines={1}
-          >
-            {statusLabel}
+        <Pressable onPress={() => showDrawer(true)} style={styles.chip} accessibilityLabel="Open chats and summaries">
+          <Text style={styles.chipText}>☰</Text>
+        </Pressable>
+        <Pressable onPress={() => setModelPicker(true)} style={[styles.chip, { flexShrink: 1 }]} accessibilityLabel="Choose model">
+          <Text style={styles.chipText} numberOfLines={1}>
+            {!apiKey && cloudMode && cloudUrl ? '☁️ Cloud' : modelLabel(model || FAST_MODEL)} ▾
           </Text>
         </Pressable>
-        <View style={{ flexDirection: 'row', gap: 8 }}>
-          <Pressable onPress={openSettings} style={styles.chip}>
-            <Text style={styles.chipText}>⚙️ Settings</Text>
-          </Pressable>
-          <Pressable onPress={clearChat} style={styles.chip}>
-            <Text style={styles.chipText}>🗑 Clear</Text>
-          </Pressable>
-        </View>
+        <View style={{ flex: 1 }} />
+        <Pressable
+          onPress={() => setMode((m) => (m === 'auto' ? 'agent' : m === 'agent' ? 'chat' : 'auto'))}
+          style={[styles.chip, mode === 'agent' && { borderColor: C.accent }]}
+          accessibilityLabel="Agent mode"
+        >
+          <Text style={styles.chipText}>{mode === 'auto' ? '🤖 Auto' : mode === 'agent' ? '🤖 Agent' : '💬 Chat'}</Text>
+        </Pressable>
+        <Pressable onPress={newChat} style={styles.chip} accessibilityLabel="New chat">
+          <Text style={styles.chipText}>✎ New</Text>
+        </Pressable>
       </View>
 
       <FlatList
@@ -1564,7 +2273,7 @@ function ChatScreen({
               {settings.name.trim() ? 'What\'s on your plate, ' + settings.name.trim().split(' ')[0] + '?' : 'What\'s on your plate?'}
             </Text>
             <Text style={styles.muted}>
-              Try: "Plan my week around a Friday exam" or "Help me budget for a trip to Goa".
+              Ask anything, or tell Pulse to do it: "find biryani near me", "play lo-fi on YouTube", "compare iPhone 16 prices".
             </Text>
             {!apiKey && !(cloudMode && cloudUrl) ? (
               <Pressable onPress={openSettings} style={[styles.primaryBtn, { paddingHorizontal: 18 }]}>
@@ -1595,6 +2304,65 @@ function ChatScreen({
           {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.sendText}>➤</Text>}
         </Pressable>
       </View>
+
+      {drawer ? (
+        <View style={styles.drawerWrap}>
+          <Pressable style={styles.drawerBackdrop} onPress={() => showDrawer(false)} />
+          <Animated.View style={[styles.drawer, { transform: [{ translateX: drawerX }] }]}>
+            <View style={styles.rowBetween}>
+              <Text style={styles.cardTitle}>Chats</Text>
+              <Pressable onPress={newChat} style={styles.chip}>
+                <Text style={styles.chipText}>✎ New chat</Text>
+              </Pressable>
+            </View>
+            <ScrollView style={{ marginTop: 10 }} contentContainerStyle={{ gap: 8, paddingBottom: 30 }}>
+              {[...convos]
+                .sort((x, y) => y.updatedAt - x.updatedAt)
+                .map((c) => (
+                  <Pressable
+                    key={c.id}
+                    onPress={() => openConvo(c.id)}
+                    onLongPress={() => deleteConvo(c.id)}
+                    style={[styles.convoItem, c.id === currentId && styles.convoItemOn]}
+                  >
+                    <View style={styles.rowBetween}>
+                      <Text style={styles.convoTitle} numberOfLines={1}>{c.title || 'New chat'}</Text>
+                      <Text style={styles.mutedSmall}>{timeAgo(c.updatedAt)}</Text>
+                    </View>
+                    <Text style={styles.mutedSmall} numberOfLines={3}>
+                      {c.summary || (c.messages.length ? c.messages.length + ' messages' : 'Empty')}
+                    </Text>
+                  </Pressable>
+                ))}
+            </ScrollView>
+            <Text style={styles.mutedSmall}>Long-press a chat to delete it.</Text>
+          </Animated.View>
+        </View>
+      ) : null}
+
+      <Modal visible={modelPicker} transparent animationType="fade" onRequestClose={() => setModelPicker(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setModelPicker(false)}>
+          <View style={styles.modalCard}>
+            <Text style={styles.cardTitle}>Model</Text>
+            {MODEL_CHOICES.map((m) => (
+              <Pressable
+                key={m.id}
+                onPress={() => {
+                  patchSettings({ model: m.id });
+                  setModelPicker(false);
+                }}
+                style={[styles.modelRow, (model || FAST_MODEL) === m.id && styles.convoItemOn]}
+              >
+                <Text style={styles.convoTitle}>{m.name}</Text>
+                <Text style={styles.mutedSmall}>{m.note}</Text>
+              </Pressable>
+            ))}
+            <Text style={[styles.mutedSmall, { marginTop: 8 }]}>
+              If a model is busy, Pulse switches to another one automatically.
+            </Text>
+          </View>
+        </Pressable>
+      </Modal>
     </KeyboardAvoidingView>
   );
 }
@@ -1622,7 +2390,6 @@ function MessageBubble({
       </View>
     );
   }
-  const r = msg.reply;
   return (
     <View style={{ marginBottom: 12 }}>
       <View style={[styles.bubble, styles.botBubble]}>
@@ -1640,7 +2407,6 @@ function MessageBubble({
         )}
         {msg.source === 'cloud' ? <Text style={styles.sourceTag}>☁️ cloud</Text> : null}
       </View>
-      {r && !msg.streaming ? <ActionCard reply={r} say={say} onCloudPlan={onCloudPlan} /> : null}
     </View>
   );
 }
@@ -1839,6 +2605,54 @@ function WorkspaceScreen({
   const [completed, setCompleted] = useState<{ title: string; url: string; ts: number }[]>([]);
   const shotRef = useRef<View>(null);
   const loadStart = useRef(0);
+  const loadingRef = useRef(false);
+  const pending = useRef(new Map<string, (v: any) => void>());
+  const agent = useAgentStatus();
+
+  // Let the agent look at and act on this browser.
+  useEffect(
+    () =>
+      AgentBus.register({
+        evalJs: (body: string) =>
+          new Promise((resolve) => {
+            const id = uid();
+            const timer = setTimeout(() => {
+              pending.current.delete(id);
+              resolve(null);
+            }, 6000);
+            pending.current.set(id, (v) => {
+              clearTimeout(timer);
+              resolve(v);
+            });
+            webRef.current?.injectJavaScript(
+              '(function(){var __r;try{__r=(function(){' + body + '})();}catch(e){__r={error:String(e)};}' +
+                'window.ReactNativeWebView.postMessage(JSON.stringify({__pulse:' + JSON.stringify(id) + ',r:__r}));})();true;',
+            );
+          }),
+        navigate: (u: string) => {
+          loadingRef.current = true;
+          setUrl(u);
+          setField(u);
+        },
+        isLoading: () => loadingRef.current,
+      }),
+    [],
+  );
+
+  const onMessage = (e: WebViewMessageEvent) => {
+    try {
+      const d = JSON.parse(e.nativeEvent.data);
+      if (d && d.__pulse) {
+        const f = pending.current.get(d.__pulse);
+        if (f) {
+          pending.current.delete(d.__pulse);
+          f(d.r);
+        }
+      }
+    } catch {
+      /* not ours */
+    }
+  };
 
   // Chat asks the workspace to open a page ("show what the app is doing").
   useEffect(
@@ -1937,13 +2751,27 @@ function WorkspaceScreen({
         </Pressable>
       </View>
       {loading ? <View style={styles.progress} /> : null}
+      {agent.running ? (
+        <View style={styles.agentStrip}>
+          <ActivityIndicator size="small" color={C.accent} />
+          <View style={{ flex: 1 }}>
+            <Text style={styles.liveTitle} numberOfLines={1}>🤖 {agent.step || 'Working…'}</Text>
+            <Text style={styles.mutedSmall} numberOfLines={1}>{agent.goal}</Text>
+          </View>
+          <Pressable onPress={() => AgentBus.stop()} style={[styles.chip, { borderColor: C.danger }]}>
+            <Text style={[styles.chipText, { color: C.danger }]}>■ Stop</Text>
+          </Pressable>
+        </View>
+      ) : null}
 
       <View ref={shotRef} collapsable={false} style={{ flex: 1, backgroundColor: '#fff' }}>
       <WebView
         ref={webRef}
         source={{ uri: url }}
         onNavigationStateChange={onNav}
+        onMessage={onMessage}
         onLoadStart={(e) => {
+          loadingRef.current = true;
           setLoading(true);
           loadStart.current = Date.now();
           if (LiveBus.get().active) LiveBus.set({ loading: true, progress: 0.05 }, 'Loading ' + hostOf(e.nativeEvent.url));
@@ -1952,6 +2780,7 @@ function WorkspaceScreen({
           if (LiveBus.get().active) LiveBus.set({ progress: e.nativeEvent.progress });
         }}
         onLoadEnd={(e) => {
+          loadingRef.current = false;
           setLoading(false);
           if (LiveBus.get().active) {
             const secs = ((Date.now() - loadStart.current) / 1000).toFixed(1);
@@ -2032,6 +2861,7 @@ function SettingsScreen({
 }) {
   const s = settings;
   const [testing, setTesting] = useState(false);
+  const [cloudAdv, setCloudAdv] = useState(false);
   const [checking, setChecking] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -2147,30 +2977,13 @@ function SettingsScreen({
         <Text style={styles.mutedSmall}>Gemini API key — stored only on this device. Free at aistudio.google.com.</Text>
         <TextInput value={s.apiKey} onChangeText={(t) => patchSettings({ apiKey: t })} placeholder="AIza…" placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} style={styles.input} />
         <Text style={styles.fieldLabel}>Model</Text>
-        <TextInput value={s.model} onChangeText={(t) => patchSettings({ model: t })} placeholder={DEFAULT_MODEL} placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} style={styles.input} />
-        <Text style={styles.fieldLabel}>Response speed</Text>
-        <View style={styles.segment}>
-          {(['fast', 'balanced', 'smart'] as SpeedMode[]).map((m) => (
-            <Pressable key={m} onPress={() => patchSettings({ speed: m })} style={[styles.segItem, s.speed === m && styles.segItemOn]}>
-              <Text style={[styles.segText, s.speed === m && styles.segTextOn]}>
-                {m === 'fast' ? '⚡ Fast' : m === 'balanced' ? '⚖️ Balanced' : '🧠 Smart'}
-              </Text>
-            </Pressable>
-          ))}
-        </View>
-        <Text style={styles.mutedSmall}>
-          {s.speed === 'fast'
-            ? 'Fastest: Flash-Lite with no extra thinking. Great for quick tasks.'
-            : s.speed === 'balanced'
-              ? 'Flash with light thinking. Fast and smart for most things.'
-              : 'Flash with full thinking. Slower, best for hard planning.'}
-        </Text>
-        {s.speed === 'fast' ? (
-          <>
-            <Text style={styles.fieldLabel}>Fast model</Text>
-            <TextInput value={s.fastModel} onChangeText={(t) => patchSettings({ fastModel: t })} placeholder={FAST_MODEL} placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} style={styles.input} />
-          </>
-        ) : null}
+        {MODEL_CHOICES.map((m) => (
+          <Pressable key={m.id} onPress={() => patchSettings({ model: m.id })} style={[styles.modelRow, s.model === m.id && styles.convoItemOn]}>
+            <Text style={styles.convoTitle}>{m.name}</Text>
+            <Text style={styles.mutedSmall}>{m.note}</Text>
+          </Pressable>
+        ))}
+        <Text style={styles.mutedSmall}>Busy or out-of-quota models are skipped automatically.</Text>
         <Text style={styles.fieldLabel}>Reply length</Text>
         <View style={styles.segment}>
           {REPLY_LENGTHS.map((r) => (
@@ -2190,15 +3003,24 @@ function SettingsScreen({
       {/* Cloud */}
       <View style={styles.settingsCard}>
         <View style={styles.rowBetween}>
-          <Text style={styles.cardTitle}>☁️ Cloud backend</Text>
+          <Text style={styles.cardTitle}>☁️ Cloud computer</Text>
           <Switch value={s.cloudMode} onValueChange={(v) => patchSettings({ cloudMode: v && !!s.cloudUrl })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
         </View>
-        <Text style={styles.mutedSmall}>Route chat through your own server (adds a hop, so on-device chat streams faster). Paste the Codespace URL (https://NAME-3000.app.github.dev) or just the name.</Text>
-        <TextInput value={s.cloudUrl} onChangeText={(t) => patchSettings({ cloudUrl: t })} onBlur={() => patchSettings({ cloudUrl: normalizeCloudUrl(s.cloudUrl) })} placeholder="https://your-codespace-3000.app.github.dev" placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} keyboardType="url" style={styles.input} />
-        <TextInput value={s.cloudToken} onChangeText={(t) => patchSettings({ cloudToken: t })} placeholder="PULSE_TOKEN (if the server has one)" placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} style={styles.input} />
+        <Text style={styles.mutedSmall}>
+          Your Codespace: {hostOf(s.cloudUrl || DEFAULT_CLOUD_URL).split('-3000')[0]}. Chat stays on the phone for speed; the cloud is used when no API key is set.
+        </Text>
         <Pressable onPress={testCloud} disabled={testing} style={styles.secondaryBtn}>
-          {testing ? <ActivityIndicator color={C.text} /> : <Text style={styles.primaryBtnText}>Test connection</Text>}
+          {testing ? <ActivityIndicator color={C.text} /> : <Text style={styles.primaryBtnText}>Check connection</Text>}
         </Pressable>
+        <Pressable onPress={() => setCloudAdv((v) => !v)}>
+          <Text style={[styles.mutedSmall, { color: C.accent }]}>{cloudAdv ? 'Hide server details ▴' : 'Change server ▾'}</Text>
+        </Pressable>
+        {cloudAdv ? (
+          <>
+            <TextInput value={s.cloudUrl} onChangeText={(t) => patchSettings({ cloudUrl: t })} onBlur={() => patchSettings({ cloudUrl: normalizeCloudUrl(s.cloudUrl) })} placeholder={DEFAULT_CLOUD_URL} placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} keyboardType="url" style={styles.input} />
+            <TextInput value={s.cloudToken} onChangeText={(t) => patchSettings({ cloudToken: t })} placeholder="Access token (only if you set one)" placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} style={styles.input} />
+          </>
+        ) : null}
       </View>
 
       {/* Voice */}
@@ -2232,8 +3054,8 @@ function SettingsScreen({
 
       {/* Workspace & chat */}
       <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>🌐 Workspace & chat</Text>
-        <Text style={styles.fieldLabel}>Workspace home page</Text>
+        <Text style={styles.cardTitle}>🖥️ Live browser & chat</Text>
+        <Text style={styles.fieldLabel}>Live browser home page</Text>
         <TextInput value={s.homeUrl} onChangeText={(t) => patchSettings({ homeUrl: t })} placeholder="https://www.google.com" placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} keyboardType="url" style={styles.input} />
         <SettingRow label="Confirm before marking done" hint="Ask before completing a task">
           <Switch value={s.confirmBeforeComplete} onValueChange={(v) => patchSettings({ confirmBeforeComplete: v })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
@@ -2306,6 +3128,28 @@ const styles = StyleSheet.create({
   fill: { ...StyleSheet.absoluteFillObject },
   hidden: { display: 'none' },
   offscreen: { opacity: 0, zIndex: -1 },
+  drawerWrap: { ...StyleSheet.absoluteFillObject, zIndex: 50 },
+  drawerBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.5)' },
+  drawer: {
+    position: 'absolute', top: 0, bottom: 0, left: 0, width: 300, padding: 14,
+    backgroundColor: C.panel, borderRightWidth: 1, borderRightColor: C.border,
+  },
+  convoItem: { padding: 10, borderRadius: 12, backgroundColor: C.panel2, borderWidth: 1, borderColor: 'transparent', gap: 4 },
+  convoItemOn: { borderColor: C.accent },
+  convoTitle: { color: C.text, fontWeight: '700', fontSize: 14, flexShrink: 1, marginRight: 8 },
+  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', padding: 24 },
+  modalCard: { backgroundColor: C.panel, borderRadius: 16, padding: 16, gap: 8, borderWidth: 1, borderColor: C.border },
+  modelRow: { padding: 10, borderRadius: 12, backgroundColor: C.panel2, borderWidth: 1, borderColor: 'transparent', gap: 2 },
+  appGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 14 },
+  appTile: {
+    width: '30%', flexGrow: 1, alignItems: 'center', paddingVertical: 14, borderRadius: 14,
+    backgroundColor: C.panel, borderWidth: 1, borderColor: C.border, gap: 6,
+  },
+  appName: { color: C.text, fontSize: 12, fontWeight: '600' },
+  agentStrip: {
+    flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 8, gap: 8,
+    backgroundColor: C.panel, borderBottomWidth: 1, borderBottomColor: C.accent,
+  },
   liveCard: {
     flexDirection: 'row', alignItems: 'center', marginHorizontal: 10, marginBottom: 6, padding: 8,
     backgroundColor: C.panel, borderRadius: 14, borderWidth: 1, borderColor: C.accent,
