@@ -86,6 +86,7 @@ type ChatMessage = {
   text: string;
   reply?: PulseReply;
   source?: 'cloud' | 'device';
+  streaming?: boolean;
   ts: number;
 };
 
@@ -235,6 +236,189 @@ async function callGemini(
     throw new Error('Gemini returned no text (' + reason + ').');
   }
   return { reply: parsePulseReply(text), modelUsed };
+}
+
+
+/* ---- Fast path: streaming Gemini replies (text first, actions after) ---- */
+
+type SpeedMode = 'fast' | 'balanced' | 'smart';
+const FAST_MODEL = 'gemini-flash-lite-latest';
+const META_MARK = '<<<PULSE_META>>>';
+
+function buildStreamPrompt(extraSystem: string): string {
+  const now = new Date();
+  const tz = (() => {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+    } catch {
+      return '';
+    }
+  })();
+  return [
+    'You are Pulse, a sharp, warm personal-productivity assistant inside the Pulse OS app.',
+    'Current local time: ' + now.toString() + (tz ? ' (' + tz + ')' : '') + '.',
+    'First understand what the user actually wants, using the whole conversation, then answer it directly.',
+    'Lead with the answer. Be specific and practical, no filler, no "Great question".',
+    'Reply in the same language the user writes in (English, Hindi, Telugu, Hinglish, etc).',
+    'Only ask a clarifying question when the request truly cannot be answered without it.',
+    'Plain text only: no markdown headings, no tables; short lines or "-" bullets are fine.',
+    'After the answer, on a new line write exactly ' + META_MARK + ' and then one compact JSON object:',
+    '{"proactive_checklist": [2-4 short follow-up actions, max 10 words each], "one_line_summary": "one short sentence"}.',
+    'Never put anything after the JSON.',
+    extraSystem,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function splitStreamText(full: string): { visible: string; meta: string | null } {
+  const i = full.indexOf(META_MARK);
+  if (i === -1) {
+    // Hide a partially-streamed marker at the very end.
+    const tail = full.lastIndexOf('<<<');
+    const visible = tail !== -1 && full.length - tail < META_MARK.length ? full.slice(0, tail) : full;
+    return { visible: visible.trimEnd(), meta: null };
+  }
+  return { visible: full.slice(0, i).trimEnd(), meta: full.slice(i + META_MARK.length) };
+}
+
+function finishStreamReply(full: string): PulseReply {
+  const { visible, meta } = splitStreamText(full);
+  let checklist: string[] = [];
+  let summary = '';
+  if (meta) {
+    const m = stripCodeFences(meta);
+    const a = m.indexOf('{');
+    const b = m.lastIndexOf('}');
+    if (a !== -1 && b > a) {
+      try {
+        const o: any = JSON.parse(m.slice(a, b + 1));
+        if (Array.isArray(o.proactive_checklist)) {
+          checklist = o.proactive_checklist.map((x: unknown) => String(x)).filter((x: string) => x.trim()).slice(0, 5);
+        }
+        summary = String(o.one_line_summary ?? '').trim();
+      } catch {
+        /* keep the answer even when the metadata is malformed */
+      }
+    }
+  }
+  // A model that ignored the format and sent JSON: fall back to the old parser.
+  if (!meta && /^\s*[{`]/.test(visible)) return parsePulseReply(visible);
+  return { direct_response: visible || 'No response received.', proactive_checklist: checklist, one_line_summary: summary };
+}
+
+function thinkingFor(model: string, speed: SpeedMode): any | undefined {
+  if (speed === 'smart') return undefined;
+  if (/gemini-2\.5/i.test(model)) return /pro/i.test(model) ? { thinkingBudget: 128 } : { thinkingBudget: 0 };
+  // Gemini 3+ and the *-latest aliases take a thinking level.
+  return { thinkingLevel: speed === 'fast' ? 'minimal' : 'low' };
+}
+
+function streamOnce(
+  apiKey: string,
+  model: string,
+  body: string,
+  onText: (full: string) => void,
+): Promise<{ full: string; status: number; error?: string }> {
+  return new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    let seen = 0;
+    let buffer = '';
+    let full = '';
+    const pump = () => {
+      const chunk = xhr.responseText.slice(seen);
+      seen = xhr.responseText.length;
+      buffer += chunk;
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? '';
+      let changed = false;
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (!data || data === '[DONE]') continue;
+        try {
+          const j: any = JSON.parse(data);
+          const parts: any[] = j?.candidates?.[0]?.content?.parts ?? [];
+          for (const p of parts) {
+            if (p?.thought) continue;
+            if (typeof p?.text === 'string') {
+              full += p.text;
+              changed = true;
+            }
+          }
+        } catch {
+          /* partial line; ignore */
+        }
+      }
+      if (changed) onText(full);
+    };
+    xhr.open('POST', GEMINI_BASE + encodeURIComponent(model) + ':streamGenerateContent?alt=sse');
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.setRequestHeader('x-goog-api-key', apiKey);
+    xhr.timeout = 60000;
+    xhr.onprogress = () => {
+      if (xhr.status === 200) pump();
+    };
+    xhr.onreadystatechange = () => {
+      if (xhr.readyState === 3 && xhr.status === 200) pump();
+    };
+    xhr.onload = () => {
+      if (xhr.status === 200) {
+        buffer += '\n';
+        pump();
+        resolve({ full, status: 200 });
+      } else {
+        let msg = 'HTTP ' + xhr.status;
+        try {
+          const j = JSON.parse(xhr.responseText);
+          msg = (Array.isArray(j) ? j[0] : j)?.error?.message || msg;
+        } catch {
+          /* keep HTTP code */
+        }
+        resolve({ full: '', status: xhr.status, error: msg });
+      }
+    };
+    xhr.onerror = () => resolve({ full: '', status: 0, error: 'Network error' });
+    xhr.ontimeout = () => resolve({ full, status: full ? 200 : 0, error: full ? undefined : 'Timed out' });
+    xhr.send(body);
+  });
+}
+
+async function streamGemini(
+  apiKey: string,
+  model: string,
+  history: ChatMessage[],
+  extraSystem: string,
+  temperature: number,
+  speed: SpeedMode,
+  onText: (visible: string) => void,
+): Promise<{ reply: PulseReply; modelUsed: string }> {
+  const contents = history
+    .filter((m) => m.role !== 'error' && m.text.trim())
+    .slice(-16)
+    .map((m) => ({ role: m.role === 'user' ? 'user' : 'model', parts: [{ text: m.text }] }));
+  const sys = buildStreamPrompt(extraSystem);
+  const make = (thinking: any | undefined) =>
+    JSON.stringify({
+      systemInstruction: { parts: [{ text: sys }] },
+      contents,
+      generationConfig: {
+        temperature,
+        maxOutputTokens: speed === 'smart' ? 4096 : 1500,
+        ...(thinking ? { thinkingConfig: thinking } : {}),
+      },
+    });
+  const emit = (full: string) => onText(splitStreamText(full).visible);
+
+  let r = await streamOnce(apiKey, model, make(thinkingFor(model, speed)), emit);
+  if (r.status === 400 && /thinking/i.test(r.error || '')) {
+    // This model doesn't accept that thinking setting: retry with the model's default.
+    r = await streamOnce(apiKey, model, make(undefined), emit);
+  }
+  if (r.status === 200 && r.full.trim()) return { reply: finishStreamReply(r.full), modelUsed: model };
+  if (r.status === 0 && r.error === 'Network error') throw new Error('No internet connection.');
+  // Model missing or another error: the non-streaming path knows how to find a working model.
+  return callGemini(apiKey, model, history, extraSystem, temperature);
 }
 
 /* ---- Cloud backend (GitHub Codespaces or any HTTPS host) ---- */
@@ -606,6 +790,8 @@ type Settings = {
   apiKey: string;
   model: string;
   temperature: number;
+  speed: SpeedMode;
+  fastModel: string;
   replyLength: 'short' | 'balanced' | 'detailed';
   historyLimit: number;
   // Cloud
@@ -638,6 +824,8 @@ const DEFAULT_SETTINGS: Settings = {
   apiKey: '',
   model: DEFAULT_MODEL,
   temperature: 0.7,
+  speed: 'balanced',
+  fastModel: FAST_MODEL,
   replyLength: 'balanced',
   historyLimit: 60,
   cloudUrl: '',
@@ -694,10 +882,10 @@ function profileContext(s: Settings): string {
   if (s.focusGoalMin > 0) bits.push('Their daily focus goal is ' + s.focusGoalMin + ' minutes.');
   const len =
     s.replyLength === 'short'
-      ? 'Keep direct_response to 1-2 sentences.'
+      ? 'Keep the answer to 1-2 sentences.'
       : s.replyLength === 'detailed'
-        ? 'direct_response may be detailed (up to ~150 words).'
-        : 'Keep direct_response concise (2-4 sentences).';
+        ? 'The answer may be detailed (up to ~150 words).'
+        : 'Keep the answer concise (2-4 sentences) unless the task needs more.';
   bits.push(len);
   return bits.join(' ');
 }
@@ -986,7 +1174,11 @@ function ChatScreen({
     AsyncStorage.getItem(STORAGE_CHAT).then((h) => {
       if (h) {
         try {
-          setMessages(JSON.parse(h));
+          setMessages(
+            (JSON.parse(h) as ChatMessage[])
+              .filter((m) => !(m.streaming && !m.text.trim()))
+              .map((m) => ({ ...m, streaming: false })),
+          );
         } catch {
           setMessages([]);
         }
@@ -1043,22 +1235,36 @@ function ChatScreen({
           ]);
         }
       }
+      const botId = uid();
       if (!result) {
-        result = await callGemini(apiKey, model, next, ctx, settings.temperature);
+        const useModel = settings.speed === 'fast' ? settings.fastModel || FAST_MODEL : model;
+        setMessages((prev) => [
+          ...prev,
+          { id: botId, role: 'assistant', text: '', source: 'device', streaming: true, ts: Date.now() },
+        ]);
+        try {
+          result = await streamGemini(apiKey, useModel, next, ctx, settings.temperature, settings.speed, (visible) => {
+            setMessages((prev) => prev.map((m) => (m.id === botId ? { ...m, text: visible } : m)));
+          });
+        } catch (err) {
+          setMessages((prev) => prev.filter((m) => m.id !== botId));
+          throw err;
+        }
+        if (result.modelUsed && result.modelUsed !== useModel) {
+          patchSettings(settings.speed === 'fast' ? { fastModel: result.modelUsed } : { model: result.modelUsed });
+        }
       }
-      const { reply, modelUsed } = result;
-      if (source === 'device' && modelUsed && modelUsed !== model) {
-        patchSettings({ model: modelUsed });
-      }
+      const { reply } = result;
       const botMsg: ChatMessage = {
-        id: uid(),
+        id: botId,
         role: 'assistant',
         text: reply.direct_response,
         reply,
         source,
+        streaming: false,
         ts: Date.now(),
       };
-      setMessages((prev) => [...prev, botMsg]);
+      setMessages((prev) => (prev.some((m) => m.id === botId) ? prev.map((m) => (m.id === botId ? botMsg : m)) : [...prev, botMsg]));
       say(replyToSpeech(reply));
     } catch (e: any) {
       setMessages((prev) => [
@@ -1116,7 +1322,7 @@ function ChatScreen({
     cloudMode && cloudUrl
       ? '☁️ Cloud · ' + (cloudStatus === 'online' ? 'online' : cloudStatus === 'checking' ? 'checking…' : 'offline')
       : apiKey
-        ? 'Model: ' + model
+        ? '⚡ ' + (settings.speed === 'fast' ? settings.fastModel || FAST_MODEL : model) + ' · ' + settings.speed
         : 'Set up a Gemini key or cloud in Settings';
 
   if (!loaded) {
@@ -1224,10 +1430,20 @@ function MessageBubble({
   return (
     <View style={{ marginBottom: 12 }}>
       <View style={[styles.bubble, styles.botBubble]}>
-        <Text style={styles.bubbleText}>{msg.text}</Text>
+        {msg.streaming && !msg.text ? (
+          <View style={styles.rowCenter}>
+            <ActivityIndicator size="small" color={C.accent} />
+            <Text style={[styles.muted, { marginLeft: 8 }]}>Thinking…</Text>
+          </View>
+        ) : (
+          <Text style={styles.bubbleText}>
+            {msg.text}
+            {msg.streaming ? <Text style={{ color: C.accent }}> ▍</Text> : null}
+          </Text>
+        )}
         {msg.source === 'cloud' ? <Text style={styles.sourceTag}>☁️ cloud</Text> : null}
       </View>
-      {r ? <ActionCard reply={r} say={say} onCloudPlan={onCloudPlan} /> : null}
+      {r && !msg.streaming ? <ActionCard reply={r} say={say} onCloudPlan={onCloudPlan} /> : null}
     </View>
   );
 }
@@ -1675,6 +1891,29 @@ function SettingsScreen({
         <TextInput value={s.apiKey} onChangeText={(t) => patchSettings({ apiKey: t })} placeholder="AIza…" placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} style={styles.input} />
         <Text style={styles.fieldLabel}>Model</Text>
         <TextInput value={s.model} onChangeText={(t) => patchSettings({ model: t })} placeholder={DEFAULT_MODEL} placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} style={styles.input} />
+        <Text style={styles.fieldLabel}>Response speed</Text>
+        <View style={styles.segment}>
+          {(['fast', 'balanced', 'smart'] as SpeedMode[]).map((m) => (
+            <Pressable key={m} onPress={() => patchSettings({ speed: m })} style={[styles.segItem, s.speed === m && styles.segItemOn]}>
+              <Text style={[styles.segText, s.speed === m && styles.segTextOn]}>
+                {m === 'fast' ? '⚡ Fast' : m === 'balanced' ? '⚖️ Balanced' : '🧠 Smart'}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+        <Text style={styles.mutedSmall}>
+          {s.speed === 'fast'
+            ? 'Fastest: Flash-Lite with no extra thinking. Great for quick tasks.'
+            : s.speed === 'balanced'
+              ? 'Flash with light thinking. Fast and smart for most things.'
+              : 'Flash with full thinking. Slower, best for hard planning.'}
+        </Text>
+        {s.speed === 'fast' ? (
+          <>
+            <Text style={styles.fieldLabel}>Fast model</Text>
+            <TextInput value={s.fastModel} onChangeText={(t) => patchSettings({ fastModel: t })} placeholder={FAST_MODEL} placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} style={styles.input} />
+          </>
+        ) : null}
         <Text style={styles.fieldLabel}>Reply length</Text>
         <View style={styles.segment}>
           {REPLY_LENGTHS.map((r) => (
@@ -1697,7 +1936,7 @@ function SettingsScreen({
           <Text style={styles.cardTitle}>☁️ Cloud backend</Text>
           <Switch value={s.cloudMode} onValueChange={(v) => patchSettings({ cloudMode: v && !!s.cloudUrl })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
         </View>
-        <Text style={styles.mutedSmall}>Route chat through your own server. Paste the Codespace URL (https://NAME-3000.app.github.dev) or just the name.</Text>
+        <Text style={styles.mutedSmall}>Route chat through your own server (adds a hop, so on-device chat streams faster). Paste the Codespace URL (https://NAME-3000.app.github.dev) or just the name.</Text>
         <TextInput value={s.cloudUrl} onChangeText={(t) => patchSettings({ cloudUrl: t })} onBlur={() => patchSettings({ cloudUrl: normalizeCloudUrl(s.cloudUrl) })} placeholder="https://your-codespace-3000.app.github.dev" placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} keyboardType="url" style={styles.input} />
         <TextInput value={s.cloudToken} onChangeText={(t) => patchSettings({ cloudToken: t })} placeholder="PULSE_TOKEN (if the server has one)" placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} style={styles.input} />
         <Pressable onPress={testCloud} disabled={testing} style={styles.secondaryBtn}>
