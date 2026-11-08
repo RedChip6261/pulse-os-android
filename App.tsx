@@ -8,6 +8,7 @@ import {
   Platform,
   Pressable,
   SafeAreaView,
+  Image,
   ScrollView,
   StatusBar as RNStatusBar,
   StyleSheet,
@@ -24,6 +25,7 @@ import * as Speech from 'expo-speech';
 import * as Application from 'expo-application';
 import * as FileSystem from 'expo-file-system';
 import * as IntentLauncher from 'expo-intent-launcher';
+import { captureRef } from 'react-native-view-shot';
 
 /* ------------------------------------------------------------------ */
 /* Theme                                                               */
@@ -87,6 +89,7 @@ type ChatMessage = {
   reply?: PulseReply;
   source?: 'cloud' | 'device';
   streaming?: boolean;
+  steps?: Step[];
   ts: number;
 };
 
@@ -419,6 +422,168 @@ async function streamGemini(
   if (r.status === 0 && r.error === 'Network error') throw new Error('No internet connection.');
   // Model missing or another error: the non-streaming path knows how to find a working model.
   return callGemini(apiKey, model, history, extraSystem, temperature);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Live bus: chat ⇄ workspace ("show what the app is doing")          */
+/* ------------------------------------------------------------------ */
+
+type LiveState = {
+  active: boolean;
+  url: string;
+  title: string;
+  loading: boolean;
+  progress: number;
+  thumb: string | null;
+  log: { t: number; text: string }[];
+  startedAt: number;
+};
+
+const EMPTY_LIVE: LiveState = { active: false, url: '', title: '', loading: false, progress: 0, thumb: null, log: [], startedAt: 0 };
+
+const LiveBus = (() => {
+  let state: LiveState = EMPTY_LIVE;
+  const stateSubs = new Set<(s: LiveState) => void>();
+  const navSubs = new Set<(url: string) => void>();
+  const focusSubs = new Set<() => void>();
+  return {
+    get: () => state,
+    set(patch: Partial<LiveState>, logLine?: string) {
+      const log = logLine ? [...state.log, { t: Date.now(), text: logLine }].slice(-8) : state.log;
+      state = { ...state, ...patch, log };
+      stateSubs.forEach((f) => f(state));
+    },
+    reset() {
+      state = EMPTY_LIVE;
+      stateSubs.forEach((f) => f(state));
+    },
+    onState(f: (s: LiveState) => void) {
+      stateSubs.add(f);
+      return () => {
+        stateSubs.delete(f);
+      };
+    },
+    open(url: string) {
+      state = { ...EMPTY_LIVE, active: true, url, loading: true, startedAt: Date.now(), log: [{ t: Date.now(), text: 'Opening ' + hostOf(url) }] };
+      stateSubs.forEach((f) => f(state));
+      navSubs.forEach((f) => f(url));
+    },
+    onNav(f: (url: string) => void) {
+      navSubs.add(f);
+      return () => {
+        navSubs.delete(f);
+      };
+    },
+    focus() {
+      focusSubs.forEach((f) => f());
+    },
+    onFocus(f: () => void) {
+      focusSubs.add(f);
+      return () => {
+        focusSubs.delete(f);
+      };
+    },
+  };
+})();
+
+function hostOf(u: string) {
+  const m = String(u).match(/^https?:\/\/([^/?#]+)/i);
+  return m ? m[1].replace(/^www\./, '') : u;
+}
+
+function useLive(): LiveState {
+  const [s, setS] = useState<LiveState>(LiveBus.get());
+  useEffect(() => LiveBus.onState(setS), []);
+  return s;
+}
+
+/** Live mini view of the Workspace browser, shown in chat (tap to go full screen). */
+function LiveCard() {
+  const live = useLive();
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!live.active) return;
+    const id = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [live.active]);
+  if (!live.active) return null;
+  const secs = Math.max(0, Math.round((Date.now() - live.startedAt) / 1000));
+  const last = live.log[live.log.length - 1];
+  return (
+    <Pressable onPress={() => LiveBus.focus()} style={styles.liveCard} accessibilityLabel="Open the live Workspace view">
+      <View style={styles.liveThumbWrap}>
+        {live.thumb ? (
+          <Image source={{ uri: live.thumb }} style={styles.liveThumb} resizeMode="cover" />
+        ) : (
+          <View style={[styles.liveThumb, styles.center]}>
+            <ActivityIndicator color={C.accent} />
+          </View>
+        )}
+        <View style={styles.liveBadge}>
+          <View style={[styles.liveDot, !live.loading && { backgroundColor: C.good }]} />
+          <Text style={styles.liveBadgeText}>{live.loading ? 'LIVE' : 'READY'}</Text>
+        </View>
+      </View>
+      <View style={{ flex: 1, paddingLeft: 10 }}>
+        <Text style={styles.liveTitle} numberOfLines={1}>{live.title || hostOf(live.url)}</Text>
+        <Text style={styles.mutedSmall} numberOfLines={1}>{hostOf(live.url)} · {secs}s</Text>
+        {last ? <Text style={[styles.mutedSmall, { color: C.text, marginTop: 4 }]} numberOfLines={2}>{last.text}</Text> : null}
+        {live.loading ? (
+          <View style={styles.liveTrack}><View style={[styles.liveFill, { width: (Math.round(Math.max(0.08, live.progress) * 100) + '%') as any }]} /></View>
+        ) : null}
+        <Text style={[styles.mutedSmall, { color: C.accent, marginTop: 4 }]}>Tap to watch full screen ›</Text>
+      </View>
+      <Pressable onPress={() => LiveBus.reset()} hitSlop={10} style={{ paddingLeft: 6 }} accessibilityLabel="Hide live view">
+        <Text style={styles.mutedSmall}>✕</Text>
+      </Pressable>
+    </Pressable>
+  );
+}
+
+/* ---- Reply steps ("what Pulse is doing") ---- */
+
+type Step = { label: string; status: 'active' | 'done' | 'error'; startedAt: number; ms?: number };
+
+function StepsView({ steps, streaming }: { steps: Step[]; streaming?: boolean }) {
+  const [open, setOpen] = useState(true);
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!streaming) {
+      setOpen(false);
+      return;
+    }
+    const id = setInterval(() => tick((n) => n + 1), 250);
+    return () => clearInterval(id);
+  }, [streaming]);
+  if (!steps.length) return null;
+  const total = steps.reduce((a, s) => a + (s.ms ?? (s.status === 'active' ? Date.now() - s.startedAt : 0)), 0);
+  return (
+    <View style={styles.stepsBox}>
+      <Pressable onPress={() => setOpen((o) => !o)} style={styles.rowBetween}>
+        <Text style={styles.stepsHead}>
+          {streaming ? '⚙️ Working… ' : '✓ Worked for '}
+          {(total / 1000).toFixed(1)}s
+        </Text>
+        <Text style={styles.mutedSmall}>{open ? 'Hide steps ▴' : 'Show steps ▾'}</Text>
+      </Pressable>
+      {open
+        ? steps.map((s, i) => (
+            <View key={i} style={styles.stepRow}>
+              {s.status === 'active' ? (
+                <ActivityIndicator size="small" color={C.accent} style={{ width: 16 }} />
+              ) : (
+                <Text style={[styles.stepIcon, s.status === 'error' && { color: C.danger }]}>{s.status === 'done' ? '✓' : '!'}</Text>
+              )}
+              <Text style={[styles.stepText, s.status === 'active' && { color: C.text }]}>{s.label}</Text>
+              <Text style={styles.stepMs}>
+                {((s.ms ?? (s.status === 'active' ? Date.now() - s.startedAt : 0)) / 1000).toFixed(1)}s
+              </Text>
+            </View>
+          ))
+        : null}
+    </View>
+  );
 }
 
 /* ---- Cloud backend (GitHub Codespaces or any HTTPS host) ---- */
@@ -1012,6 +1177,8 @@ export default function App() {
     });
   }, []);
 
+  useEffect(() => LiveBus.onFocus(() => setTab('WORKSPACE')), []);
+
   const patchSettings = useCallback((patch: Partial<Settings>) => {
     const next = { ...settingsRef.current, ...patch };
     settingsRef.current = next;
@@ -1087,7 +1254,11 @@ export default function App() {
         <View style={[styles.fill, tab !== 'WIDGETS' && styles.hidden]}>
           <WidgetsScreen say={say} />
         </View>
-        <View style={[styles.fill, tab !== 'WORKSPACE' && styles.hidden]}>
+        <View
+          style={[styles.fill, tab !== 'WORKSPACE' && styles.offscreen]}
+          pointerEvents={tab === 'WORKSPACE' ? 'auto' : 'none'}
+          importantForAccessibility={tab === 'WORKSPACE' ? 'auto' : 'no-hide-descendants'}
+        >
           <WorkspaceScreen say={say} homeUrl={settings.homeUrl} confirmFirst={settings.confirmBeforeComplete} />
         </View>
         <View style={[styles.fill, tab !== 'SETTINGS' && styles.hidden]}>
@@ -1207,14 +1378,38 @@ function ChatScreen({
     if (settings.haptics) Vibration.vibrate(10);
     const userMsg: ChatMessage = { id: uid(), role: 'user', text, ts: Date.now() };
     const next = [...messages, userMsg];
-    setMessages(next);
+    const botId = uid();
+    let steps: Step[] = [{ label: 'Reading your message and context', status: 'active', startedAt: Date.now() }];
+    const pushSteps = () =>
+      setMessages((prev) => prev.map((m) => (m.id === botId ? { ...m, steps: [...steps] } : m)));
+    const step = (label: string, status: Step['status'] = 'active') => {
+      const now = Date.now();
+      steps = steps.map((s) => (s.status === 'active' ? { ...s, status: 'done', ms: now - s.startedAt } : s));
+      steps.push(status === 'active' ? { label, status, startedAt: now } : { label, status, startedAt: now, ms: 0 });
+      pushSteps();
+    };
+    const finishSteps = () => {
+      const now = Date.now();
+      steps = steps.map((s) => (s.status === 'active' ? { ...s, status: 'done', ms: now - s.startedAt } : s));
+    };
+    setMessages([
+      ...next,
+      { id: botId, role: 'assistant', text: '', source: 'device', streaming: true, steps: [...steps], ts: Date.now() },
+    ]);
     setInput('');
     setBusy(true);
     const ctx = profileContext(settings);
+    const wantsWeb = /^(search|look up|lookup|google|find|browse|open|show me)\b|\bsearch (for|the web)\b/i.test(text);
+    if (wantsWeb) {
+      const q = text.replace(/^(please\s+)?(search( for)?|look ?up|google|find|browse|open|show me)\s+/i, '');
+      step('Opening ' + (q.length > 40 ? q.slice(0, 40) + '…' : q) + ' in Workspace');
+      LiveBus.open(searchUrl(q || text));
+    }
     try {
       let result: { reply: PulseReply; modelUsed: string } | null = null;
       let source: 'cloud' | 'device' = 'device';
       if (useCloud) {
+        step('Asking your cloud server');
         try {
           result = await callCloudChat(cloudUrl, cloudToken, keyForCloud(), next, ctx);
           source = 'cloud';
@@ -1222,6 +1417,7 @@ function ChatScreen({
         } catch (cloudErr: any) {
           setCloudStatus('offline');
           if (!apiKey) throw cloudErr;
+          step('Cloud unreachable, switching to on-device', 'error');
           setMessages((prev) => [
             ...prev,
             {
@@ -1233,26 +1429,25 @@ function ChatScreen({
           ]);
         }
       }
-      const botId = uid();
       if (!result) {
         const useModel = settings.speed === 'fast' ? settings.fastModel || FAST_MODEL : model;
-        setMessages((prev) => [
-          ...prev,
-          { id: botId, role: 'assistant', text: '', source: 'device', streaming: true, ts: Date.now() },
-        ]);
-        try {
-          result = await streamGemini(apiKey, useModel, next, ctx, settings.temperature, settings.speed, (visible) => {
-            setMessages((prev) => prev.map((m) => (m.id === botId ? { ...m, text: visible } : m)));
-          });
-        } catch (err) {
-          setMessages((prev) => prev.filter((m) => m.id !== botId));
-          throw err;
-        }
+        step('Thinking (' + useModel + ', ' + settings.speed + ')');
+        let writing = false;
+        result = await streamGemini(apiKey, useModel, next, ctx, settings.temperature, settings.speed, (visible) => {
+          if (!writing && visible.trim()) {
+            writing = true;
+            step('Writing reply');
+          }
+          setMessages((prev) => prev.map((m) => (m.id === botId ? { ...m, text: visible } : m)));
+        });
         if (result.modelUsed && result.modelUsed !== useModel) {
           patchSettings(settings.speed === 'fast' ? { fastModel: result.modelUsed } : { model: result.modelUsed });
         }
       }
       const { reply } = result;
+      const n = reply.proactive_checklist.length;
+      step(n ? 'Prepared ' + n + ' next step' + (n > 1 ? 's' : '') + ' and action cards' : 'Reply ready', 'done');
+      finishSteps();
       const botMsg: ChatMessage = {
         id: botId,
         role: 'assistant',
@@ -1260,13 +1455,14 @@ function ChatScreen({
         reply,
         source,
         streaming: false,
+        steps: [...steps],
         ts: Date.now(),
       };
       setMessages((prev) => (prev.some((m) => m.id === botId) ? prev.map((m) => (m.id === botId ? botMsg : m)) : [...prev, botMsg]));
       say(replyToSpeech(reply));
     } catch (e: any) {
       setMessages((prev) => [
-        ...prev,
+        ...prev.filter((m) => m.id !== botId),
         { id: uid(), role: 'error', text: 'Request failed: ' + (e?.message || String(e)), ts: Date.now() },
       ]);
     } finally {
@@ -1382,6 +1578,8 @@ function ChatScreen({
         )}
       />
 
+      <LiveCard />
+
       <View style={styles.composer}>
         <TextInput
           value={input}
@@ -1428,7 +1626,8 @@ function MessageBubble({
   return (
     <View style={{ marginBottom: 12 }}>
       <View style={[styles.bubble, styles.botBubble]}>
-        {msg.streaming && !msg.text ? (
+        {msg.steps && msg.steps.length ? <StepsView steps={msg.steps} streaming={msg.streaming} /> : null}
+        {msg.streaming && !msg.text && msg.steps && msg.steps.length ? null : msg.streaming && !msg.text ? (
           <View style={styles.rowCenter}>
             <ActivityIndicator size="small" color={C.accent} />
             <Text style={[styles.muted, { marginLeft: 8 }]}>Thinking…</Text>
@@ -1524,9 +1723,10 @@ function ChecklistRow({ item, summary, say }: { item: string; summary: string; s
 }
 
 function ActionButton({ label, url, small }: { label: string; url: string; small?: boolean }) {
+  const inApp = /^https:\/\//i.test(url) && !/calendar\.google\.com/i.test(url);
   return (
     <Pressable
-      onPress={() => openLink(url)}
+      onPress={() => (inApp ? LiveBus.open(url) : openLink(url))}
       style={({ pressed }) => [styles.actionBtn, small && styles.actionBtnSmall, pressed && { opacity: 0.7 }]}
       accessibilityRole="button"
       accessibilityLabel={label}
@@ -1637,13 +1837,49 @@ function WorkspaceScreen({
   const [loading, setLoading] = useState(false);
   const [title, setTitle] = useState('');
   const [completed, setCompleted] = useState<{ title: string; url: string; ts: number }[]>([]);
+  const shotRef = useRef<View>(null);
+  const loadStart = useRef(0);
 
-  const go = () => setUrl(normalizeUrl(field));
+  // Chat asks the workspace to open a page ("show what the app is doing").
+  useEffect(
+    () =>
+      LiveBus.onNav((u) => {
+        setUrl(u);
+        setField(u);
+      }),
+    [],
+  );
+
+  const snap = useCallback(async () => {
+    if (!LiveBus.get().active || !shotRef.current) return;
+    try {
+      const uri = await captureRef(shotRef, { format: 'jpg', quality: 0.5, width: 360, result: 'tmpfile' });
+      LiveBus.set({ thumb: uri + '?t=' + Date.now() });
+    } catch {
+      /* preview is best-effort */
+    }
+  }, []);
+
+  // Refresh the live preview every 2s while a live session is showing.
+  useEffect(() => {
+    const id = setInterval(() => {
+      const l = LiveBus.get();
+      if (l.active && Date.now() - l.startedAt < 5 * 60 * 1000) snap();
+    }, 2000);
+    return () => clearInterval(id);
+  }, [snap]);
+
+  const go = () => {
+    const u = normalizeUrl(field);
+    setUrl(u);
+    if (LiveBus.get().active) LiveBus.set({ url: u }, 'Opening ' + hostOf(u));
+  };
 
   const onNav = (nav: WebViewNavigation) => {
     setCanBack(nav.canGoBack);
     setField(nav.url);
     setTitle(nav.title || '');
+    if (LiveBus.get().active) LiveBus.set({ url: nav.url, title: nav.title || '' });
   };
 
   const confirmComplete = () => {
@@ -1651,6 +1887,7 @@ function WorkspaceScreen({
     const markDone = () => {
       setCompleted((prev) => [{ title: label, url: field, ts: Date.now() }, ...prev].slice(0, 20));
       say('Task complete: ' + label);
+      if (LiveBus.get().active) LiveBus.set({}, '✅ Marked done: ' + label);
     };
     if (!confirmFirst) {
       markDone();
@@ -1666,6 +1903,7 @@ function WorkspaceScreen({
     setUrl(home);
     setField(home);
     setTitle('');
+    LiveBus.reset();
   };
 
   return (
@@ -1700,17 +1938,36 @@ function WorkspaceScreen({
       </View>
       {loading ? <View style={styles.progress} /> : null}
 
+      <View ref={shotRef} collapsable={false} style={{ flex: 1, backgroundColor: '#fff' }}>
       <WebView
         ref={webRef}
         source={{ uri: url }}
         onNavigationStateChange={onNav}
-        onLoadStart={() => setLoading(true)}
-        onLoadEnd={() => setLoading(false)}
+        onLoadStart={(e) => {
+          setLoading(true);
+          loadStart.current = Date.now();
+          if (LiveBus.get().active) LiveBus.set({ loading: true, progress: 0.05 }, 'Loading ' + hostOf(e.nativeEvent.url));
+        }}
+        onLoadProgress={(e) => {
+          if (LiveBus.get().active) LiveBus.set({ progress: e.nativeEvent.progress });
+        }}
+        onLoadEnd={(e) => {
+          setLoading(false);
+          if (LiveBus.get().active) {
+            const secs = ((Date.now() - loadStart.current) / 1000).toFixed(1);
+            LiveBus.set(
+              { loading: false, progress: 1, title: e.nativeEvent.title || '' },
+              'Loaded "' + (e.nativeEvent.title || hostOf(e.nativeEvent.url)) + '" in ' + secs + 's',
+            );
+            setTimeout(snap, 400);
+          }
+        }}
         javaScriptEnabled
         domStorageEnabled
         setSupportMultipleWindows={false}
         style={{ flex: 1, backgroundColor: '#fff' }}
       />
+      </View>
 
       {completed.length ? (
         <View style={styles.completedStrip}>
@@ -2048,6 +2305,28 @@ const styles = StyleSheet.create({
   },
   fill: { ...StyleSheet.absoluteFillObject },
   hidden: { display: 'none' },
+  offscreen: { opacity: 0, zIndex: -1 },
+  liveCard: {
+    flexDirection: 'row', alignItems: 'center', marginHorizontal: 10, marginBottom: 6, padding: 8,
+    backgroundColor: C.panel, borderRadius: 14, borderWidth: 1, borderColor: C.accent,
+  },
+  liveThumbWrap: { width: 96, height: 72, borderRadius: 10, overflow: 'hidden', backgroundColor: C.panel2 },
+  liveThumb: { width: 96, height: 72 },
+  liveBadge: {
+    position: 'absolute', top: 4, left: 4, flexDirection: 'row', alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.65)', borderRadius: 6, paddingHorizontal: 5, paddingVertical: 2,
+  },
+  liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: C.danger, marginRight: 4 },
+  liveBadgeText: { color: '#fff', fontSize: 9, fontWeight: '800', letterSpacing: 0.5 },
+  liveTitle: { color: C.text, fontWeight: '700', fontSize: 14 },
+  liveTrack: { height: 3, borderRadius: 2, backgroundColor: C.border, marginTop: 6, overflow: 'hidden' },
+  liveFill: { height: 3, backgroundColor: C.accent },
+  stepsBox: { marginBottom: 8, paddingBottom: 8, borderBottomWidth: 1, borderBottomColor: C.border },
+  stepsHead: { color: C.muted, fontSize: 12, fontWeight: '700' },
+  stepRow: { flexDirection: 'row', alignItems: 'center', marginTop: 6 },
+  stepIcon: { width: 16, color: C.good, fontWeight: '800', textAlign: 'center' },
+  stepText: { flex: 1, color: C.muted, fontSize: 12, marginLeft: 6 },
+  stepMs: { color: C.muted, fontSize: 11, fontVariant: ['tabular-nums'] },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: C.bg },
 
   header: {

@@ -7,8 +7,11 @@
     "userInterfaceStyle": "dark",
     "backgroundColor": "#0B0F17",
     "newArchEnabled": true,
-    "platforms": ["android"],
+    "platforms": [
+      "android"
+    ],
     "splash": {
+      "image": "./assets/splash-icon.png",
       "backgroundColor": "#0B0F17",
       "resizeMode": "contain"
     },
@@ -16,7 +19,8 @@
       "package": "com.pulseos.app",
       "versionCode": 2,
       "adaptiveIcon": {
-        "backgroundColor": "#09090B"
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0B0F17"
       },
       "permissions": [
         "android.permission.INTERNET",
@@ -24,6 +28,7 @@
         "android.permission.REQUEST_INSTALL_PACKAGES"
       ],
       "softwareKeyboardLayoutMode": "resize"
-    }
+    },
+    "icon": "./assets/icon.png"
   }
 }
