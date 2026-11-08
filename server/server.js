@@ -353,7 +353,8 @@ app.post('/api/chat', async (req, res, next) => {
     if (!contents.length || contents[contents.length - 1].role !== 'user') {
       return res.status(400).json({ ok: false, error: 'messages must end with a user message.' });
     }
-    const { text, model } = await gemini(apiKey, { system: SYSTEM_PROMPT, contents });
+    const context = String((req.body && req.body.context) || '').slice(0, 800).trim();
+    const { text, model } = await gemini(apiKey, { system: SYSTEM_PROMPT + (context ? '\n' + context : ''), contents });
     res.json({ ok: true, reply: parsePulseReply(text), model, source: 'cloud' });
   } catch (e) {
     next(e);
