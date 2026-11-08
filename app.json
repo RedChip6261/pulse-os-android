@@ -1,22 +1,27 @@
 {
   "expo": {
-    "name": "Pulse OS",
+    "name": "Pulse OS Max",
     "slug": "pulse-os",
-    "version": "1.0.0",
+    "version": "2.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
-    "backgroundColor": "#0B0F17",
-    "newArchEnabled": true,
-    "platforms": ["android"],
-    "splash": {
-      "backgroundColor": "#0B0F17",
-      "resizeMode": "contain"
-    },
     "android": {
       "package": "com.pulseos.app",
-      "versionCode": 1,
-      "permissions": ["INTERNET"],
-      "softwareKeyboardLayoutMode": "resize"
-    }
+      "versionCode": 2,
+      "adaptiveIcon": {
+        "backgroundColor": "#09090B"
+      },
+      "permissions": [
+        "android.permission.INTERNET",
+        "android.permission.VIBRATE",
+        "android.permission.RECEIVE_BOOT_COMPLETED",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.FOREGROUND_SERVICE"
+      ]
+    },
+    "plugins": [
+      "./withHarkNativeOS.js"
+    ]
   }
 }
