@@ -46,8 +46,7 @@ const STORAGE_MODEL = 'pulseos.gemini_model';
 const STORAGE_VOICE = 'pulseos.voice_enabled';
 const STORAGE_CHAT = 'pulseos.chat_history';
 
-const DEFAULT_MODEL = 'gemini-1.5-flash';
-const FALLBACK_MODEL = 'gemini-2.5-flash';
+const DEFAULT_MODEL = 'gemini-flash-latest';
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
 
 const SYSTEM_PROMPT = [
@@ -123,6 +122,27 @@ function parsePulseReply(raw: string): PulseReply {
   };
 }
 
+async function discoverFlashModels(apiKey: string): Promise<string[]> {
+  try {
+    const res = await fetch(GEMINI_BASE.replace(/\/$/, '') + '?pageSize=200', {
+      headers: { 'x-goog-api-key': apiKey },
+    });
+    if (!res.ok) return [];
+    const json: any = await res.json();
+    const names: string[] = (json?.models ?? [])
+      .filter((m: any) => (m?.supportedGenerationMethods ?? []).includes('generateContent'))
+      .map((m: any) => String(m?.name ?? '').replace(/^models\//, ''))
+      .filter((n: string) => /flash/i.test(n) && !/(lite|image|tts|audio|live|thinking|exp|preview|embedding)/i.test(n));
+    const ver = (n: string) => {
+      const m = n.match(/gemini-(\d+(?:\.\d+)?)/);
+      return m ? parseFloat(m[1]) : 0;
+    };
+    return names.sort((a, b) => ver(b) - ver(a));
+  } catch {
+    return [];
+  }
+}
+
 async function callGemini(
   apiKey: string,
   model: string,
@@ -151,9 +171,32 @@ async function callGemini(
 
   let modelUsed = model;
   let res = await attempt(model);
-  if (res.status === 404 && model !== FALLBACK_MODEL) {
-    modelUsed = FALLBACK_MODEL;
-    res = await attempt(FALLBACK_MODEL);
+  if (!res.ok && (res.status === 404 || res.status === 400 || res.status === 403)) {
+    // The model may be retired or unavailable to this key: find a working Flash model.
+    const errJson: any = await res.clone().json().catch(() => null);
+    const errMsg: string = errJson?.error?.message || '';
+    if (/model|not found|no longer available|not supported/i.test(errMsg) || res.status === 404) {
+      const candidates: string[] = [];
+      const suggested = errMsg.match(/models\/([a-z0-9.\-]+)/gi) || [];
+      suggested
+        .map((x) => x.replace(/^models\//i, ''))
+        .filter((x) => x !== model)
+        .forEach((x) => candidates.push(x));
+      (await discoverFlashModels(apiKey)).forEach((x) => {
+        if (x !== model && !candidates.includes(x)) candidates.push(x);
+      });
+      if (!candidates.includes('gemini-flash-latest') && model !== 'gemini-flash-latest') {
+        candidates.push('gemini-flash-latest');
+      }
+      for (const c of candidates.slice(0, 5)) {
+        const r = await attempt(c);
+        if (r.ok) {
+          res = r;
+          modelUsed = c;
+          break;
+        }
+      }
+    }
   }
   const json: any = await res.json().catch(() => null);
   if (!res.ok) {
