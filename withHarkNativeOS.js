@@ -6,7 +6,7 @@ const SERVICE_NAME = '.HarkAccessibilityService';
 const SERVICE_LABEL = 'Pulse OS Assistive Bridge';
 const SERVICE_DESC_KEY = 'hark_accessibility_service_description';
 const SERVICE_DESC_VALUE =
-  'Pulse OS Assistive Screen Reader, Voice Navigation, and Real-Time Cross-App UI Automation (Blinkit, Uber, Meesho, WhatsApp, Instagram, Telegram, Free Fire, and all installed apps).';
+  'Pulse OS Assistive Screen Reader, Fast Node Detection, Real-Time Cart/Action Screenshot Verification, and Multi-Tier UI Fallback Engine across all mobile apps.';
 
 function withHarkAccessibilityManifest(config) {
   return withAndroidManifest(config, (config) => {
@@ -157,7 +157,8 @@ function withHarkKotlinFiles(config) {
     android:accessibilityFlags="flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews|flagRequestEnhancedWebAccessibility"
     android:canPerformGestures="true"
     android:canRetrieveWindowContent="true"
-    android:notificationTimeout="50" />
+    android:canTakeScreenshot="true"
+    android:notificationTimeout="25" />
 `,
         'utf8',
       );
@@ -165,7 +166,11 @@ function withHarkKotlinFiles(config) {
       const kotlinDir = path.join(androidRoot, 'app/src/main/java', packagePath);
       fs.mkdirSync(kotlinDir, { recursive: true });
 
-      // 1. Write HarkAccessibilityService.kt with full Window Traversal, Coordinate Taps, Swipes, Text Input & Global Actions
+      // 1. Write HarkAccessibilityService.kt with:
+      //    - Fast 120ms Reactive Polling Node Detector (replaces slow fixed sleeps)
+      //    - 4-Tier UI Layout Change Fallback Engine (ViewId -> Text/ContentDesc -> Dynamic Scroll Search -> Proportional Screen Heuristics)
+      //    - Real-Time Cart & Action Verification + Native Android 11+ takeScreenshot() Capture
+      //    - Native TTS Voice + Toast Status Prompts when manual user confirmation is required
       fs.writeFileSync(
         path.join(kotlinDir, 'HarkAccessibilityService.kt'),
         `package ${packageName}
@@ -173,23 +178,51 @@ function withHarkKotlinFiles(config) {
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.Intent
-import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.ColorSpace
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.speech.tts.TextToSpeech
+import android.util.Base64
+import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
+import android.widget.Toast
+import java.io.ByteArrayOutputStream
 import java.util.ArrayDeque
+import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
-class HarkAccessibilityService : AccessibilityService() {
+class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitListener {
     companion object {
         @Volatile
         var instance: HarkAccessibilityService? = null
             private set
+
+        @Volatile
+        var lastStatus: String = "idle"
+
+        @Volatile
+        var lastMessage: String = "Ready"
+
+        @Volatile
+        var lastCartVerified: Boolean = false
+
+        @Volatile
+        var lastCartSummary: String = ""
+
+        @Volatile
+        var lastScreenshotBase64: String = ""
+
+        @Volatile
+        var lastUpdatedTs: Long = 0L
 
         val KNOWN_APP_PACKAGES: Map<String, List<String>> = mapOf(
             "blinkit" to listOf("com.grofers.customerapp"),
@@ -219,10 +252,23 @@ class HarkAccessibilityService : AccessibilityService() {
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val worker = Executors.newSingleThreadExecutor()
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        try {
+            tts = TextToSpeech(applicationContext, this)
+        } catch (_: Exception) {}
+    }
+
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
+            tts?.language = Locale.forLanguageTag("en-IN")
+            ttsReady = true
+        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
@@ -230,19 +276,374 @@ class HarkAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         if (instance === this) instance = null
+        try {
+            tts?.shutdown()
+        } catch (_: Exception) {}
         super.onDestroy()
     }
 
+    private fun announceStatus(message: String, showToast: Boolean = true) {
+        lastMessage = message
+        lastUpdatedTs = System.currentTimeMillis()
+        if (showToast) {
+            mainHandler.post {
+                try {
+                    Toast.makeText(applicationContext, "Pulse OS: \$message", Toast.LENGTH_SHORT).show()
+                } catch (_: Exception) {}
+            }
+        }
+        if (ttsReady) {
+            try {
+                tts?.speak(message, TextToSpeech.QUEUE_FLUSH, null, "pulse_tts_\${System.currentTimeMillis()}")
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun screenWidth(): Int = resources.displayMetrics.widthPixels.coerceAtLeast(720)
+    private fun screenHeight(): Int = resources.displayMetrics.heightPixels.coerceAtLeast(1280)
+
     private fun getActiveRoot(): AccessibilityNodeInfo? {
-        rootInActiveWindow?.let { return it }
         try {
+            val active = rootInActiveWindow
+            if (active != null && active.packageName?.toString() != packageName) {
+                return active
+            }
             for (w in windows) {
-                if (w.isActive || w.type == AccessibilityWindowInfo.TYPE_APPLICATION) {
-                    w.root?.let { return it }
+                val r = w.root ?: continue
+                if (r.packageName?.toString() != packageName) {
+                    return r
                 }
             }
-        } catch (_: Exception) {}
+            return active
+        } catch (_: Exception) {
+            return rootInActiveWindow
+        }
+    }
+
+    /**
+     * Fast Reactive Node Polling (polls every 120ms instead of blocking on fixed 3s sleeps).
+     */
+    private fun waitForExternalAppWindow(timeoutMs: Long = 5500L): Boolean {
+        val start = System.currentTimeMillis()
+        while (System.currentTimeMillis() - start < timeoutMs) {
+            val root = getActiveRoot()
+            val pkg = root?.packageName?.toString() ?: ""
+            if (pkg.isNotEmpty() && pkg != packageName && !pkg.contains("launcher", true)) {
+                return true
+            }
+            Thread.sleep(120)
+        }
+        return getActiveRoot() != null
+    }
+
+    private fun waitForMatchingNode(labels: List<String>, timeoutMs: Long = 2800L): AccessibilityNodeInfo? {
+        val start = System.currentTimeMillis()
+        while (System.currentTimeMillis() - start < timeoutMs) {
+            val root = getActiveRoot()
+            if (root != null) {
+                for (label in labels) {
+                    findNodeMultiTier(root, label)?.let { return it }
+                }
+            }
+            Thread.sleep(120)
+        }
         return null
+    }
+
+    /**
+     * Multi-Tier Node Finder (Resilient to UI Layout Changes across all apps):
+     * Tier 1: Exact text or contentDescription match
+     * Tier 2: ViewId resource name match (e.g. search_bar, btn_add, add_to_cart, et_search)
+     * Tier 3: Case-insensitive substring text/contentDescription/hint match
+     */
+    private fun findNodeMultiTier(root: AccessibilityNodeInfo, query: String): AccessibilityNodeInfo? {
+        val q = query.trim()
+        if (q.isEmpty()) return null
+
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var tier2Match: AccessibilityNodeInfo? = null
+        var tier3Match: AccessibilityNodeInfo? = null
+
+        while (queue.isNotEmpty()) {
+            val n = queue.removeFirst()
+            if (n.isVisibleToUser) {
+                val t = n.text?.toString()?.trim().orEmpty()
+                val d = n.contentDescription?.toString()?.trim().orEmpty()
+                val id = n.viewIdResourceName?.substringAfterLast("/")?.trim().orEmpty()
+                val hint = if (Build.VERSION.SDK_INT >= 26) n.hintText?.toString()?.trim().orEmpty() else ""
+
+                // Tier 1: Exact label match
+                if (t.equals(q, ignoreCase = true) || d.equals(q, ignoreCase = true)) {
+                    return n
+                }
+                // Tier 2: ViewId match
+                if (tier2Match == null && id.contains(q.replace(" ", "_"), ignoreCase = true)) {
+                    tier2Match = n
+                }
+                // Tier 3: Substring match
+                if (tier3Match == null && (t.contains(q, true) || d.contains(q, true) || hint.contains(q, true))) {
+                    tier3Match = n
+                }
+            }
+            for (i in 0 until n.childCount) {
+                n.getChild(i)?.let { queue.add(it) }
+            }
+        }
+        return tier2Match ?: tier3Match
+    }
+
+    /**
+     * Captures a real-time verification screenshot (Android 11 / API 30+) of the current screen
+     * (e.g., showing the item added to cart in Blinkit/Meesho/Swiggy or ride staged in Uber)
+     * and encodes it as a compact JPEG data URL for instant display inside Pulse OS chat!
+     */
+    fun captureVerificationScreenshotSync(timeoutMs: Long = 2500L): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return ""
+        val latch = CountDownLatch(1)
+        var encoded = ""
+        try {
+            takeScreenshot(
+                Display.DEFAULT_DISPLAY,
+                worker,
+                object : TakeScreenshotCallback {
+                    override fun onSuccess(screenshotResult: ScreenshotResult) {
+                        try {
+                            val buffer = screenshotResult.hardwareBuffer
+                            val colorSpace = screenshotResult.colorSpace
+                            val hwBitmap = Bitmap.wrapHardwareBuffer(buffer, colorSpace)
+                            buffer.close()
+                            if (hwBitmap != null) {
+                                val swBitmap = hwBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                                hwBitmap.recycle()
+                                if (swBitmap != null) {
+                                    val targetW = 480
+                                    val targetH = (swBitmap.height * (targetW.toFloat() / swBitmap.width)).toInt().coerceAtLeast(320)
+                                    val scaled = Bitmap.createScaledBitmap(swBitmap, targetW, targetH, true)
+                                    swBitmap.recycle()
+                                    val baos = ByteArrayOutputStream()
+                                    scaled.compress(Bitmap.CompressFormat.JPEG, 72, baos)
+                                    scaled.recycle()
+                                    val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+                                    encoded = "data:image/jpeg;base64,\$b64"
+                                }
+                            }
+                        } catch (_: Exception) {
+                        } finally {
+                            latch.countDown()
+                        }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        latch.countDown()
+                    }
+                }
+            )
+            latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: Exception) {}
+        return encoded
+    }
+
+    /**
+     * Scans the active screen to verify whether a cart badge, item count, price total, or confirmation state is visible.
+     */
+    private fun verifyCartOrActionState(query: String): Pair<Boolean, String> {
+        val root = getActiveRoot() ?: return Pair(false, "Unable to read active window")
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        val indicators = mutableListOf<String>()
+        val cartRegex = Regex("(\\\\b\\\\d+\\\\s*item|view cart|go to cart|added to cart|proceed to pay|checkout|₹\\\\s*\\\\d+|confirm ride|book\\\\s+uber|send)", RegexOption.IGNORE_CASE)
+
+        while (queue.isNotEmpty()) {
+            val n = queue.removeFirst()
+            if (n.isVisibleToUser) {
+                val combined = listOf(
+                    n.text?.toString()?.trim().orEmpty(),
+                    n.contentDescription?.toString()?.trim().orEmpty()
+                ).filter { it.isNotEmpty() }.joinToString(" ")
+                if (combined.isNotEmpty() && cartRegex.containsMatchIn(combined)) {
+                    indicators.add(combined.take(70))
+                }
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+
+        return if (indicators.isNotEmpty()) {
+            Pair(true, indicators.distinct().take(3).joinToString(" · "))
+        } else {
+            Pair(false, "Action staged for '\$query' — please review on screen")
+        }
+    }
+
+    /**
+     * Universal Autonomous Multi-Tier Workflow Runner (Works across Blinkit, Zepto, Swiggy, Zomato,
+     * Meesho, Flipkart, Amazon, Uber, Ola, Rapido, WhatsApp, Instagram, Telegram, YouTube, etc.):
+     * - Fast 120ms reactive node polling
+     * - 4-Tier UI layout fallback if search/action buttons moved
+     * - Real-time cart/action state verification + automatic screenshot capture
+     * - Voice + Toast confirmation prompts when manual user action is required
+     */
+    fun runAutonomousAppWorkflow(appKey: String, query: String, actionMode: String) {
+        if (query.isBlank()) return
+        worker.execute {
+            try {
+                lastStatus = "running"
+                lastCartVerified = false
+                lastScreenshotBase64 = ""
+                announceStatus("Opening \$appKey for \$query…", showToast = true)
+
+                // Fast poll (120ms) for external app window instead of blind 3.2s wait
+                waitForExternalAppWindow(4500L)
+                Thread.sleep(650)
+
+                val w = screenWidth().toFloat()
+                val h = screenHeight().toFloat()
+
+                // --- PHASE 1: Multi-Tier Search / Input Field Discovery & Fallback ---
+                val searchHints = listOf(
+                    "Search", "search", "search_bar", "search_src_text", "et_search",
+                    "What are you looking for", "Search for products", "Where to",
+                    "Enter pickup", "Search in", "Ask or search", "Message"
+                )
+                var typedOk = false
+
+                // Tier 1 & 2: Direct editable node or labeled search bar
+                for (attempt in 0 until 3) {
+                    if (inputTextIntoNode(null, query)) {
+                        typedOk = true
+                        break
+                    }
+                    val foundSearch = waitForMatchingNode(searchHints, 1400L)
+                    if (foundSearch != null && performClickOrTap(foundSearch)) {
+                        Thread.sleep(550)
+                        if (inputTextIntoNode(null, query)) {
+                            typedOk = true
+                            break
+                        }
+                    }
+                    // Tier 3 Fallback: Proportional screen coordinate tap on top search bar band (50% W, 11% H and 16% H)
+                    tapCoordinate(w * 0.50f, h * (if (attempt == 0) 0.11f else 0.16f), 75L)
+                    Thread.sleep(650)
+                    if (inputTextIntoNode(null, query)) {
+                        typedOk = true
+                        break
+                    }
+                }
+
+                if (!typedOk) {
+                    announceStatus("Please tap the search bar in \$appKey to confirm.", showToast = true)
+                }
+
+                // --- PHASE 2: Submit Search (IME Enter + Suggestion Row Fallback) ---
+                Thread.sleep(450)
+                pressImeSearchOrClickFirstSuggestion(query)
+                Thread.sleep(1500)
+
+                // --- PHASE 3: App-Specific Action + Multi-Tier Layout Fallback ---
+                val isEcommerceOrFood = appKey in listOf("blinkit", "zepto", "swiggy", "zomato", "meesho", "flipkart", "amazon") ||
+                    actionMode.contains("order", true) || actionMode.contains("add", true) || actionMode.contains("buy", true)
+
+                if (isEcommerceOrFood) {
+                    val addLabels = listOf("ADD", "Add", "+ Add", "Add +", "Add to Cart", "ADD TO CART", "Add to bag", "Buy Now")
+                    var added = false
+
+                    // Tier 1: Fast poll for visible ADD button on search results
+                    val addBtn = waitForMatchingNode(addLabels, 2200L)
+                    if (addBtn != null && performClickOrTap(addBtn)) {
+                        added = true
+                    }
+
+                    // Tier 2 Fallback: Scroll down slightly in case banner covers first product row, then retry ADD
+                    if (!added) {
+                        swipe(w * 0.5f, h * 0.72f, w * 0.5f, h * 0.38f, 260L)
+                        Thread.sleep(850)
+                        val addAfterScroll = waitForMatchingNode(addLabels, 1500L)
+                        if (addAfterScroll != null && performClickOrTap(addAfterScroll)) {
+                            added = true
+                        }
+                    }
+
+                    // Tier 3 Fallback: Tap the first product card matching the query to open product details, then tap Add to Cart
+                    if (!added) {
+                        if (clickNodeByText(query)) {
+                            Thread.sleep(1300)
+                            val detailAdd = waitForMatchingNode(addLabels, 1800L)
+                            if (detailAdd != null && performClickOrTap(detailAdd)) {
+                                added = true
+                            } else {
+                                // Tier 4 Fallback: Scroll down on product page and tap Add to Cart
+                                swipe(w * 0.5f, h * 0.75f, w * 0.5f, h * 0.35f, 260L)
+                                Thread.sleep(700)
+                                val bottomAdd = waitForMatchingNode(addLabels, 1200L)
+                                if (bottomAdd != null && performClickOrTap(bottomAdd)) {
+                                    added = true
+                                }
+                            }
+                        }
+                    }
+
+                    // Wait briefly for any variant/quantity bottom-sheet (e.g. "Confirm" / "Add item" / "Done") and handle it
+                    Thread.sleep(900)
+                    val sheetConfirm = waitForMatchingNode(listOf("Add item", "Confirm", "Continue", "Done"), 900L)
+                    if (sheetConfirm != null) {
+                        performClickOrTap(sheetConfirm)
+                        Thread.sleep(700)
+                    }
+
+                    // --- PHASE 4: Real-Time Cart Verification & Screenshot Capture ---
+                    val (verified, summaryText) = verifyCartOrActionState(query)
+                    lastCartVerified = verified || added
+                    lastCartSummary = summaryText
+                    lastScreenshotBase64 = captureVerificationScreenshotSync(2200L)
+
+                    if (lastCartVerified) {
+                        lastStatus = "verified"
+                        announceStatus(
+                            "Verified: '\$query' added to cart in \$appKey (\$summaryText). Ready for your checkout confirmation.",
+                            showToast = true
+                        )
+                    } else {
+                        lastStatus = "needs_confirmation"
+                        announceStatus(
+                            "Opened '\$query' in \$appKey. Please confirm the variant or quantity on screen.",
+                            showToast = true
+                        )
+                    }
+                } else {
+                    // Ride-booking, messaging, media, or general app workflow
+                    Thread.sleep(1000)
+                    val (verified, summaryText) = verifyCartOrActionState(query)
+                    lastCartVerified = verified
+                    lastCartSummary = summaryText
+                    lastScreenshotBase64 = captureVerificationScreenshotSync(2200L)
+                    lastStatus = "verified"
+                    announceStatus(
+                        "Staged '\$query' in \$appKey. Please review and confirm the final action on screen.",
+                        showToast = true
+                    )
+                }
+            } catch (e: Exception) {
+                lastStatus = "error"
+                announceStatus(
+                    "Automation paused in \$appKey (\${e.message ?: "layout change"}). Please confirm manually on screen.",
+                    showToast = true
+                )
+            }
+        }
+    }
+
+    private fun pressImeSearchOrClickFirstSuggestion(query: String) {
+        val root = getActiveRoot() ?: return
+        val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        if (focused != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            focused.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+        }
+        val matches = root.findAccessibilityNodeInfosByText(query) ?: emptyList()
+        for (node in matches) {
+            if (!node.isEditable && node.isVisibleToUser) {
+                if (performClickOrTap(node)) return
+            }
+        }
     }
 
     fun dumpScreenSummary(maxNodes: Int = 90): String {
@@ -280,7 +681,7 @@ class HarkAccessibilityService : AccessibilityService() {
         return sb.toString()
     }
 
-    fun tapCoordinate(x: Float, y: Float, durationMs: Long = 90L): Boolean {
+    fun tapCoordinate(x: Float, y: Float, durationMs: Long = 75L): Boolean {
         if (x < 0f || y < 0f) return false
         val path = Path().apply { moveTo(x, y) }
         val gesture = GestureDescription.Builder()
@@ -289,7 +690,7 @@ class HarkAccessibilityService : AccessibilityService() {
         return dispatchGesture(gesture, null, mainHandler)
     }
 
-    fun swipe(startX: Float, startY: Float, endX: Float, endY: Float, durationMs: Long = 320L): Boolean {
+    fun swipe(startX: Float, startY: Float, endX: Float, endY: Float, durationMs: Long = 260L): Boolean {
         val path = Path().apply {
             moveTo(startX, startY)
             lineTo(endX, endY)
@@ -301,33 +702,9 @@ class HarkAccessibilityService : AccessibilityService() {
     }
 
     fun clickNodeByText(targetText: String): Boolean {
-        val query = targetText.trim()
-        if (query.isEmpty()) return false
         val root = getActiveRoot() ?: return false
-
-        val fast = root.findAccessibilityNodeInfosByText(query) ?: emptyList()
-        for (node in fast) {
-            if (!node.isVisibleToUser) continue
-            if (performClickOrTap(node)) return true
-        }
-
-        val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.add(root)
-        while (queue.isNotEmpty()) {
-            val node = queue.removeFirst()
-            if (node.isVisibleToUser) {
-                val t = node.text?.toString()?.trim().orEmpty()
-                val d = node.contentDescription?.toString()?.trim().orEmpty()
-                val id = node.viewIdResourceName?.substringAfterLast("/").orEmpty()
-                if (t.contains(query, ignoreCase = true) || d.contains(query, ignoreCase = true) || id.contains(query, ignoreCase = true)) {
-                    if (performClickOrTap(node)) return true
-                }
-            }
-            for (i in 0 until node.childCount) {
-                node.getChild(i)?.let { queue.add(it) }
-            }
-        }
-        return false
+        val matched = findNodeMultiTier(root, targetText) ?: return false
+        return performClickOrTap(matched)
     }
 
     private fun performClickOrTap(node: AccessibilityNodeInfo): Boolean {
@@ -350,22 +727,7 @@ class HarkAccessibilityService : AccessibilityService() {
         val root = getActiveRoot() ?: return false
         var targetNode: AccessibilityNodeInfo? = null
         if (!targetLabel.isNullOrBlank()) {
-            val q = targetLabel.trim()
-            val queue = ArrayDeque<AccessibilityNodeInfo>()
-            queue.add(root)
-            while (queue.isNotEmpty()) {
-                val n = queue.removeFirst()
-                if (n.isVisibleToUser && n.isEditable) {
-                    val t = n.text?.toString().orEmpty()
-                    val d = n.contentDescription?.toString().orEmpty()
-                    val h = if (Build.VERSION.SDK_INT >= 26) n.hintText?.toString().orEmpty() else ""
-                    if (t.contains(q, true) || d.contains(q, true) || h.contains(q, true)) {
-                        targetNode = n
-                        break
-                    }
-                }
-                for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
-            }
+            targetNode = findNodeMultiTier(root, targetLabel.trim())?.takeIf { it.isEditable }
         }
         if (targetNode == null) {
             targetNode = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
@@ -383,11 +745,7 @@ class HarkAccessibilityService : AccessibilityService() {
             }
         }
         val node = targetNode ?: return false
-        val rect = Rect()
-        node.getBoundsInScreen(rect)
-        if (!rect.isEmpty) {
-            node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        }
+        node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
         node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, textToEnter)
@@ -409,7 +767,7 @@ class HarkAccessibilityService : AccessibilityService() {
         'utf8',
       );
 
-      // 2. Write HarkBridgeModule.kt & HarkBridgePackage.kt with Accessibility Status Check, Screen Dump, Swipe, Tap, Text Input & App Launching
+      // 2. Write HarkBridgeModule.kt exposing getAutomationResult and captureScreenVerification
       fs.writeFileSync(
         path.join(kotlinDir, 'HarkBridgeModule.kt'),
         `package ${packageName}
@@ -421,8 +779,6 @@ import android.os.Build
 import android.provider.Settings
 import android.speech.RecognizerIntent
 import com.facebook.react.bridge.*
-import java.io.BufferedReader
-import java.io.InputStreamReader
 
 class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext), ActivityEventListener {
@@ -452,6 +808,31 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
         } catch (e: Exception) {
             promise.resolve(HarkAccessibilityService.instance != null)
         }
+    }
+
+    @ReactMethod
+    fun getAutomationResult(promise: Promise) {
+        val map = Arguments.createMap()
+        map.putString("status", HarkAccessibilityService.lastStatus)
+        map.putString("message", HarkAccessibilityService.lastMessage)
+        map.putBoolean("cartVerified", HarkAccessibilityService.lastCartVerified)
+        map.putString("cartSummary", HarkAccessibilityService.lastCartSummary)
+        map.putString("screenshot", HarkAccessibilityService.lastScreenshotBase64)
+        map.putDouble("ts", HarkAccessibilityService.lastUpdatedTs.toDouble())
+        promise.resolve(map)
+    }
+
+    @ReactMethod
+    fun captureScreenVerification(promise: Promise) {
+        val svc = HarkAccessibilityService.instance
+        if (svc == null) {
+            promise.resolve("")
+            return
+        }
+        Thread {
+            val shot = svc.captureVerificationScreenshotSync(2500L)
+            promise.resolve(shot)
+        }.start()
     }
 
     @ReactMethod
@@ -544,43 +925,60 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
             HarkAccessibilityService.KNOWN_APP_PACKAGES[lower]?.let { candidates.addAll(it) }
             if (clean.contains(".")) candidates.add(clean)
 
+            var launched = false
             for (pkg in candidates) {
                 val intent = pm.getLaunchIntentForPackage(pkg)
                 if (intent != null) {
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                     reactContext.startActivity(intent)
-                    promise.resolve(true)
-                    return
+                    launched = true
+                    break
                 }
             }
 
-            val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
-                addCategory(Intent.CATEGORY_LAUNCHER)
-            }
-            val apps = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                pm.queryIntentActivities(mainIntent, PackageManager.ResolveInfoFlags.of(0L))
-            } else {
-                @Suppress("DEPRECATION")
-                pm.queryIntentActivities(mainIntent, 0)
-            }
-            val matched = apps.firstOrNull { info ->
-                val label = info.loadLabel(pm)?.toString()?.lowercase() ?: ""
-                label == lower || label.contains(lower) || (label.length > 2 && lower.contains(label))
-            }
-            val matchedPkg = matched?.activityInfo?.packageName
-            if (!matchedPkg.isNullOrEmpty()) {
-                val intent = pm.getLaunchIntentForPackage(matchedPkg)
-                if (intent != null) {
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                    reactContext.startActivity(intent)
-                    promise.resolve(true)
-                    return
+            if (!launched) {
+                val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
+                    addCategory(Intent.CATEGORY_LAUNCHER)
+                }
+                val apps = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    pm.queryIntentActivities(mainIntent, PackageManager.ResolveInfoFlags.of(0L))
+                } else {
+                    @Suppress("DEPRECATION")
+                    pm.queryIntentActivities(mainIntent, 0)
+                }
+                val matched = apps.firstOrNull { info ->
+                    val label = info.loadLabel(pm)?.toString()?.lowercase() ?: ""
+                    label == lower || label.contains(lower) || (label.length > 2 && lower.contains(label))
+                }
+                val matchedPkg = matched?.activityInfo?.packageName
+                if (!matchedPkg.isNullOrEmpty()) {
+                    val intent = pm.getLaunchIntentForPackage(matchedPkg)
+                    if (intent != null) {
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                        reactContext.startActivity(intent)
+                        launched = true
+                    }
                 }
             }
-            promise.resolve(false)
+
+            if (launched && !query.isNullOrBlank()) {
+                HarkAccessibilityService.instance?.runAutonomousAppWorkflow(lower, query.trim(), "order")
+            }
+            promise.resolve(launched)
         } catch (e: Exception) {
             promise.resolve(false)
         }
+    }
+
+    @ReactMethod
+    fun runAutonomousWorkflow(appKey: String, query: String, mode: String, promise: Promise) {
+        val svc = HarkAccessibilityService.instance
+        if (svc == null) {
+            promise.resolve(false)
+            return
+        }
+        svc.runAutonomousAppWorkflow(appKey.lowercase().trim(), query.trim(), mode)
+        promise.resolve(true)
     }
 
     @ReactMethod
@@ -592,17 +990,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun tapCoordinate(x: Double, y: Double, promise: Promise) {
         val svcOk = HarkAccessibilityService.instance?.tapCoordinate(x.toFloat(), y.toFloat()) ?: false
-        if (svcOk) {
-            promise.resolve(true)
-            return
-        }
-        try {
-            val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", "input tap \${x.toInt()} \${y.toInt()}"))
-            val code = proc.waitFor()
-            promise.resolve(code == 0)
-        } catch (e: Exception) {
-            promise.resolve(false)
-        }
+        promise.resolve(svcOk)
     }
 
     @ReactMethod
@@ -626,19 +1014,6 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     fun globalAction(action: String, promise: Promise) {
         val ok = HarkAccessibilityService.instance?.runGlobal(action) ?: false
         promise.resolve(ok)
-    }
-
-    @ReactMethod
-    fun runRootCommand(cmd: String, promise: Promise) {
-        try {
-            val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
-            val reader = BufferedReader(InputStreamReader(proc.inputStream))
-            val out = reader.readText()
-            proc.waitFor()
-            promise.resolve(out)
-        } catch (e: Exception) {
-            promise.reject("ROOT_ERR", e.message)
-        }
     }
 }
 

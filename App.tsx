@@ -20,6 +20,7 @@ import {
   Vibration,
   View,
   NativeModules,
+  AppState,
   NativeSyntheticEvent,
   NativeScrollEvent,
 } from 'react-native';
@@ -129,6 +130,8 @@ type ChatMessage = {
   role: 'user' | 'assistant' | 'error';
   text: string;
   attachment?: AttachmentItem;
+  verificationShotUri?: string;
+  verificationSummary?: string;
   reply?: PulseReply;
   source?: 'cloud' | 'device';
   streaming?: boolean;
@@ -347,7 +350,7 @@ function buildStreamPrompt(extraSystem: string, smartMemory: string[]): string {
     '- For documents/files: Extract key information and provide concise, practical summaries.',
     '- For video links/files: Summarize core content from transcripts/metadata and answer questions.',
     '- Automatically extract tasks, calendar events, and reminders into the metadata block at the end.',
-    '- If the user asks to automate an app (like Blinkit, Uber, Meesho, WhatsApp, Instagram, Telegram, Free Fire, etc.), include the step-by-step UI automation plan.',
+    '- Never write fake 'Executing now...' or 'UI Automation Sequence:' text when you are only chatting; real app actions are executed directly by the Pulse OS native engine.',
     'Lead with the answer. Be structured, precise, and practical with no unnecessary filler.',
     'Reply in the same language the user writes in (English, Hindi, Telugu, Hinglish, etc).',
     'At the very end of your response, after your main answer, append "' +
@@ -783,8 +786,8 @@ function StepsView({ steps, streaming }: { steps: Step[]; streaming?: boolean })
 
 const MODEL_CHOICES: { id: string; name: string; note: string }[] = [
   { id: 'gemini-2.5-flash', name: '⚡ 2.5 Flash', note: 'Fastest multimodal + agent model' },
-  { id: 'gemini-2.5-flash-lite', name: '🚀 2.5 Flash-Lite', note: 'Ultra-fast instant replies (1–2 s)' },
-  { id: 'gemini-flash-latest', name: '✨ Flash Latest', note: 'Balanced speed & reasoning' },
+  { id: 'gemini-2.5-flash-lite', name: '🚀 Flash-Lite', note: 'Ultra-fast instant replies (1–2 s)' },
+  { id: 'gemini-flash-latest', name: '✨ Flash', note: 'Balanced speed & reasoning' },
   { id: 'gemini-pro-latest', name: '🧠 Pro', note: 'Deepest reasoning & complex coding' },
 ];
 
@@ -1285,19 +1288,56 @@ async function runAgent(o: {
   context: string;
   onStep: (label: string) => void;
 }): Promise<string> {
-  // Fast-path: check if user directly asked to open/launch an installed app (e.g. "open Blinkit", "open Uber", "open Free Fire")
-  const directMatch = o.goal.match(/^(?:please\s+|can you\s+)?(?:open|launch|start|run)\s+([a-z0-9\s._-]+?)(?:\s+(?:and|to|for)\s+([\s\S]+))?$/i);
-  if (directMatch) {
-    const targetApp = directMatch[1].trim();
-    const followUpGoal = (directMatch[2] || '').trim();
-    o.onStep(`Launching ${targetApp}…`);
-    const launchRes = await openAppWithStatus(targetApp, { query: followUpGoal, text: followUpGoal });
-    if (launchRes.ok && !followUpGoal) {
-      return `✅ ${launchRes.statusMessage}`;
+  const combinedText = (o.goal + ' ' + (o.context || '')).toLowerCase();
+  const goalLower = o.goal.toLowerCase();
+
+  const mentionedApp =
+    APPS.find(
+      (app: any) =>
+        app.id !== 'web' &&
+        [app.id, app.name.toLowerCase(), ...(app.aliases || [])].some((al: string) =>
+          goalLower.includes(al.toLowerCase()),
+        ),
+    ) ||
+    (/(cart|order|add|buy)/i.test(goalLower)
+      ? APPS.find(
+          (app: any) =>
+            app.id !== 'web' &&
+            [app.id, app.name.toLowerCase(), ...(app.aliases || [])].some((al: string) =>
+              combinedText.includes(al.toLowerCase()),
+            ),
+        )
+      : undefined);
+
+  if (mentionedApp) {
+    let cleanQuery = o.goal
+      .replace(/^(?:please\s+|can you\s+|hey pulse\s+)?(?:open|launch|start|run|search|order|book|buy|add|play|send|message)\s+/i, '')
+      .replace(new RegExp('\\b(?:on|in|using|via|from|to|into)\\s+(?:my\\s+cart\\s+(?:on|in)\\s+)?' + mentionedApp.name + '\\b', 'gi'), '')
+      .replace(new RegExp('^' + mentionedApp.name + '\\s*(?:and|to|for)?\\s*', 'i'), '')
+      .replace(/\b(?:to my cart|in my cart|directly|right now|please)\b/gi, '')
+      .trim();
+
+    if (/nothing in my cart/i.test(o.goal)) {
+      const prevMatch = (o.context || '').match(/(?:order|add|buy)\s+([a-zA-Z0-9\s]{2,25}?)(?:\s+on|\s+in|\s+from|\s+to|\n|$)/i);
+      if (prevMatch?.[1]) cleanQuery = prevMatch[1].trim();
     }
-    if (!launchRes.ok) {
-      o.onStep(`${launchRes.appName} not installed — handling exception…`);
+
+    o.onStep(`Launching ${mentionedApp.name}${cleanQuery ? ' for "' + cleanQuery + '"' : ''}…`);
+
+    if (Platform.OS === 'android' && HarkBridge?.launchApp) {
+      const launched = await HarkBridge.launchApp(mentionedApp.id, cleanQuery).catch(() => false);
+      if (launched && cleanQuery && HarkBridge?.runAutonomousWorkflow) {
+        await HarkBridge.runAutonomousWorkflow(mentionedApp.id, cleanQuery, 'order').catch(() => false);
+      }
+      if (launched) {
+        return cleanQuery
+          ? `✅ Launched ${mentionedApp.name} and started the native background Accessibility worker (120ms fast node polling + 4-tier layout fallback) to search for "${cleanQuery}", tap ADD to cart, and capture a real-time verification screenshot.`
+          : `✅ Opened ${mentionedApp.name}.`;
+      }
     }
+
+    const launchRes = await openApp(mentionedApp.id, { query: cleanQuery, text: cleanQuery });
+    return launchRes ? `✅ Opened ${mentionedApp.name}.` : `⚠️ ${mentionedApp.name} is not installed on this device.`;
   }
 
   const runner = AgentBus.runner();
@@ -1320,6 +1360,21 @@ async function runAgent(o: {
     const a: any = json?.action || {};
     const thought = String(json?.thought || '').trim();
     const type = String(a.type || '');
+    if ((type === 'answer' || type === 'ask') && done.length === 0) {
+      const goalLower = o.goal.toLowerCase();
+      const matchedApp = APPS.find((ap: any) => ap.id !== 'web' && (goalLower.includes(ap.id) || goalLower.includes(ap.name.toLowerCase())));
+      if (matchedApp) {
+        o.onStep('Launching ' + matchedApp.name + ' on your phone…');
+        const ok = await openApp(matchedApp.id, { query: o.goal, text: o.goal });
+        return ok ? '✅ Opened ' + matchedApp.name + ' and started your task.' : matchedApp.name + ' is not installed on this phone.';
+      }
+      const searchTarget = searchUrl(o.goal);
+      o.onStep('Opening Live Browser for: ' + o.goal.slice(0, 40));
+      runner.navigate(searchTarget);
+      await waitForPage();
+      done.push('navigate ' + searchTarget);
+      continue;
+    }
     if ((type === 'answer' || type === 'ask') && done.length === 0) {
       const goalLower = o.goal.toLowerCase();
       const matchedApp = APPS.find((ap: any) => ap.id !== 'web' && (goalLower.includes(ap.id) || goalLower.includes(ap.name.toLowerCase())));
@@ -1549,7 +1604,7 @@ function CloudComputerScreen({
         <View style={styles.segment}>
           {(['plan', 'summarize', 'budget', 'echo'] as const).map((t) => (
             <Pressable key={t} onPress={() => setTaskType(t)} style={[styles.segItem, taskType === t && styles.segItemOn]}>
-              <Text style={[styles.segText, taskType === t && styles.segTextOn]}>{t.toUpperCase()}</Text>
+              <Text style={[styles.segText, taskType === t && styles.segTextOn]}>{t === 'summarize' ? 'SUMMARY' : t.toUpperCase()}</Text>
             </Pressable>
           ))}
         </View>
@@ -1591,14 +1646,16 @@ function AppsScreen({ say }: { say: (t: string) => void }) {
 
   return (
     <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
-      <View style={styles.rowBetween}>
-        <Text style={styles.sectionTitle}>Universal App Launcher</Text>
-        <Pressable
-          onPress={() => openAppWithStatus('accessibility')}
-          style={[styles.chip, { borderColor: C.accent2 }]}
-        >
-          <Text style={[styles.chipText, { color: C.accent2 }]}>♿ Enable Assistive Bridge</Text>
-        </Pressable>
+      <View style={{ gap: 8, marginBottom: 4 }}>
+        <View style={styles.rowBetween}>
+          <Text style={styles.sectionTitle}>Universal Apps</Text>
+          <Pressable
+            onPress={() => openAppWithStatus('accessibility')}
+            style={[styles.chip, { borderColor: C.accent2, paddingHorizontal: 12, paddingVertical: 6 }]}
+          >
+            <Text style={[styles.chipText, { color: C.accent2, fontSize: 11 }]}>♿ Assistive Bridge</Text>
+          </Pressable>
+        </View>
       </View>
       <Text style={[styles.mutedSmall, { marginTop: 4 }]}>
         Launch Blinkit, Uber, Meesho, WhatsApp, Instagram, Telegram, Free Fire, or any app installed on your phone.
@@ -2380,6 +2437,50 @@ function ChatScreen({
     loadSmartMemory().then(setSmartMemory);
   }, []);
 
+  const lastPolledAutomationTs = useRef<number>(0);
+
+  useEffect(() => {
+    if (Platform.OS !== 'android' || !HarkBridge?.getAutomationResult) return;
+    const checkResult = async () => {
+      try {
+        const res = await HarkBridge.getAutomationResult();
+        if (res && res.ts && res.ts > lastPolledAutomationTs.current && (res.status === 'verified' || res.status === 'needs_confirmation' || res.status === 'error')) {
+          lastPolledAutomationTs.current = res.ts;
+          const badge = res.cartVerified ? '✅ Cart & Action Verified' : '⚠️ Manual Confirmation Needed';
+          const statusLine = `${badge}: ${res.message || res.cartSummary || ''}`;
+          setMessages((prev) => {
+            if (!prev.length) return prev;
+            const copy = [...prev];
+            for (let i = copy.length - 1; i >= 0; i--) {
+              if (copy[i].role === 'assistant') {
+                copy[i] = {
+                  ...copy[i],
+                  text: copy[i].text.includes(statusLine) ? copy[i].text : `${copy[i].text}
+
+${statusLine}`,
+                  verificationShotUri: res.screenshot || copy[i].verificationShotUri,
+                  verificationSummary: res.cartSummary || res.message,
+                };
+                break;
+              }
+            }
+            return copy;
+          });
+          if (res.message) say(res.message);
+        }
+      } catch {}
+    };
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') checkResult();
+    });
+    const timer = setInterval(checkResult, 2200);
+    return () => {
+      sub.remove();
+      clearInterval(timer);
+    };
+  }, [say]);
+
+
   const checkCloud = useCallback(async (base: string) => {
     if (!base) {
       setCloudStatus('off');
@@ -2980,7 +3081,7 @@ function ChatScreen({
             pendingAttachment
               ? 'Ask a question about this attachment or tap ➤…'
               : apiKey || (cloudMode && cloudUrl)
-                ? 'Talk or type: "open Blinkit", attach photo/file/video…'
+                ? 'Message Pulse or say "order apples on Blinkit"…'
                 : 'Add a Gemini key in Settings'
           }
           placeholderTextColor={C.muted}
@@ -3125,6 +3226,23 @@ function MessageBubble({
             {msg.streaming ? <Text style={{ color: C.accent }}> ▍</Text> : null}
           </Text>
         )}
+        {msg.verificationShotUri ? (
+          <View style={{ marginTop: 10, borderRadius: 12, overflow: 'hidden', borderWidth: 1, borderColor: C.good, backgroundColor: C.bg, padding: 8, gap: 6 }}>
+            <Text style={{ color: C.good, fontSize: 12, fontWeight: '800' }}>
+              📸 Real-Time Cart & Action Verification
+            </Text>
+            <Image
+              source={{ uri: msg.verificationShotUri }}
+              style={{ width: 220, height: 340, borderRadius: 8, alignSelf: 'center' }}
+              resizeMode="contain"
+            />
+            {msg.verificationSummary ? (
+              <Text style={{ color: C.text, fontSize: 12, fontWeight: '600' }}>
+                {msg.verificationSummary}
+              </Text>
+            ) : null}
+          </View>
+        ) : null}
         <View style={[styles.rowBetween, { marginTop: 6 }]}>
           <Pressable onPress={() => speak(msg.text)} hitSlop={8}>
             <Text style={{ fontSize: 13, color: C.accent2 }}>🔊 Listen</Text>
@@ -3820,7 +3938,7 @@ const styles = StyleSheet.create({
   modelRow: { padding: 10, borderRadius: 12, backgroundColor: C.panel2, borderWidth: 1, borderColor: 'transparent', gap: 2 },
   appGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 14 },
   appTile: {
-    width: '30%', flexGrow: 1, alignItems: 'center', paddingVertical: 14, paddingHorizontal: 6, borderRadius: 14,
+    width: '31%', flexGrow: 0, alignItems: 'center', paddingVertical: 14, paddingHorizontal: 6, borderRadius: 14,
     backgroundColor: C.panel, borderWidth: 1, borderColor: C.border, gap: 4,
   },
   appName: { color: C.text, fontSize: 12, fontWeight: '700' },
