@@ -6,7 +6,7 @@ const SERVICE_NAME = '.HarkAccessibilityService';
 const SERVICE_LABEL = 'Pulse OS Assistive Bridge';
 const SERVICE_DESC_KEY = 'hark_accessibility_service_description';
 const SERVICE_DESC_VALUE =
-  'Pulse OS Assistive Automation Bridge for app launching, search execution, login auto-fill, and task completion.';
+  'Pulse OS Agentic & RAG Automation Bridge for launching apps, executing searches, auto-filling saved logins, reading screen context for RAG, and completing multi-step tasks.';
 
 function withHarkAccessibilityManifest(config) {
   return withAndroidManifest(config, (config) => {
@@ -18,9 +18,16 @@ function withHarkAccessibilityManifest(config) {
         manifest['uses-permission'].push({ $: { 'android:name': name } });
       }
     };
+    ensurePerm('android.permission.INTERNET');
+    ensurePerm('android.permission.VIBRATE');
     ensurePerm('android.permission.RECORD_AUDIO');
     ensurePerm('android.permission.MODIFY_AUDIO_SETTINGS');
     ensurePerm('android.permission.QUERY_ALL_PACKAGES');
+    ensurePerm('android.permission.REQUEST_INSTALL_PACKAGES');
+    ensurePerm('android.permission.CAMERA');
+    ensurePerm('android.permission.FLASHLIGHT');
+    ensurePerm('android.permission.CALL_PHONE');
+    ensurePerm('android.permission.WAKE_LOCK');
 
     if (!manifest.queries) manifest.queries = [];
     const queriesBlock = manifest.queries[0] || { package: [], intent: [] };
@@ -39,6 +46,7 @@ function withHarkAccessibilityManifest(config) {
       'com.meesho.supply',
       'com.flipkart.android',
       'in.amazon.mShop.android.shopping',
+      'com.amazon.mShop.android.shopping',
       'com.phonepe.app',
       'com.google.android.apps.nbu.paisa.user',
       'net.one97.paytm',
@@ -56,6 +64,12 @@ function withHarkAccessibilityManifest(config) {
       'com.android.chrome',
       'com.google.android.gm',
       'com.google.android.apps.maps',
+      'com.google.android.dialer',
+      'com.android.dialer',
+      'com.google.android.apps.messaging',
+      'com.google.android.calendar',
+      'com.android.vending',
+      'com.android.settings',
       'com.snapchat.android',
       'com.twitter.android',
       'com.facebook.katana',
@@ -67,16 +81,31 @@ function withHarkAccessibilityManifest(config) {
       }
     }
 
-    if (
-      !queriesBlock.intent.some(
-        (it) => it?.action?.[0]?.$?.['android:name'] === 'android.intent.action.MAIN',
-      )
-    ) {
-      queriesBlock.intent.push({
-        action: [{ $: { 'android:name': 'android.intent.action.MAIN' } }],
-        category: [{ $: { 'android:name': 'android.intent.category.LAUNCHER' } }],
-      });
-    }
+    const ensureQueryIntent = (actionName, categoryName, schemeName) => {
+      const exists = queriesBlock.intent.some(
+        (it) => it?.action?.[0]?.$?.['android:name'] === actionName &&
+          (!schemeName || it?.data?.[0]?.$?.['android:scheme'] === schemeName)
+      );
+      if (!exists) {
+        const entry = {
+          action: [{ $: { 'android:name': actionName } }],
+        };
+        if (categoryName) {
+          entry.category = [{ $: { 'android:name': categoryName } }];
+        }
+        if (schemeName) {
+          entry.data = [{ $: { 'android:scheme': schemeName } }];
+        }
+        queriesBlock.intent.push(entry);
+      }
+    };
+
+    ensureQueryIntent('android.intent.action.MAIN', 'android.intent.category.LAUNCHER');
+    ensureQueryIntent('android.speech.RecognitionService');
+    ensureQueryIntent('android.intent.action.TTS_SERVICE');
+    ensureQueryIntent('android.intent.action.VIEW', null, 'https');
+    ensureQueryIntent('android.intent.action.VIEW', null, 'http');
+
     manifest.queries[0] = queriesBlock;
 
     const mainApp = manifest.application?.[0];
@@ -122,23 +151,32 @@ function withHarkAccessibilityStrings(config) {
   });
 }
 
+function injectHarkPackageIntoMainApplication(src, pkgName) {
+  let out = src;
+  const importLine = `import ${pkgName}.HarkBridgePackage`;
+  if (!out.includes(importLine) && !out.includes(`package ${pkgName}`)) {
+    out = out.replace(/(package\s+[\w.]+\s*\n)/, `$1\n${importLine}\n`);
+  }
+  if (!out.includes('HarkBridgePackage')) {
+    if (/PackageList\(this\)\.packages\.apply\s*\{/.test(out)) {
+      out = out.replace(
+        /PackageList\(this\)\.packages\.apply\s*\{/,
+        'PackageList(this).packages.apply {\n              add(HarkBridgePackage())',
+      );
+    } else if (/PackageList\(this\)\.packages/.test(out)) {
+      out = out.replace(
+        /PackageList\(this\)\.packages/,
+        'PackageList(this).packages.apply { add(HarkBridgePackage()) }',
+      );
+    }
+  }
+  return out;
+}
+
 function withHarkMainApplicationPackage(config) {
   return withMainApplication(config, (config) => {
-    let src = config.modResults.contents;
-    if (!src.includes('HarkBridgePackage')) {
-      if (/PackageList\(this\)\.packages\.apply\s*\{/.test(src)) {
-        src = src.replace(
-          /PackageList\(this\)\.packages\.apply\s*\{/,
-          'PackageList(this).packages.apply {\n              add(HarkBridgePackage())',
-        );
-      } else if (/PackageList\(this\)\.packages/.test(src)) {
-        src = src.replace(
-          /PackageList\(this\)\.packages/,
-          'PackageList(this).packages.apply { add(HarkBridgePackage()) }',
-        );
-      }
-      config.modResults.contents = src;
-    }
+    const pkgName = config.android?.package || 'com.pulseos.app';
+    config.modResults.contents = injectHarkPackageIntoMainApplication(config.modResults.contents, pkgName);
     return config;
   });
 }
@@ -176,20 +214,10 @@ function withHarkKotlinFiles(config) {
 
       const mainAppKtPath = path.join(kotlinDir, 'MainApplication.kt');
       if (fs.existsSync(mainAppKtPath)) {
-        let mainKt = fs.readFileSync(mainAppKtPath, 'utf8');
-        if (!mainKt.includes('HarkBridgePackage')) {
-          if (/PackageList\(this\)\.packages\.apply\s*\{/.test(mainKt)) {
-            mainKt = mainKt.replace(
-              /PackageList\(this\)\.packages\.apply\s*\{/,
-              'PackageList(this).packages.apply {\n              add(HarkBridgePackage())',
-            );
-          } else if (/PackageList\(this\)\.packages/.test(mainKt)) {
-            mainKt = mainKt.replace(
-              /PackageList\(this\)\.packages/,
-              'PackageList(this).packages.apply { add(HarkBridgePackage()) }',
-            );
-          }
-          fs.writeFileSync(mainAppKtPath, mainKt, 'utf8');
+        const mainKt = fs.readFileSync(mainAppKtPath, 'utf8');
+        const updatedMainKt = injectHarkPackageIntoMainApplication(mainKt, packageName);
+        if (updatedMainKt !== mainKt) {
+          fs.writeFileSync(mainAppKtPath, updatedMainKt, 'utf8');
         }
       }
 
@@ -199,6 +227,8 @@ function withHarkKotlinFiles(config) {
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Path
@@ -212,9 +242,11 @@ import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Toast
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.util.ArrayDeque
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -242,7 +274,12 @@ class HarkAccessibilityService : AccessibilityService() {
         var lastScreenshotBase64: String = ""
 
         @Volatile
+        var lastScreenTextDump: String = ""
+
+        @Volatile
         var lastUpdatedTs: Long = 0L
+
+        val lastStepLogs = CopyOnWriteArrayList<String>()
 
         @Volatile
         var userEmail: String = ""
@@ -286,8 +323,14 @@ class HarkAccessibilityService : AccessibilityService() {
             "spotify" to listOf("com.spotify.music"),
             "chrome" to listOf("com.android.chrome"),
             "gmail" to listOf("com.google.android.gm"),
+            "email" to listOf("com.google.android.gm"),
             "maps" to listOf("com.google.android.apps.maps"),
-            "playstore" to listOf("com.android.vending")
+            "navigate" to listOf("com.google.android.apps.maps"),
+            "phone" to listOf("com.google.android.dialer", "com.android.dialer"),
+            "sms" to listOf("com.google.android.apps.messaging"),
+            "calendar" to listOf("com.google.android.calendar"),
+            "playstore" to listOf("com.android.vending"),
+            "settings" to listOf("com.android.settings")
         )
 
         fun updateLoginDataFromJson(context: Context, jsonStr: String) {
@@ -340,6 +383,7 @@ class HarkAccessibilityService : AccessibilityService() {
                 applyJsonToMemory(saved)
             }
         } catch (_: Exception) {}
+        recordStatus("Accessibility Bridge Connected", showToast = false)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
@@ -350,10 +394,13 @@ class HarkAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
-    // Silent status update: NEVER speaks with TTS during work
     private fun recordStatus(message: String, showToast: Boolean = false) {
         lastMessage = message
         lastUpdatedTs = System.currentTimeMillis()
+        lastStepLogs.add(message)
+        while (lastStepLogs.size > 16) {
+            lastStepLogs.removeAt(0)
+        }
         if (showToast) {
             mainHandler.post {
                 try {
@@ -509,9 +556,9 @@ class HarkAccessibilityService : AccessibilityService() {
         }
 
         if (filledAny) {
-            Thread.sleep(400)
-            val submitLabels = listOf("Log In", "Login", "Sign In", "Continue", "Submit", "Next", "Verify", "Proceed")
-            val btn = waitForMatchingNode(submitLabels, 1200L)
+            Thread.sleep(450)
+            val submitLabels = listOf("Log In", "Login", "Sign In", "Continue", "Submit", "Next", "Verify", "Proceed", "Get OTP", "Send OTP")
+            val btn = waitForMatchingNode(submitLabels, 1400L)
             if (btn != null && !btn.isEditable) {
                 performClickOrTap(btn)
             } else {
@@ -527,7 +574,17 @@ class HarkAccessibilityService : AccessibilityService() {
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value)
         }
-        return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+            return true
+        }
+        // Fallback: copy to clipboard and paste into focused node
+        return try {
+            val cm = applicationContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            cm?.setPrimaryClip(ClipData.newPlainText("pulse_input", value))
+            node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+        } catch (_: Exception) {
+            false
+        }
     }
 
     fun captureVerificationScreenshotSync(timeoutMs: Long = 2500L): String {
@@ -581,7 +638,7 @@ class HarkAccessibilityService : AccessibilityService() {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
         val indicators = mutableListOf<String>()
-        val cartRegex = Regex("(\\\\b\\\\d+\\\\s*item|view cart|go to cart|added to cart|proceed to pay|checkout|₹\\\\s*\\\\d+|confirm ride|book\\\\s+uber|playing|subscribe|sent)", RegexOption.IGNORE_CASE)
+        val cartRegex = Regex("(\\\\b\\\\d+\\\\s*item|view cart|go to cart|added to cart|proceed to pay|checkout|₹\\\\s*\\\\d+|confirm ride|book\\\\s+uber|playing|subscribe|sent|delivered|in stock)", RegexOption.IGNORE_CASE)
 
         while (queue.isNotEmpty()) {
             val n = queue.removeFirst()
@@ -604,18 +661,48 @@ class HarkAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun isQueryAlreadyRenderedInResults(query: String, minYRatio: Float = 0.22f): Boolean {
+        val root = getActiveRoot() ?: return false
+        val h = screenHeight().toFloat()
+        val minY = (h * minYRatio).toInt()
+        val words = query.lowercase().split(" ").filter { it.length > 2 }
+        if (words.isEmpty()) return false
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var matchesBelowHeader = 0
+        while (queue.isNotEmpty()) {
+            val n = queue.removeFirst()
+            if (n.isVisibleToUser && !n.isEditable) {
+                val r = Rect()
+                n.getBoundsInScreen(r)
+                if (r.centerY() >= minY && r.height() > 24) {
+                    val t = n.text?.toString()?.trim().orEmpty()
+                    val d = n.contentDescription?.toString()?.trim().orEmpty()
+                    val combined = "\$t \$d".lowercase()
+                    if (combined.contains(query.lowercase()) || words.count { combined.contains(it) } >= ((words.size + 1) / 2)) {
+                        matchesBelowHeader++
+                        if (matchesBelowHeader >= 2) return true
+                    }
+                }
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+        return false
+    }
+
     fun runAutonomousAppWorkflow(appKey: String, query: String, actionMode: String, usedDeepLink: Boolean = false) {
         val mySeq = workflowSeq.incrementAndGet()
         worker.execute {
             try {
+                lastStepLogs.clear()
                 lastStatus = "running"
                 lastCartVerified = false
                 lastScreenshotBase64 = ""
-                recordStatus("Working in \$appKey…", showToast = false)
+                recordStatus("Launching workflow in \$appKey…", showToast = false)
 
-                waitForExternalAppWindow(4800L)
+                waitForExternalAppWindow(5200L)
                 if (workflowSeq.get() != mySeq) return@execute
-                Thread.sleep(700)
+                Thread.sleep(800)
 
                 // 1. Check if app is asking for Login and auto-fill saved user login credentials
                 if (actionMode.equals("login", ignoreCase = true)) {
@@ -626,6 +713,7 @@ class HarkAccessibilityService : AccessibilityService() {
                     Thread.sleep(1000)
                     lastCartVerified = loggedIn
                     lastCartSummary = if (loggedIn) "Filled login credentials in \$appKey" else "Login screen ready in \$appKey"
+                    lastScreenTextDump = dumpScreenSummary(90)
                     lastScreenshotBase64 = captureVerificationScreenshotSync(2000L)
                     lastStatus = if (loggedIn) "verified" else "needs_confirmation"
                     recordStatus(lastCartSummary, showToast = true)
@@ -638,20 +726,38 @@ class HarkAccessibilityService : AccessibilityService() {
                     lastStatus = "verified"
                     lastCartVerified = true
                     lastCartSummary = "Opened \$appKey"
+                    lastScreenTextDump = dumpScreenSummary(90)
+                    recordStatus(lastCartSummary, showToast = false)
                     return@execute
                 }
 
                 val w = screenWidth().toFloat()
                 val h = screenHeight().toFloat()
 
-                // 2. If deep link didn't already land on results, locate search bar, type query, AND submit search
-                var searchSubmitted = usedDeepLink
-                if (!usedDeepLink) {
+                // 2. Verify whether deep link actually landed on results; if not, locate search bar, type query, AND submit search
+                var searchSubmitted = false
+                if (usedDeepLink) {
+                    Thread.sleep(1100)
+                    val focusedEdit = getActiveRoot()?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                    if (focusedEdit != null && focusedEdit.isEditable) {
+                        recordStatus("Submitting search in \$appKey…")
+                        setNodeTextDirect(focusedEdit, query)
+                        Thread.sleep(350)
+                        submitSearchAndSelectSuggestion(appKey, query, w, h)
+                        searchSubmitted = true
+                        Thread.sleep(1600)
+                    } else if (isQueryAlreadyRenderedInResults(query)) {
+                        recordStatus("Results loaded for '\$query' in \$appKey")
+                        searchSubmitted = true
+                    }
+                }
+
+                if (!searchSubmitted) {
                     val searchHints = listOf(
                         "Search", "search", "search_bar", "search_src_text", "et_search", "search_edit_text",
                         "What are you looking for", "Search for products", "Search for", "Where to",
-                        "Enter pickup", "Search in", "Ask or search", "Search YouTube", "Search songs",
-                        "Search or type URL", "Find"
+                        "Enter pickup", "Enter destination", "Search in", "Ask or search", "Search YouTube",
+                        "Search songs", "Search or type URL", "Find", "Search items", "Search stores"
                     )
                     var typedOk = false
                     for (attempt in 0 until 3) {
@@ -659,23 +765,32 @@ class HarkAccessibilityService : AccessibilityService() {
                         val existingEdit = findEditableNode(getActiveRoot())
                         if (existingEdit != null && setNodeTextDirect(existingEdit, query)) {
                             typedOk = true
+                            recordStatus("Entered '\$query' in search box")
                             break
                         }
-                        val foundSearch = waitForMatchingNode(searchHints, 1300L)
-                        if (foundSearch != null && performClickOrTap(foundSearch)) {
-                            Thread.sleep(650)
+                        val foundSearch = waitForMatchingNode(searchHints, 1400L)
+                        if (foundSearch != null) {
+                            performClickOrTap(foundSearch)
+                            Thread.sleep(750)
                             val editAfterClick = findEditableNode(getActiveRoot())
                             if (editAfterClick != null && setNodeTextDirect(editAfterClick, query)) {
                                 typedOk = true
+                                recordStatus("Tapped search bar and entered '\$query'")
                                 break
                             }
                         }
                         // Fallback tap on standard top search bar region
-                        tapCoordinate(w * 0.48f, h * (if (attempt == 0) 0.11f else 0.16f), 80L)
-                        Thread.sleep(650)
+                        val tapY = when (attempt) {
+                            0 -> h * 0.11f
+                            1 -> h * 0.16f
+                            else -> h * 0.08f
+                        }
+                        tapCoordinate(w * 0.48f, tapY, 85L)
+                        Thread.sleep(750)
                         val editAfterTap = findEditableNode(getActiveRoot())
                         if (editAfterTap != null && setNodeTextDirect(editAfterTap, query)) {
                             typedOk = true
+                            recordStatus("Focused search bar and entered '\$query'")
                             break
                         }
                     }
@@ -684,20 +799,8 @@ class HarkAccessibilityService : AccessibilityService() {
                         Thread.sleep(450)
                         submitSearchAndSelectSuggestion(appKey, query, w, h)
                         searchSubmitted = true
-                        Thread.sleep(1600)
-                    }
-                } else {
-                    // Deep link was used; wait for results screen to settle, or if still on search box, submit it
-                    Thread.sleep(1200)
-                    val focusedEdit = getActiveRoot()?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                    if (focusedEdit != null && focusedEdit.isEditable) {
-                        val existingText = focusedEdit.text?.toString()?.trim().orEmpty()
-                        if (existingText.isEmpty() || !existingText.contains(query.take(4), ignoreCase = true)) {
-                            setNodeTextDirect(focusedEdit, query)
-                            Thread.sleep(350)
-                        }
-                        submitSearchAndSelectSuggestion(appKey, query, w, h)
-                        Thread.sleep(1500)
+                        recordStatus("Submitted search for '\$query'")
+                        Thread.sleep(1700)
                     }
                 }
 
@@ -709,15 +812,15 @@ class HarkAccessibilityService : AccessibilityService() {
                     actionMode.contains("order", true) || actionMode.contains("add", true) || actionMode.contains("buy", true)
 
                 if (lowerApp == "youtube" || lowerApp.contains("youtube")) {
-                    // Click the first video result below the top search bar so it actually plays
-                    var played = clickFirstResultBelowHeader(query, minYRatio = 0.20f, maxYRatio = 0.78f)
+                    var played = clickFirstResultBelowHeader(query, minYRatio = 0.18f, maxYRatio = 0.78f)
                     if (!played) {
-                        tapCoordinate(w * 0.50f, h * 0.36f, 85L)
+                        tapCoordinate(w * 0.50f, h * 0.35f, 85L)
                         played = true
                     }
                     Thread.sleep(1000)
                     lastCartVerified = played
                     lastCartSummary = "Playing '\$query' on YouTube"
+                    lastScreenTextDump = dumpScreenSummary(90)
                     lastScreenshotBase64 = captureVerificationScreenshotSync(2000L)
                     lastStatus = "verified"
                     recordStatus(lastCartSummary, showToast = true)
@@ -725,7 +828,7 @@ class HarkAccessibilityService : AccessibilityService() {
                 }
 
                 if (lowerApp == "spotify" || lowerApp.contains("spotify")) {
-                    var played = clickFirstResultBelowHeader(query, minYRatio = 0.20f, maxYRatio = 0.70f)
+                    var played = clickFirstResultBelowHeader(query, minYRatio = 0.18f, maxYRatio = 0.72f)
                     if (!played) {
                         tapCoordinate(w * 0.45f, h * 0.32f, 85L)
                         played = true
@@ -733,6 +836,7 @@ class HarkAccessibilityService : AccessibilityService() {
                     Thread.sleep(900)
                     lastCartVerified = played
                     lastCartSummary = "Playing '\$query' on Spotify"
+                    lastScreenTextDump = dumpScreenSummary(90)
                     lastScreenshotBase64 = captureVerificationScreenshotSync(2000L)
                     lastStatus = "verified"
                     recordStatus(lastCartSummary, showToast = true)
@@ -740,21 +844,21 @@ class HarkAccessibilityService : AccessibilityService() {
                 }
 
                 if (lowerApp in listOf("whatsapp", "telegram")) {
-                    // If on a chat compose screen with Send button, click Send; if on search list, click first contact
-                    val sendBtn = waitForMatchingNode(listOf("Send", "send"), 1200L)
+                    val sendBtn = waitForMatchingNode(listOf("Send", "send", "iv_send", "send_button"), 1200L)
                     if (sendBtn != null && !sendBtn.isEditable) {
                         performClickOrTap(sendBtn)
                         Thread.sleep(600)
                     } else {
                         clickFirstResultBelowHeader(query, minYRatio = 0.18f, maxYRatio = 0.55f)
                         Thread.sleep(900)
-                        val sendAfter = waitForMatchingNode(listOf("Send", "send"), 1000L)
+                        val sendAfter = waitForMatchingNode(listOf("Send", "send", "iv_send"), 1000L)
                         if (sendAfter != null && !sendAfter.isEditable) {
                             performClickOrTap(sendAfter)
                         }
                     }
                     lastCartVerified = true
                     lastCartSummary = "Completed message action in \$appKey"
+                    lastScreenTextDump = dumpScreenSummary(90)
                     lastScreenshotBase64 = captureVerificationScreenshotSync(2000L)
                     lastStatus = "verified"
                     recordStatus(lastCartSummary, showToast = true)
@@ -762,13 +866,14 @@ class HarkAccessibilityService : AccessibilityService() {
                 }
 
                 if (lowerApp in listOf("uber", "ola", "rapido")) {
-                    clickFirstResultBelowHeader(query, minYRatio = 0.20f, maxYRatio = 0.60f)
-                    Thread.sleep(1200)
-                    val rideBtn = waitForMatchingNode(listOf("Confirm", "Book", "Choose", "Request", "Proceed"), 1800L)
+                    clickFirstResultBelowHeader(query, minYRatio = 0.18f, maxYRatio = 0.62f)
+                    Thread.sleep(1300)
+                    val rideBtn = waitForMatchingNode(listOf("Confirm", "Book", "Choose", "Request", "Proceed", "Select"), 1800L)
                     if (rideBtn != null) performClickOrTap(rideBtn)
                     val (verified, summaryText) = verifyCartOrActionState(query)
                     lastCartVerified = verified
                     lastCartSummary = summaryText
+                    lastScreenTextDump = dumpScreenSummary(90)
                     lastScreenshotBase64 = captureVerificationScreenshotSync(2000L)
                     lastStatus = "verified"
                     recordStatus("Ride destination '\$query' set in \$appKey", showToast = true)
@@ -782,15 +887,16 @@ class HarkAccessibilityService : AccessibilityService() {
                     val addBtn = waitForMatchingNode(addLabels, 2000L)
                     if (addBtn != null && !addBtn.isEditable && performClickOrTap(addBtn)) {
                         added = true
+                        recordStatus("Tapped Add button for '\$query'")
                     }
 
-                    // If no inline ADD button (e.g. Flipkart, Amazon, Meesho), click first product card to open product detail page
                     if (!added) {
-                        val openedProduct = clickFirstResultBelowHeader(query, minYRatio = 0.24f, maxYRatio = 0.75f)
+                        val openedProduct = clickFirstResultBelowHeader(query, minYRatio = 0.22f, maxYRatio = 0.76f)
                         if (!openedProduct) {
                             tapCoordinate(w * 0.32f, h * 0.42f, 85L)
                         }
-                        Thread.sleep(1500)
+                        recordStatus("Opened first matching product card")
+                        Thread.sleep(1600)
                         val detailAdd = waitForMatchingNode(addLabels, 2000L)
                         if (detailAdd != null && !detailAdd.isEditable && performClickOrTap(detailAdd)) {
                             added = true
@@ -814,6 +920,7 @@ class HarkAccessibilityService : AccessibilityService() {
                     val (verified, summaryText) = verifyCartOrActionState(query)
                     lastCartVerified = verified || added
                     lastCartSummary = summaryText
+                    lastScreenTextDump = dumpScreenSummary(90)
                     lastScreenshotBase64 = captureVerificationScreenshotSync(2000L)
                     lastStatus = if (lastCartVerified) "verified" else "needs_confirmation"
                     recordStatus(
@@ -821,21 +928,21 @@ class HarkAccessibilityService : AccessibilityService() {
                         showToast = true
                     )
                 } else {
-                    // Generic app: after searching, click the first result below the search bar so it opens
                     if (searchSubmitted) {
-                        clickFirstResultBelowHeader(query, minYRatio = 0.20f, maxYRatio = 0.75f)
+                        clickFirstResultBelowHeader(query, minYRatio = 0.18f, maxYRatio = 0.76f)
                         Thread.sleep(900)
                     }
                     val (verified, summaryText) = verifyCartOrActionState(query)
                     lastCartVerified = verified || searchSubmitted
                     lastCartSummary = summaryText
+                    lastScreenTextDump = dumpScreenSummary(90)
                     lastScreenshotBase64 = captureVerificationScreenshotSync(2000L)
                     lastStatus = "verified"
                     recordStatus("Completed '\$query' in \$appKey", showToast = true)
                 }
             } catch (e: Exception) {
                 lastStatus = "error"
-                recordStatus("Action paused in \$appKey", showToast = false)
+                recordStatus("Workflow error in \$appKey: \${e.message ?: "paused"}", showToast = false)
             }
         }
     }
@@ -870,13 +977,13 @@ class HarkAccessibilityService : AccessibilityService() {
         val editNode = findEditableNode(root)
         val editRect = Rect()
         editNode?.getBoundsInScreen(editRect)
-        val minSuggestionY = if (!editRect.isEmpty) (editRect.bottom + 12) else (h * 0.16f).toInt()
+        val minSuggestionY = if (!editRect.isEmpty) (editRect.bottom + 8) else (h * 0.15f).toInt()
 
         // 1. Try native IME_ENTER action on the focused EditText
-        val imeOk = pressImeEnterOnFocused()
+        pressImeEnterOnFocused()
 
         // 2. Also look for an explicit Search / Submit icon button near the search bar (not the EditText itself)
-        val searchBtnLabels = listOf("Search", "search_go_btn", "iv_search", "btn_search", "Go", "Submit")
+        val searchBtnLabels = listOf("Search", "search_go_btn", "iv_search", "btn_search", "Go", "Submit", "search_button")
         for (lbl in searchBtnLabels) {
             val btn = findNodeMultiTier(root, lbl)
             if (btn != null && !btn.isEditable && btn != editNode) {
@@ -889,32 +996,26 @@ class HarkAccessibilityService : AccessibilityService() {
             }
         }
 
-        // 3. Tap the keyboard bottom-right Search/Enter key (works across Gboard, Samsung, SwiftKey when keyboard is open)
-        if (!imeOk) {
-            tapCoordinate(w * 0.91f, h * 0.91f, 70L)
-        }
+        Thread.sleep(500)
 
-        Thread.sleep(650)
-
-        // 4. Check if we are still on a search suggestion dropdown; if so, click the first suggestion strictly BELOW the search bar
+        // 3. Check if we are still editing or if autocomplete suggestions are shown below the search bar
         val rootAfter = getActiveRoot() ?: return
         val stillEditing = findEditableNode(rootAfter) != null
-        val queryWords = query.lowercase().split(" ").filter { it.length > 2 }
+        val queryWords = query.lowercase().split(" ").filter { it.length >= 2 }
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(rootAfter)
         var bestSuggestion: AccessibilityNodeInfo? = null
 
         while (queue.isNotEmpty()) {
             val n = queue.removeFirst()
-            if (n.isVisibleToUser && !n.isEditable) {
+            if (n.isVisibleToUser && !n.isEditable && n != editNode) {
                 val r = Rect()
                 n.getBoundsInScreen(r)
-                // Strictly below the search bar and above the keyboard
-                if (r.top >= minSuggestionY && r.centerY() < h * 0.56f && r.width() > w * 0.25f && r.height() in 28..(h * 0.18f).toInt()) {
+                if (r.top >= minSuggestionY && r.centerY() < h * 0.56f && r.height() in 24..(h * 0.16f).toInt()) {
                     val t = n.text?.toString()?.trim().orEmpty()
                     val d = n.contentDescription?.toString()?.trim().orEmpty()
                     val combined = "\$t \$d".lowercase()
-                    if (combined.contains(query.lowercase()) || (queryWords.isNotEmpty() && queryWords.any { combined.contains(it) })) {
+                    if (combined.isNotEmpty() && (combined.contains(query.lowercase()) || (queryWords.isNotEmpty() && queryWords.any { combined.contains(it) }))) {
                         bestSuggestion = n
                         break
                     }
@@ -925,23 +1026,26 @@ class HarkAccessibilityService : AccessibilityService() {
 
         if (bestSuggestion != null) {
             performClickOrTap(bestSuggestion)
-        } else if (stillEditing) {
-            // Tap keyboard search key + first suggestion row coordinate
-            tapCoordinate(w * 0.91f, h * 0.91f, 75L)
             Thread.sleep(450)
-            if (findEditableNode(getActiveRoot()) != null) {
-                tapCoordinate(w * 0.45f, (minSuggestionY + 70).toFloat().coerceAtMost(h * 0.30f), 75L)
+        }
+
+        // 4. If the EditText is still focused (meaning IME_ENTER didn't submit), tap the keyboard's bottom-right Enter/Search key
+        if (stillEditing || findEditableNode(getActiveRoot()) != null) {
+            tapCoordinate(w * 0.91f, h * 0.90f, 75L)
+            Thread.sleep(550)
+            if (findEditableNode(getActiveRoot()) != null && bestSuggestion == null) {
+                tapCoordinate(w * 0.45f, (minSuggestionY + 68).toFloat().coerceAtMost(h * 0.30f), 75L)
             }
         }
     }
 
-    private fun clickFirstResultBelowHeader(query: String, minYRatio: Float = 0.20f, maxYRatio: Float = 0.78f): Boolean {
+    private fun clickFirstResultBelowHeader(query: String, minYRatio: Float = 0.18f, maxYRatio: Float = 0.78f): Boolean {
         val root = getActiveRoot() ?: return false
         val w = screenWidth().toFloat()
         val h = screenHeight().toFloat()
         val minY = (h * minYRatio).toInt()
         val maxY = (h * maxYRatio).toInt()
-        val queryWords = query.lowercase().split(" ").filter { it.length > 2 }
+        val queryWords = query.lowercase().split(" ").filter { it.length >= 2 }
 
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
@@ -952,7 +1056,7 @@ class HarkAccessibilityService : AccessibilityService() {
             if (n.isVisibleToUser && !n.isEditable) {
                 val r = Rect()
                 n.getBoundsInScreen(r)
-                if (r.centerY() in minY..maxY && r.width() > w * 0.22f && r.height() > 40) {
+                if (r.centerY() in minY..maxY && r.width() > w * 0.18f && r.height() > 36) {
                     val t = n.text?.toString()?.trim().orEmpty()
                     val d = n.contentDescription?.toString()?.trim().orEmpty()
                     val combined = "\$t \$d".lowercase()
@@ -973,7 +1077,7 @@ class HarkAccessibilityService : AccessibilityService() {
         return false
     }
 
-    fun dumpScreenSummary(maxNodes: Int = 90): String {
+    fun dumpScreenSummary(maxNodes: Int = 100): String {
         val root = getActiveRoot() ?: return ""
         val pkg = root.packageName?.toString() ?: "unknown"
         val sb = StringBuilder("ActiveAppPackage: \$pkg\\nElements:\\n")
@@ -994,7 +1098,7 @@ class HarkAccessibilityService : AccessibilityService() {
                         node.isClickable -> "BTN"
                         else -> "TXT"
                     }
-                    val label = listOf(t, d, id).filter { it.isNotEmpty() }.joinToString(" | ").take(75)
+                    val label = listOf(t, d, id).filter { it.isNotEmpty() }.joinToString(" | ").take(80)
                     if (label.isNotEmpty() || node.isEditable) {
                         sb.append("[\$count] \$tag (\$label) @(\${rect.centerX()},\${rect.centerY()})\\n")
                         count++
@@ -1005,12 +1109,20 @@ class HarkAccessibilityService : AccessibilityService() {
                 node.getChild(i)?.let { queue.add(it) }
             }
         }
-        return sb.toString()
+        val out = sb.toString()
+        lastScreenTextDump = out
+        return out
     }
 
     fun tapCoordinate(x: Float, y: Float, durationMs: Long = 75L): Boolean {
-        if (x < 0f || y < 0f) return false
-        val path = Path().apply { moveTo(x, y) }
+        val w = screenWidth().toFloat()
+        val h = screenHeight().toFloat()
+        // Support both normalized (0..1) and pixel coordinates
+        val px = if (x in 0.001f..1.0f && y in 0.001f..1.0f) x * w else x
+        val py = if (x in 0.001f..1.0f && y in 0.001f..1.0f) y * h else y
+        val clampedX = px.coerceIn(1f, w - 1f)
+        val clampedY = py.coerceIn(1f, h - 1f)
+        val path = Path().apply { moveTo(clampedX, clampedY) }
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0L, durationMs.coerceIn(40L, 600L)))
             .build()
@@ -1018,14 +1130,31 @@ class HarkAccessibilityService : AccessibilityService() {
     }
 
     fun swipe(startX: Float, startY: Float, endX: Float, endY: Float, durationMs: Long = 260L): Boolean {
+        val w = screenWidth().toFloat()
+        val h = screenHeight().toFloat()
+        val sx = startX.coerceIn(1f, w - 1f)
+        val sy = startY.coerceIn(1f, h - 1f)
+        val ex = endX.coerceIn(1f, w - 1f)
+        val ey = endY.coerceIn(1f, h - 1f)
         val path = Path().apply {
-            moveTo(startX, startY)
-            lineTo(endX, endY)
+            moveTo(sx, sy)
+            lineTo(ex, ey)
         }
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0L, durationMs.coerceIn(100L, 1000L)))
             .build()
         return dispatchGesture(gesture, null, mainHandler)
+    }
+
+    fun scrollDirection(dir: String): Boolean {
+        val w = screenWidth().toFloat()
+        val h = screenHeight().toFloat()
+        return when (dir.lowercase().trim()) {
+            "up" -> swipe(w * 0.5f, h * 0.30f, w * 0.5f, h * 0.78f, 260L)
+            "left" -> swipe(w * 0.82f, h * 0.5f, w * 0.18f, h * 0.5f, 260L)
+            "right" -> swipe(w * 0.18f, h * 0.5f, w * 0.82f, h * 0.5f, 260L)
+            else -> swipe(w * 0.5f, h * 0.76f, w * 0.5f, h * 0.26f, 260L)
+        }
     }
 
     fun clickNodeByText(targetText: String): Boolean {
@@ -1060,7 +1189,7 @@ class HarkAccessibilityService : AccessibilityService() {
                     targetNode = found
                 } else {
                     performClickOrTap(found)
-                    Thread.sleep(450)
+                    Thread.sleep(500)
                     targetNode = findEditableNode(getActiveRoot())
                 }
             }
@@ -1083,6 +1212,7 @@ class HarkAccessibilityService : AccessibilityService() {
             "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
             "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
             "notifications" -> performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+            "quick_settings" -> performGlobalAction(GLOBAL_ACTION_QUICK_SETTINGS)
             else -> false
         }
     }
@@ -1097,10 +1227,19 @@ class HarkAccessibilityService : AccessibilityService() {
 
 import android.app.Activity
 import android.app.SearchManager
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.hardware.camera2.CameraManager
+import android.media.AudioManager
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.Settings
 import android.speech.RecognizerIntent
 import com.facebook.react.bridge.*
@@ -1110,6 +1249,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
 
     private var voicePromise: Promise? = null
     private val VOICE_REQ_CODE = 9412
+    private var torchEnabled: Boolean = false
 
     init {
         reactContext.addActivityEventListener(this)
@@ -1136,6 +1276,224 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun openAccessibilitySettings(promise: Promise) {
+        try {
+            val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            reactContext.startActivity(intent)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun openSystemSettings(panel: String?, promise: Promise) {
+        try {
+            val action = when (panel?.lowercase()?.trim()) {
+                "wifi" -> Settings.ACTION_WIFI_SETTINGS
+                "bluetooth" -> Settings.ACTION_BLUETOOTH_SETTINGS
+                "display", "brightness" -> Settings.ACTION_DISPLAY_SETTINGS
+                "sound", "volume" -> Settings.ACTION_SOUND_SETTINGS
+                "accessibility" -> Settings.ACTION_ACCESSIBILITY_SETTINGS
+                "location" -> Settings.ACTION_LOCATION_SOURCE_SETTINGS
+                else -> Settings.ACTION_SETTINGS
+            }
+            val intent = Intent(action).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            reactContext.startActivity(intent)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun getDeviceStatus(promise: Promise) {
+        try {
+            val map = Arguments.createMap()
+            val bm = reactContext.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+            val batteryPct = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+            val isCharging = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) bm?.isCharging ?: false else false
+
+            val am = reactContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            val curVol = am?.getStreamVolume(AudioManager.STREAM_MUSIC) ?: 0
+            val maxVol = (am?.getStreamMaxVolume(AudioManager.STREAM_MUSIC) ?: 15).coerceAtLeast(1)
+            val volPct = ((curVol.toFloat() / maxVol.toFloat()) * 100f).toInt()
+
+            val enabledServices = Settings.Secure.getString(
+                reactContext.contentResolver,
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            ) ?: ""
+            val settingEnabled = enabledServices.contains(reactContext.packageName, ignoreCase = true)
+            val activeInstance = HarkAccessibilityService.instance != null
+
+            map.putInt("batteryPct", batteryPct)
+            map.putBoolean("isCharging", isCharging)
+            map.putInt("volumePct", volPct)
+            map.putBoolean("torchOn", torchEnabled)
+            map.putBoolean("accessibilityEnabled", activeInstance || settingEnabled)
+            map.putBoolean("serviceConnected", activeInstance)
+            map.putString("lastStatus", HarkAccessibilityService.lastStatus)
+            map.putString("lastMessage", HarkAccessibilityService.lastMessage)
+            promise.resolve(map)
+        } catch (e: Exception) {
+            promise.reject("DEVICE_STATUS_ERR", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun toggleTorch(enable: Boolean, promise: Promise) {
+        try {
+            val cm = reactContext.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+            val camId = cm?.cameraIdList?.firstOrNull()
+            if (cm != null && camId != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                cm.setTorchMode(camId, enable)
+                torchEnabled = enable
+                promise.resolve(true)
+            } else {
+                promise.resolve(false)
+            }
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun setVolume(levelPct: Double, promise: Promise) {
+        try {
+            val am = reactContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            if (am == null) {
+                promise.resolve(false)
+                return
+            }
+            val maxVol = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+            val target = ((levelPct.coerceIn(0.0, 100.0) / 100.0) * maxVol).toInt()
+            am.setStreamVolume(AudioManager.STREAM_MUSIC, target, AudioManager.FLAG_SHOW_UI)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun vibrate(durationMs: Double, promise: Promise) {
+        try {
+            val ms = durationMs.toLong().coerceIn(20L, 2000L)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val vm = reactContext.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+                vm?.defaultVibrator?.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                val v = reactContext.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    v?.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+                } else {
+                    @Suppress("DEPRECATION")
+                    v?.vibrate(ms)
+                }
+            }
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun copyToClipboard(text: String, promise: Promise) {
+        try {
+            val cm = reactContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            cm?.setPrimaryClip(ClipData.newPlainText("Pulse OS", text))
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun getClipboardText(promise: Promise) {
+        try {
+            val cm = reactContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            val item = cm?.primaryClip?.getItemAt(0)
+            promise.resolve(item?.coerceToText(reactContext)?.toString() ?: "")
+        } catch (e: Exception) {
+            promise.resolve("")
+        }
+    }
+
+    @ReactMethod
+    fun openUrl(url: String, promise: Promise) {
+        try {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url.trim())).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            reactContext.startActivity(intent)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun dialPhone(phone: String, directCall: Boolean, promise: Promise) {
+        try {
+            val clean = phone.replace(Regex("[^0-9+]"), "")
+            val action = if (directCall) Intent.ACTION_CALL else Intent.ACTION_DIAL
+            val intent = Intent(action, Uri.parse("tel:\$clean")).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            reactContext.startActivity(intent)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            try {
+                val clean = phone.replace(Regex("[^0-9+]"), "")
+                val dialIntent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:\$clean")).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                reactContext.startActivity(dialIntent)
+                promise.resolve(true)
+            } catch (_: Exception) {
+                promise.resolve(false)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun sendSms(phone: String, body: String, promise: Promise) {
+        try {
+            val clean = phone.replace(Regex("[^0-9+]"), "")
+            val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:\$clean")).apply {
+                putExtra("sms_body", body)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            reactContext.startActivity(intent)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun shareText(text: String, title: String?, promise: Promise) {
+        try {
+            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, text)
+                if (!title.isNullOrBlank()) putExtra(Intent.EXTRA_SUBJECT, title)
+            }
+            val chooser = Intent.createChooser(sendIntent, title ?: "Share via Pulse OS").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            reactContext.startActivity(chooser)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
     fun syncUserLoginData(jsonStr: String, promise: Promise) {
         try {
             HarkAccessibilityService.updateLoginDataFromJson(reactContext, jsonStr)
@@ -1153,7 +1511,13 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
         map.putBoolean("cartVerified", HarkAccessibilityService.lastCartVerified)
         map.putString("cartSummary", HarkAccessibilityService.lastCartSummary)
         map.putString("screenshot", HarkAccessibilityService.lastScreenshotBase64)
+        map.putString("screenDump", HarkAccessibilityService.lastScreenTextDump)
         map.putDouble("ts", HarkAccessibilityService.lastUpdatedTs.toDouble())
+        val logsArr = Arguments.createArray()
+        for (l in HarkAccessibilityService.lastStepLogs) {
+            logsArr.pushString(l)
+        }
+        map.putArray("stepLogs", logsArr)
         promise.resolve(map)
     }
 
@@ -1173,7 +1537,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun dumpScreenNodes(promise: Promise) {
         try {
-            val dump = HarkAccessibilityService.instance?.dumpScreenSummary(90) ?: ""
+            val dump = HarkAccessibilityService.instance?.dumpScreenSummary(100) ?: ""
             promise.resolve(dump)
         } catch (e: Exception) {
             promise.resolve("")
@@ -1249,19 +1613,14 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    private fun tryDeepLinkOrSearchIntent(pkg: String, appKey: String, query: String): Boolean {
+    // Only use direct URI deep-links for apps whose URI schemes reliably open search results
+    private fun tryReliableDeepLinkIntent(pkg: String, appKey: String, query: String): Boolean {
         if (query.isBlank()) return false
         val enc = Uri.encode(query.trim())
         val deepLinks = when (appKey) {
             "youtube" -> listOf("vnd.youtube://results?search_query=\$enc")
-            "blinkit" -> listOf("blinkit://search?q=\$enc")
-            "swiggy" -> listOf("swiggy://explore?query=\$enc")
-            "zomato" -> listOf("zomato://search?q=\$enc")
-            "meesho" -> listOf("meesho://search?q=\$enc")
-            "flipkart" -> listOf("flipkart://fk.dl/de_wv_CL?q=\$enc")
-            "amazon" -> listOf("com.amazon.mobile.shopping://www.amazon.in/s?k=\$enc")
-            "spotify" -> listOf("spotify:search:\$enc")
-            "maps", "navigate" -> listOf("geo:0,0?q=\$enc")
+            "maps" -> listOf("geo:0,0?q=\$enc")
+            "navigate" -> listOf("google.navigation:q=\$enc")
             "playstore" -> listOf("market://search?q=\$enc")
             "chrome", "web" -> listOf("https://www.google.com/search?q=\$enc")
             else -> emptyList()
@@ -1274,19 +1633,6 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                 }
                 reactContext.startActivity(viewIntent)
-                return true
-            } catch (_: Exception) {}
-        }
-
-        if (appKey in listOf("youtube", "spotify", "flipkart", "amazon", "meesho")) {
-            try {
-                val searchIntent = Intent(Intent.ACTION_SEARCH).apply {
-                    setPackage(pkg)
-                    putExtra(SearchManager.QUERY, query.trim())
-                    putExtra("query", query.trim())
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                }
-                reactContext.startActivity(searchIntent)
                 return true
             } catch (_: Exception) {}
         }
@@ -1311,7 +1657,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
 
             for (pkg in candidates) {
                 if (cleanQuery.isNotEmpty() && !cleanQuery.contains("|")) {
-                    if (tryDeepLinkOrSearchIntent(pkg, lower, cleanQuery)) {
+                    if (tryReliableDeepLinkIntent(pkg, lower, cleanQuery)) {
                         launched = true
                         usedDeepLink = true
                         break
@@ -1343,7 +1689,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                 val matchedPkg = matched?.activityInfo?.packageName
                 if (!matchedPkg.isNullOrEmpty()) {
                     resolvedKey = matched?.loadLabel(pm)?.toString()?.lowercase() ?: lower
-                    if (cleanQuery.isNotEmpty() && tryDeepLinkOrSearchIntent(matchedPkg, resolvedKey, cleanQuery)) {
+                    if (cleanQuery.isNotEmpty() && tryReliableDeepLinkIntent(matchedPkg, resolvedKey, cleanQuery)) {
                         launched = true
                         usedDeepLink = true
                     } else {
@@ -1402,6 +1748,12 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun scrollScreen(direction: String, promise: Promise) {
+        val svcOk = HarkAccessibilityService.instance?.scrollDirection(direction) ?: false
+        promise.resolve(svcOk)
+    }
+
+    @ReactMethod
     fun inputText(targetLabel: String?, text: String, promise: Promise) {
         val ok = HarkAccessibilityService.instance?.inputTextIntoNode(targetLabel, text) ?: false
         promise.resolve(ok)
@@ -1428,23 +1780,23 @@ class HarkBridgePackage : com.facebook.react.ReactPackage {
       );
 
       // 1. Optimize gradle-wrapper.properties: use lighter -bin.zip instead of -all.zip
-      const wrapperPropsPath = path.join(androidRoot, "gradle/wrapper/gradle-wrapper.properties");
+      const wrapperPropsPath = path.join(androidRoot, 'gradle/wrapper/gradle-wrapper.properties');
       if (fs.existsSync(wrapperPropsPath)) {
-        let props = fs.readFileSync(wrapperPropsPath, "utf8");
-        props = props.replace(/-all\.zip/g, "-bin.zip");
-        if (!props.includes("networkTimeout")) {
-          props = props.trimEnd() + "\nnetworkTimeout=60000\n";
+        let props = fs.readFileSync(wrapperPropsPath, 'utf8');
+        props = props.replace(/-all\.zip/g, '-bin.zip');
+        if (!props.includes('networkTimeout')) {
+          props = props.trimEnd() + '\nnetworkTimeout=60000\n';
         }
-        fs.writeFileSync(wrapperPropsPath, props, "utf8");
+        fs.writeFileSync(wrapperPropsPath, props, 'utf8');
       }
 
       // 2. Patch android/gradlew to pre-fetch the wrapper zip with curl retry before running exec "$JAVACMD" "$@" once
-      const gradlewPath = path.join(androidRoot, "gradlew");
+      const gradlewPath = path.join(androidRoot, 'gradlew');
       if (fs.existsSync(gradlewPath)) {
-        let gw = fs.readFileSync(gradlewPath, "utf8");
-        if (gw.includes('exec "$JAVACMD" "$@"') && !gw.includes("PULSE_GRADLE_PREFETCH")) {
+        let gw = fs.readFileSync(gradlewPath, 'utf8');
+        if (gw.includes('exec "$JAVACMD" "$@"') && !gw.includes('PULSE_GRADLE_PREFETCH')) {
           const prefetchBlock = [
-            "# PULSE_GRADLE_PREFETCH",
+            '# PULSE_GRADLE_PREFETCH',
             '_WRAPPER_DIR="$APP_HOME/gradle/wrapper"',
             '_PROPS="$_WRAPPER_DIR/gradle-wrapper.properties"',
             'if [ -f "$_PROPS" ] && command -v curl >/dev/null 2>&1; then',
@@ -1463,9 +1815,9 @@ class HarkBridgePackage : com.facebook.react.ReactPackage {
             '  fi',
             'fi',
             'exec "$JAVACMD" "$@"',
-          ].join("\n");
+          ].join('\n');
           gw = gw.replace('exec "$JAVACMD" "$@"', prefetchBlock);
-          fs.writeFileSync(gradlewPath, gw, "utf8");
+          fs.writeFileSync(gradlewPath, gw, 'utf8');
         }
       }
 

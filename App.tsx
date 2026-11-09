@@ -30,21 +30,36 @@ import * as Application from 'expo-application';
 import * as FileSystem from 'expo-file-system';
 import * as IntentLauncher from 'expo-intent-launcher';
 
+import {
+  RagCategory,
+  RagChunk,
+  RagSearchResult,
+  STORAGE_RAG_INDEX,
+  DEFAULT_RAG_PLAYBOOKS,
+  loadRagIndex,
+  saveRagIndex,
+  ingestDocumentIntoRag,
+  syncUserVaultToRag,
+  retrieveRagChunksSync,
+  buildAgenticRagContext,
+} from './pulseFeatures';
+
 const { HarkBridge } = NativeModules;
 
 /* ------------------------------------------------------------------ */
-/* Plain Utilitarian Theme (No Flashy Styles or Animations)           */
+/* High-Contrast Tactile Dark OS Theme                                 */
 /* ------------------------------------------------------------------ */
 
 const C = {
-  bg: '#121212',
-  panel: '#1C1C1C',
-  panel2: '#252525',
-  border: '#383838',
-  text: '#F0F0F0',
-  muted: '#9E9E9E',
+  bg: '#0B0F17',
+  panel: '#131A26',
+  panel2: '#1B2434',
+  border: '#2A364B',
+  text: '#F3F6FA',
+  muted: '#94A3B8',
   accent: '#2563EB',
   accent2: '#3B82F6',
+  rag: '#0D9488',
   good: '#16A34A',
   warn: '#D97706',
   danger: '#DC2626',
@@ -56,13 +71,12 @@ const C = {
 
 const STORAGE_API_KEY = 'pulseos.gemini_api_key';
 const STORAGE_MODEL = 'pulseos.gemini_model';
-const STORAGE_VOICE = 'pulseos.voice_enabled';
 const STORAGE_CHAT = 'pulseos.chat_history';
 const STORAGE_CLOUD_URL = 'pulseos.cloud_url';
 const STORAGE_CLOUD_TOKEN = 'pulseos.cloud_token';
-const STORAGE_CLOUD_MODE = 'pulseos.cloud_mode';
 const STORAGE_SMART_MEMORY = 'pulseos.smart_memory.v1';
 const STORAGE_USER_AUTH = 'pulseos.user_auth.v1';
+const STORAGE_ROUTINES = 'pulseos.agent_routines.v1';
 
 const CLOUD_PORT = 3000;
 const CLOUD_DOMAIN = 'app.github.dev';
@@ -73,7 +87,7 @@ const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
 const DEFAULT_UPDATE_REPO = 'RedChip6261/pulse-os-android';
 const DEFAULT_CLOUD_URL = 'https://scaling-space-telegram-jjg94w99g6pj255vv-3000.app.github.dev';
 
-type Tab = 'CHAT' | 'APPS' | 'LOGIN' | 'CLOUD' | 'LIVE' | 'SETTINGS';
+type Tab = 'CHAT' | 'RAG' | 'APPS' | 'LOGIN' | 'LIVE' | 'CLOUD' | 'SETTINGS';
 type SpeedMode = 'fast' | 'balanced' | 'smart';
 
 type SavedAppLogin = {
@@ -110,6 +124,14 @@ type AutomationStep = {
   value?: string;
 };
 
+type RagCitation = {
+  id: string;
+  title: string;
+  category: RagCategory;
+  score: number;
+  snippet: string;
+};
+
 type PulseReply = {
   direct_response: string;
   proactive_checklist: string[];
@@ -117,6 +139,7 @@ type PulseReply = {
   automation_script?: AutomationStep[];
   memory_facts?: string[];
   source_verified?: string;
+  rag_citations?: RagCitation[];
 };
 
 type AttachmentItem = {
@@ -129,6 +152,8 @@ type AttachmentItem = {
   sizeBytes?: number;
 };
 
+type Step = { label: string; status: 'active' | 'done' | 'error'; startedAt: number; ms?: number };
+
 type ChatMessage = {
   id: string;
   role: 'user' | 'assistant' | 'error';
@@ -137,6 +162,7 @@ type ChatMessage = {
   verificationShotUri?: string;
   verificationSummary?: string;
   reply?: PulseReply;
+  ragCitations?: RagCitation[];
   source?: 'cloud' | 'device';
   streaming?: boolean;
   steps?: Step[];
@@ -152,6 +178,20 @@ type CloudHealth = {
   model?: string;
   public_url?: string;
 };
+
+type AgentRoutine = {
+  id: string;
+  title: string;
+  command: string;
+  category: string;
+};
+
+const DEFAULT_ROUTINES: AgentRoutine[] = [
+  { id: 'rt_1', title: 'Order Milk on Blinkit', command: 'open blinkit and order milk', category: 'Shopping' },
+  { id: 'rt_2', title: 'Play Telugu Hits on YouTube', command: 'open youtube and play latest telugu hit songs', category: 'Media' },
+  { id: 'rt_3', title: 'Search Wireless Earbuds on Flipkart', command: 'open flipkart and search wireless earbuds', category: 'Shopping' },
+  { id: 'rt_4', title: 'Book Uber to My Saved Address', command: 'open uber and book a ride to my address', category: 'Travel' },
+];
 
 /* ------------------------------------------------------------------ */
 /* Helpers, Login Persistence & Smart Cross-Session Memory             */
@@ -178,12 +218,13 @@ async function loadUserAuth(): Promise<UserAuthData> {
   }
 }
 
-async function saveUserAuth(data: UserAuthData): Promise<void> {
+async function saveUserAuth(data: UserAuthData): Promise<RagChunk[]> {
   const json = JSON.stringify(data);
   await AsyncStorage.setItem(STORAGE_USER_AUTH, json);
   if (Platform.OS === 'android' && HarkBridge?.syncUserLoginData) {
     HarkBridge.syncUserLoginData(json).catch(() => undefined);
   }
+  return syncUserVaultToRag(data);
 }
 
 async function loadSmartMemory(): Promise<string[]> {
@@ -359,12 +400,12 @@ async function quickVerifyUrlsInText(text: string): Promise<string> {
 }
 
 /* ------------------------------------------------------------------ */
-/* Fast Streaming & Multimodal Gemini Engine                           */
+/* Fast Streaming & Multimodal Gemini Engine with Agentic RAG          */
 /* ------------------------------------------------------------------ */
 
 const META_MARK = '<<<PULSE_META>>>';
 
-function buildStreamPrompt(extraSystem: string, smartMemory: string[]): string {
+function buildStreamPrompt(extraSystem: string, smartMemory: string[], ragContextBlock = ''): string {
   const now = new Date();
   const tz = (() => {
     try {
@@ -374,21 +415,23 @@ function buildStreamPrompt(extraSystem: string, smartMemory: string[]): string {
     }
   })();
   return [
-    'You are Pulse, an OS-level Android automation agent and multimodal AI assistant.',
+    'You are Pulse OS v4.0, an OS-level Android automation agent, RAG-grounded intelligence engine, and multimodal AI assistant.',
     'Current local time: ' + now.toString() + (tz ? ' (' + tz + ')' : '') + '.',
-    'STRICT EXECUTION RULES:',
-    '- NEVER claim or pretend you opened an app, searched for an item, or completed a device action in plain text unless an actual automation_script is included in the metadata block.',
-    '- When the user asks to open an app, search in an app, order/buy an item, play a video/song, send a message, or log in, always include the exact steps in "automation_script" inside the metadata JSON at the end.',
-    '- Keep answers short, plain, direct, and factual with zero filler.',
+    'STRICT EXECUTION & AGENTIC RAG RULES:',
+    '- Ground your answers and task parameters in the RETRIEVED AGENTIC RAG KNOWLEDGE block below whenever relevant.',
+    '- NEVER pretend you opened an app, searched for an item, or completed a device action unless an actual automation_script is included in the metadata block.',
+    '- When the user asks to open an app, search in an app, order/buy an item, play a video/song, send a message, or log in, ALWAYS include the exact steps in "automation_script" inside the metadata JSON at the end.',
+    '- Keep answers clear, direct, and grounded with zero filler.',
     'Reply in the same language the user writes in.',
     'At the very end of your response, append "' +
       META_MARK +
-      '" followed by a single-line JSON object: {"proactive_checklist":[],"one_line_summary":"short summary","automation_script":[{"step":1,"action":"launch_app|tap_text|tap_xy|input_text|wait","target":"app_or_label","value":"query_or_text"}],"memory_facts":[],"source_verified":"Verified"}.',
+      '" followed by a single-line JSON object: {"proactive_checklist":["actionable follow-up step 1","step 2"],"one_line_summary":"short summary","automation_script":[{"step":1,"action":"launch_app|tap_text|tap_xy|input_text|scroll|global_action|wait","target":"app_or_label","value":"query_or_text"}],"memory_facts":["any new user preference or fact to remember"],"source_verified":"Verified with RAG"}.',
+    ragContextBlock,
     smartMemory.length ? 'User Context Memory:\n- ' + smartMemory.join('\n- ') : '',
     extraSystem,
   ]
     .filter(Boolean)
-    .join('\n');
+    .join('\n\n');
 }
 
 function splitStreamText(full: string): { visible: string; meta: string | null } {
@@ -580,12 +623,13 @@ async function streamGemini(
   history: ChatMessage[],
   extraSystem: string,
   smartMemory: string[],
+  ragContextBlock: string,
   temperature: number,
   speed: SpeedMode,
   onText: (visible: string) => void,
 ): Promise<{ reply: PulseReply; modelUsed: string }> {
   const contents = buildMultimodalContents(history);
-  const sys = buildStreamPrompt(extraSystem, smartMemory);
+  const sys = buildStreamPrompt(extraSystem, smartMemory, ragContextBlock);
   const hasMedia = history.some((m) => !!m.attachment?.base64);
   const make = (thinking: any | undefined) =>
     JSON.stringify({
@@ -593,7 +637,7 @@ async function streamGemini(
       contents,
       generationConfig: {
         temperature,
-        maxOutputTokens: speed === 'smart' || hasMedia ? 4096 : 1500,
+        maxOutputTokens: speed === 'smart' || hasMedia ? 4096 : 1800,
         ...(thinking ? { thinkingConfig: thinking } : {}),
       },
     });
@@ -604,9 +648,9 @@ async function streamGemini(
   let sawNetwork = false;
   for (const m of chain) {
     if (isCooling(m)) continue;
-    let r = await streamOnce(apiKey, m, make(thinkingFor(m, speed)), emit, hasMedia ? 14000 : 7000);
+    let r = await streamOnce(apiKey, m, make(thinkingFor(m, speed)), emit, hasMedia ? 14000 : 7500);
     if (r.status === 400 && /thinking/i.test(r.error || '')) {
-      r = await streamOnce(apiKey, m, make(undefined), emit, hasMedia ? 14000 : 7000);
+      r = await streamOnce(apiKey, m, make(undefined), emit, hasMedia ? 14000 : 7500);
     }
     if (r.status === 200 && r.full.trim()) {
       noteGood(m);
@@ -659,7 +703,7 @@ function modelChain(preferred: string): string[] {
 }
 
 /* ------------------------------------------------------------------ */
-/* Live bus: Manual workspace browser state only (no unsolicited popups) */
+/* Live bus & StepsView                                                */
 /* ------------------------------------------------------------------ */
 
 type LiveState = {
@@ -715,16 +759,6 @@ function hostOf(u: string) {
   return m ? m[1].replace(/^www\./, '') : u;
 }
 
-function useLive(): LiveState {
-  const [s, setS] = useState<LiveState>(LiveBus.get());
-  useEffect(() => LiveBus.onState(setS), []);
-  return s;
-}
-
-/* ---- Reply steps ("what Pulse is doing") ---- */
-
-type Step = { label: string; status: 'active' | 'done' | 'error'; startedAt: number; ms?: number };
-
 function StepsView({ steps, streaming }: { steps: Step[]; streaming?: boolean }) {
   const [open, setOpen] = useState(true);
   if (!steps.length) return null;
@@ -733,18 +767,18 @@ function StepsView({ steps, streaming }: { steps: Step[]; streaming?: boolean })
     <View style={styles.stepsBox}>
       <Pressable onPress={() => setOpen((o) => !o)} style={styles.rowBetween}>
         <Text style={styles.stepsHead}>
-          {streaming ? 'Working... ' : 'Completed in '}
+          {streaming ? '⚡ Executing Agent + RAG... ' : '✓ Completed in '}
           {(total / 1000).toFixed(1)}s
         </Text>
-        <Text style={styles.mutedSmall}>{open ? 'Hide' : 'Steps'}</Text>
+        <Text style={styles.mutedSmall}>{open ? 'Hide' : `Steps (${steps.length})`}</Text>
       </Pressable>
       {open
         ? steps.map((s, i) => (
             <View key={i} style={styles.stepRow}>
-              <Text style={[styles.stepIcon, s.status === 'error' && { color: C.danger }]}>
-                {s.status === 'active' ? '-' : s.status === 'done' ? '✓' : '!'}
+              <Text style={[styles.stepIcon, s.status === 'error' && { color: C.danger }, s.status === 'active' && { color: C.accent2 }]}>
+                {s.status === 'active' ? '●' : s.status === 'done' ? '✓' : '!'}
               </Text>
-              <Text style={[styles.stepText, s.status === 'active' && { color: C.text }]}>{s.label}</Text>
+              <Text style={[styles.stepText, s.status === 'active' && { color: C.text, fontWeight: '600' }]}>{s.label}</Text>
             </View>
           ))
         : null}
@@ -757,10 +791,10 @@ function StepsView({ steps, streaming }: { steps: Step[]; streaming?: boolean })
 /* ------------------------------------------------------------------ */
 
 const MODEL_CHOICES: { id: string; name: string; note: string }[] = [
-  { id: 'gemini-2.5-flash', name: '2.5 Flash', note: 'Default fast multimodal & automation model' },
-  { id: 'gemini-2.5-flash-lite', name: 'Flash-Lite', note: 'Instant low-latency replies' },
-  { id: 'gemini-flash-latest', name: 'Flash Latest', note: 'Balanced speed & reasoning' },
-  { id: 'gemini-pro-latest', name: 'Pro Latest', note: 'Complex reasoning & coding' },
+  { id: 'gemini-2.5-flash', name: '2.5 Flash', note: 'Default fast multimodal, RAG & OS automation model' },
+  { id: 'gemini-2.5-flash-lite', name: 'Flash-Lite', note: 'Ultra-low latency replies & quick actions' },
+  { id: 'gemini-flash-latest', name: 'Flash Latest', note: 'Balanced speed & multi-step reasoning' },
+  { id: 'gemini-pro-latest', name: 'Pro Latest', note: 'Deep reasoning, complex RAG & coding' },
 ];
 
 function modelLabel(id: string) {
@@ -848,40 +882,41 @@ type AppArgs = { query?: string; to?: string; text?: string };
 type AppCatalogItem = {
   id: string;
   name: string;
+  icon: string;
   hint: string;
   aliases: string[];
   packages: string[];
 };
 
 const APPS: AppCatalogItem[] = [
-  { id: 'blinkit', name: 'Blinkit', hint: 'Groceries', aliases: ['blinkit', 'grofers'], packages: ['com.grofers.customerapp'] },
-  { id: 'uber', name: 'Uber', hint: 'Book ride', aliases: ['uber', 'uber cab', 'uber auto'], packages: ['com.ubercab', 'com.ubercab.uberlite'] },
-  { id: 'meesho', name: 'Meesho', hint: 'Shopping', aliases: ['meesho'], packages: ['com.meesho.supply'] },
-  { id: 'whatsapp', name: 'WhatsApp', hint: 'Messaging', aliases: ['whatsapp', 'wa', 'whats app'], packages: ['com.whatsapp', 'com.whatsapp.w4b'] },
-  { id: 'instagram', name: 'Instagram', hint: 'Social', aliases: ['instagram', 'insta', 'ig'], packages: ['com.instagram.android', 'com.instagram.lite'] },
-  { id: 'telegram', name: 'Telegram', hint: 'Messaging', aliases: ['telegram', 'tg', 'tele'], packages: ['org.telegram.messenger', 'org.telegram.messenger.web', 'org.thunderdog.challegram'] },
-  { id: 'freefire', name: 'Free Fire', hint: 'Game', aliases: ['freefire', 'free fire', 'free fire max', 'ff'], packages: ['com.dts.freefiremax', 'com.dts.freefireth'] },
-  { id: 'zepto', name: 'Zepto', hint: 'Groceries', aliases: ['zepto'], packages: ['com.zeptoconsumerapp'] },
-  { id: 'swiggy', name: 'Swiggy', hint: 'Food & Instamart', aliases: ['swiggy', 'instamart'], packages: ['in.swiggy.android'] },
-  { id: 'zomato', name: 'Zomato', hint: 'Food delivery', aliases: ['zomato'], packages: ['com.application.zomato'] },
-  { id: 'ola', name: 'Ola', hint: 'Cab booking', aliases: ['ola', 'ola cabs'], packages: ['com.olacabs.customer'] },
-  { id: 'rapido', name: 'Rapido', hint: 'Bike & Auto', aliases: ['rapido'], packages: ['com.rapido.passenger'] },
-  { id: 'flipkart', name: 'Flipkart', hint: 'Shopping', aliases: ['flipkart', 'fk'], packages: ['com.flipkart.android'] },
-  { id: 'amazon', name: 'Amazon', hint: 'Shopping', aliases: ['amazon', 'amazon shopping'], packages: ['in.amazon.mShop.android.shopping', 'com.amazon.mShop.android.shopping'] },
-  { id: 'phonepe', name: 'PhonePe', hint: 'UPI Payments', aliases: ['phonepe', 'phone pe'], packages: ['com.phonepe.app'] },
-  { id: 'gpay', name: 'Google Pay', hint: 'UPI Payments', aliases: ['gpay', 'google pay', 'tez'], packages: ['com.google.android.apps.nbu.paisa.user'] },
-  { id: 'paytm', name: 'Paytm', hint: 'Payments', aliases: ['paytm'], packages: ['net.one97.paytm'] },
-  { id: 'youtube', name: 'YouTube', hint: 'Videos', aliases: ['youtube', 'yt'], packages: ['com.google.android.youtube'] },
-  { id: 'spotify', name: 'Spotify', hint: 'Music', aliases: ['spotify', 'music'], packages: ['com.spotify.music'] },
-  { id: 'maps', name: 'Maps', hint: 'Navigation', aliases: ['maps', 'google maps'], packages: ['com.google.android.apps.maps'] },
-  { id: 'navigate', name: 'Navigate', hint: 'Directions', aliases: ['navigate', 'directions'], packages: ['com.google.android.apps.maps'] },
-  { id: 'phone', name: 'Call', hint: 'Dialer', aliases: ['phone', 'call', 'dialer'], packages: ['com.google.android.dialer', 'com.android.dialer'] },
-  { id: 'sms', name: 'SMS', hint: 'Messages', aliases: ['sms', 'messages'], packages: ['com.google.android.apps.messaging'] },
-  { id: 'email', name: 'Email', hint: 'Gmail', aliases: ['email', 'gmail', 'mail'], packages: ['com.google.android.gm'] },
-  { id: 'calendar', name: 'Calendar', hint: 'Schedule', aliases: ['calendar'], packages: ['com.google.android.calendar'] },
-  { id: 'playstore', name: 'Play Store', hint: 'Install apps', aliases: ['playstore', 'play store'], packages: ['com.android.vending'] },
-  { id: 'web', name: 'Chrome', hint: 'Web search', aliases: ['web', 'chrome', 'browser'], packages: ['com.android.chrome'] },
-  { id: 'settings', name: 'Settings', hint: 'Device settings', aliases: ['settings'], packages: ['com.android.settings'] },
+  { id: 'blinkit', name: 'Blinkit', icon: '⚡', hint: 'Groceries', aliases: ['blinkit', 'grofers'], packages: ['com.grofers.customerapp'] },
+  { id: 'zepto', name: 'Zepto', icon: '🥬', hint: 'Groceries', aliases: ['zepto'], packages: ['com.zeptoconsumerapp'] },
+  { id: 'swiggy', name: 'Swiggy', icon: '🍔', hint: 'Food & Instamart', aliases: ['swiggy', 'instamart'], packages: ['in.swiggy.android'] },
+  { id: 'zomato', name: 'Zomato', icon: '🍕', hint: 'Food delivery', aliases: ['zomato'], packages: ['com.application.zomato'] },
+  { id: 'flipkart', name: 'Flipkart', icon: '🛒', hint: 'Shopping', aliases: ['flipkart', 'fk'], packages: ['com.flipkart.android'] },
+  { id: 'meesho', name: 'Meesho', icon: '🛍️', hint: 'Shopping', aliases: ['meesho'], packages: ['com.meesho.supply'] },
+  { id: 'amazon', name: 'Amazon', icon: '📦', hint: 'Shopping', aliases: ['amazon', 'amazon shopping'], packages: ['in.amazon.mShop.android.shopping', 'com.amazon.mShop.android.shopping'] },
+  { id: 'youtube', name: 'YouTube', icon: '▶️', hint: 'Videos', aliases: ['youtube', 'yt'], packages: ['com.google.android.youtube'] },
+  { id: 'spotify', name: 'Spotify', icon: '🎵', hint: 'Music', aliases: ['spotify', 'music'], packages: ['com.spotify.music'] },
+  { id: 'whatsapp', name: 'WhatsApp', icon: '💬', hint: 'Messaging', aliases: ['whatsapp', 'wa', 'whats app'], packages: ['com.whatsapp', 'com.whatsapp.w4b'] },
+  { id: 'instagram', name: 'Instagram', icon: '📸', hint: 'Social', aliases: ['instagram', 'insta', 'ig'], packages: ['com.instagram.android', 'com.instagram.lite'] },
+  { id: 'telegram', name: 'Telegram', icon: '✈️', hint: 'Messaging', aliases: ['telegram', 'tg', 'tele'], packages: ['org.telegram.messenger', 'org.telegram.messenger.web', 'org.thunderdog.challegram'] },
+  { id: 'uber', name: 'Uber', icon: '🚕', hint: 'Book ride', aliases: ['uber', 'uber cab', 'uber auto'], packages: ['com.ubercab', 'com.ubercab.uberlite'] },
+  { id: 'ola', name: 'Ola', icon: '🚖', hint: 'Cab booking', aliases: ['ola', 'ola cabs'], packages: ['com.olacabs.customer'] },
+  { id: 'rapido', name: 'Rapido', icon: '🛵', hint: 'Bike & Auto', aliases: ['rapido'], packages: ['com.rapido.passenger'] },
+  { id: 'phonepe', name: 'PhonePe', icon: '🟣', hint: 'UPI Payments', aliases: ['phonepe', 'phone pe'], packages: ['com.phonepe.app'] },
+  { id: 'gpay', name: 'Google Pay', icon: '💳', hint: 'UPI Payments', aliases: ['gpay', 'google pay', 'tez'], packages: ['com.google.android.apps.nbu.paisa.user'] },
+  { id: 'paytm', name: 'Paytm', icon: '💠', hint: 'Payments', aliases: ['paytm'], packages: ['net.one97.paytm'] },
+  { id: 'freefire', name: 'Free Fire', icon: '🔥', hint: 'Game', aliases: ['freefire', 'free fire', 'free fire max', 'ff'], packages: ['com.dts.freefiremax', 'com.dts.freefireth'] },
+  { id: 'maps', name: 'Maps', icon: '🗺️', hint: 'Navigation', aliases: ['maps', 'google maps'], packages: ['com.google.android.apps.maps'] },
+  { id: 'navigate', name: 'Navigate', icon: '🧭', hint: 'Directions', aliases: ['navigate', 'directions'], packages: ['com.google.android.apps.maps'] },
+  { id: 'phone', name: 'Call', icon: '📞', hint: 'Dialer', aliases: ['phone', 'call', 'dialer'], packages: ['com.google.android.dialer', 'com.android.dialer'] },
+  { id: 'sms', name: 'SMS', icon: '✉️', hint: 'Messages', aliases: ['sms', 'messages'], packages: ['com.google.android.apps.messaging'] },
+  { id: 'email', name: 'Gmail', icon: '📧', hint: 'Email', aliases: ['email', 'gmail', 'mail'], packages: ['com.google.android.gm'] },
+  { id: 'calendar', name: 'Calendar', icon: '📅', hint: 'Schedule', aliases: ['calendar'], packages: ['com.google.android.calendar'] },
+  { id: 'playstore', name: 'Play Store', icon: '▶️', hint: 'Install apps', aliases: ['playstore', 'play store'], packages: ['com.android.vending'] },
+  { id: 'web', name: 'Chrome', icon: '🌐', hint: 'Web search', aliases: ['web', 'chrome', 'browser'], packages: ['com.android.chrome'] },
+  { id: 'settings', name: 'Settings', icon: '⚙️', hint: 'Device settings', aliases: ['settings'], packages: ['com.android.settings'] },
 ];
 
 function phoneDigits(to: string) {
@@ -961,23 +996,31 @@ function appUrls(app: string, a: AppArgs): string[] {
   }
 }
 
-/**
- * Universal mobile app launcher.
- * Note: HarkBridge.launchApp already triggers HarkAccessibilityService.runAutonomousAppWorkflow,
- * so we NEVER call runAutonomousWorkflow a second time when launchApp succeeds.
- */
 async function openAppWithStatus(
   appNameOrId: string,
   a: AppArgs = {},
-): Promise<{ ok: boolean; appName: string; statusMessage: string }> {
+): Promise<{ ok: boolean; appName: string; statusMessage: string; bridgeActive?: boolean }> {
   const clean = appNameOrId.trim().toLowerCase();
   if (clean === 'settings' || clean === 'accessibility') {
     if (clean === 'accessibility' && Platform.OS === 'android') {
-      await IntentLauncher.startActivityAsync(IntentLauncher.ActivityAction.ACCESSIBILITY_SETTINGS).catch(() => Linking.openSettings());
-      return { ok: true, appName: 'Accessibility Settings', statusMessage: 'Opened Android Accessibility Settings.' };
+      if (HarkBridge?.openAccessibilitySettings) {
+        await HarkBridge.openAccessibilitySettings().catch(() => undefined);
+      } else {
+        await IntentLauncher.startActivityAsync(IntentLauncher.ActivityAction.ACCESSIBILITY_SETTINGS).catch(() => Linking.openSettings());
+      }
+      return { ok: true, appName: 'Accessibility Settings', statusMessage: 'Opened Android Accessibility Settings. Enable "Pulse OS Assistive Bridge".' };
     }
     await Linking.openSettings().catch(() => undefined);
     return { ok: true, appName: 'Settings', statusMessage: 'Opened device Settings.' };
+  }
+
+  let bridgeActive = false;
+  if (Platform.OS === 'android' && HarkBridge?.isAccessibilityEnabled) {
+    try {
+      bridgeActive = !!(await HarkBridge.isAccessibilityEnabled());
+    } catch {
+      bridgeActive = false;
+    }
   }
 
   const catalogMatch = APPS.find(
@@ -988,6 +1031,18 @@ async function openAppWithStatus(
 
   // 1. For WhatsApp/Phone/SMS with explicit phone number, use direct URI first
   if (catalogMatch && (catalogMatch.id === 'whatsapp' || catalogMatch.id === 'phone' || catalogMatch.id === 'sms') && (a.to || qText)) {
+    if (catalogMatch.id === 'phone' && Platform.OS === 'android' && HarkBridge?.dialPhone) {
+      const ok = await HarkBridge.dialPhone(a.to || qText, false).catch(() => false);
+      if (ok) {
+        return { ok: true, appName: displayName, statusMessage: `Dialing ${a.to || qText}.`, bridgeActive };
+      }
+    }
+    if (catalogMatch.id === 'sms' && Platform.OS === 'android' && HarkBridge?.sendSms && a.to) {
+      const ok = await HarkBridge.sendSms(a.to, qText).catch(() => false);
+      if (ok) {
+        return { ok: true, appName: displayName, statusMessage: `Opened SMS to ${a.to}.`, bridgeActive };
+      }
+    }
     for (const u of appUrls(catalogMatch.id, a)) {
       try {
         if (await Linking.canOpenURL(u)) {
@@ -999,6 +1054,7 @@ async function openAppWithStatus(
             ok: true,
             appName: displayName,
             statusMessage: `Opened ${displayName}${qText ? ` for "${qText}"` : ''}.`,
+            bridgeActive,
           };
         }
       } catch {
@@ -1007,18 +1063,23 @@ async function openAppWithStatus(
     }
   }
 
-  // 2. Native HarkBridge (handles direct search intents + deep links + single-thread Accessibility workflow)
+  // 2. Native HarkBridge (handles package launch + reliable deep links + single-thread Accessibility workflow)
   if (Platform.OS === 'android' && HarkBridge?.launchApp) {
     try {
       const targetKey = catalogMatch ? catalogMatch.id : clean;
       const launched = await HarkBridge.launchApp(targetKey, qText);
       if (launched) {
+        const bridgeHint =
+          qText && !bridgeActive
+            ? ' (Note: Enable "Bridge: OFF" at top-right so Pulse can type & click inside the app automatically!)'
+            : '';
         return {
           ok: true,
           appName: displayName,
           statusMessage: qText
-            ? `Opened ${displayName} and executing "${qText}".`
+            ? `Opened ${displayName} and executing "${qText}".${bridgeHint}`
             : `Opened ${displayName}.`,
+          bridgeActive,
         };
       }
     } catch {
@@ -1039,6 +1100,7 @@ async function openAppWithStatus(
             ok: true,
             appName: displayName,
             statusMessage: `Opened ${displayName}${qText ? ` for "${qText}"` : ''}.`,
+            bridgeActive,
           };
         }
       } catch {
@@ -1064,6 +1126,7 @@ async function openAppWithStatus(
             statusMessage: qText
               ? `Opened ${displayName} and executing "${qText}".`
               : `Opened ${displayName}.`,
+            bridgeActive,
           };
         } catch {
           /* try next package */
@@ -1076,17 +1139,10 @@ async function openAppWithStatus(
     ok: false,
     appName: displayName,
     statusMessage: `"${displayName}" is not installed on this device.`,
+    bridgeActive,
   };
 }
 
-async function openApp(app: string, a: AppArgs): Promise<boolean> {
-  const res = await openAppWithStatus(app, a);
-  return res.ok;
-}
-
-/**
- * Extracts a clean search/action query from natural user text for a target app.
- */
 function extractCleanAppQuery(rawGoal: string, app: AppCatalogItem): string {
   let q = rawGoal.trim();
   const names = [app.id, app.name, ...(app.aliases || [])]
@@ -1098,7 +1154,7 @@ function extractCleanAppQuery(rawGoal: string, app: AppCatalogItem): string {
     .replace(/^(?:please\s+|can you\s+|pls\s+|hey\s+pulse\s+|pulse\s+)?/i, '')
     .replace(new RegExp(`\\b(?:open|launch|start|run|go\\s+to|in|on|using|via|from|into)\\s+(?:the\\s+)?(?:${appPattern})(?:\\s+app)?\\b`, 'gi'), ' ')
     .replace(new RegExp(`^(?:${appPattern})(?:\\s+app)?\\b`, 'i'), ' ')
-    .replace(/\b(?:in\s+(?:the\s+)?search\s*bar|search\s+for|search|look\s+for|find|order|buy|add\s+to\s+cart|add|book\s+a\s+ride\s+to|book|play|watch|listen\s+to|send\s+message|send)\b/gi, ' ')
+    .replace(/\b(?:in\s+(?:the\s+)?search\s*bar|search\s+for|search|look\s+for|find|order|buy|add\s+to\s+cart|add|book\s+a\s+ride\s+to|book\s+a\s+cab\s+to|book|play|watch|listen\s+to|send\s+message|send)\b/gi, ' ')
     .replace(/\b(?:to\s+my\s+cart|in\s+my\s+cart|directly|right\s+now|please|and\s+do\s+the\s+work|and)\b/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -1108,19 +1164,65 @@ function extractCleanAppQuery(rawGoal: string, app: AppCatalogItem): string {
 }
 
 /**
- * Deterministic pre-flight parser: checks if the user's message is a direct app open, search, order, play, message, or login task,
- * and executes it immediately without letting the LLM hallucinate plain text.
+ * RAG-Augmented Pre-Flight Executor:
+ * Uses retrieved RAG chunks (`user_vault`, `note`, `document`, `playbook`) to resolve indirect references
+ * (like "my address", "my usual groceries", saved app logins, or phone numbers) and executes native OS actions immediately.
  */
 async function tryDirectDeviceExecution(
   rawText: string,
-  recentContext: string,
   userAuth: UserAuthData,
+  ragIndex: RagChunk[],
   onStep?: (label: string) => void,
-): Promise<{ handled: boolean; statusMessage: string; appName?: string }> {
+): Promise<{
+  handled: boolean;
+  statusMessage: string;
+  appName?: string;
+  ragCitations?: RagCitation[];
+}> {
   const clean = rawText.trim();
   const lower = clean.toLowerCase();
 
-  // Check if user is asking to log in to an app
+  const ragCtx = buildAgenticRagContext(clean, ragIndex, 4);
+  const ragCitations: RagCitation[] = ragCtx.results.map((r) => ({
+    id: r.chunk.id,
+    title: r.chunk.title,
+    category: r.chunk.category,
+    score: r.score,
+    snippet: r.chunk.content.slice(0, 140),
+  }));
+
+  // 1. Hardware / OS System Commands (Flashlight, Volume, Back/Home/Notifications)
+  if (/\b(turn\s+on|enable|switch\s+on)\s+(?:the\s+)?(?:flashlight|torch|light)\b/i.test(lower)) {
+    onStep?.('Toggling device flashlight ON...');
+    const ok = Platform.OS === 'android' && HarkBridge?.toggleTorch ? await HarkBridge.toggleTorch(true) : false;
+    return {
+      handled: true,
+      statusMessage: ok ? 'Turned ON the device flashlight.' : 'Could not toggle flashlight on this device.',
+      ragCitations,
+    };
+  }
+  if (/\b(turn\s+off|disable|switch\s+off)\s+(?:the\s+)?(?:flashlight|torch|light)\b/i.test(lower)) {
+    onStep?.('Toggling device flashlight OFF...');
+    const ok = Platform.OS === 'android' && HarkBridge?.toggleTorch ? await HarkBridge.toggleTorch(false) : false;
+    return {
+      handled: true,
+      statusMessage: ok ? 'Turned OFF the device flashlight.' : 'Could not toggle flashlight on this device.',
+      ragCitations,
+    };
+  }
+  const volMatch = lower.match(/\b(?:set\s+)?volume\s+(?:to\s+)?(\d{1,3})\s*%?\b/i);
+  if (volMatch && Platform.OS === 'android' && HarkBridge?.setVolume) {
+    const pct = Math.min(100, Math.max(0, parseInt(volMatch[1], 10)));
+    onStep?.(`Setting media volume to ${pct}%...`);
+    await HarkBridge.setVolume(pct);
+    return {
+      handled: true,
+      statusMessage: `Set device media volume to ${pct}%.`,
+      ragCitations,
+    };
+  }
+
+  // 2. Check if user is asking to log in to an app
   const loginMatch = lower.match(/\b(?:log\s*in|login|sign\s*in)\b/);
   const matchedApp = APPS.find(
     (app) =>
@@ -1140,25 +1242,31 @@ async function tryDirectDeviceExecution(
     );
     const u = saved?.username || userAuth.email || userAuth.phone || '';
     const p = saved?.password || userAuth.password || '';
-    onStep?.(`Logging into ${matchedApp.name}...`);
+    onStep?.(`RAG Vault matched credentials for ${matchedApp.name}. Logging in...`);
     const loginPayload = u || p ? `${u}|${p}` : '';
     const res = await openAppWithStatus(matchedApp.id, { query: loginPayload, text: loginPayload });
     return {
       handled: true,
       appName: matchedApp.name,
       statusMessage: u
-        ? `${res.statusMessage} Auto-filling saved login for ${u}.`
+        ? `${res.statusMessage} Auto-filling RAG Vault login for ${u}.`
         : `${res.statusMessage} Add credentials in the LOGIN tab to auto-fill.`,
+      ragCitations,
     };
   }
 
-  // Check if any known app is mentioned in the user message
+  // 3. Check if any known app is mentioned in the user message
   if (matchedApp) {
-    const query = extractCleanAppQuery(clean, matchedApp);
-    // Extract phone number if present for WhatsApp / Call / SMS
+    let query = extractCleanAppQuery(clean, matchedApp);
+    // If query refers to "my address", "my office", "usual", etc., replace with RAG-resolved value!
+    if (ragCtx.resolvedHintQuery && (!query || /\b(my\s+address|my\s+home|my\s+office|usual|saved)\b/i.test(clean))) {
+      query = ragCtx.resolvedHintQuery;
+    } else if (/\b(my\s+address|my\s+home|my\s+office)\b/i.test(clean) && userAuth.address) {
+      query = userAuth.address;
+    }
     const phoneMatch = clean.match(/(?:\+?91[\s-]?)?[6-9]\d{9}\b/);
     const toPhone = phoneMatch ? phoneMatch[0] : '';
-    onStep?.(`Opening ${matchedApp.name}${query ? ` for "${query}"` : ''}...`);
+    onStep?.(`RAG Grounded -> Opening ${matchedApp.name}${query ? ` for "${query}"` : ''}...`);
     const res = await openAppWithStatus(matchedApp.id, {
       query,
       text: query,
@@ -1168,21 +1276,22 @@ async function tryDirectDeviceExecution(
       handled: true,
       appName: matchedApp.name,
       statusMessage: res.statusMessage,
+      ragCitations,
     };
   }
 
-  // Generic "open <installed app>" command for any non-catalog phone app
+  // 4. Generic "open <installed app>" command for any non-catalog phone app
   const genericOpen = clean.match(/^(?:please\s+|can you\s+|pls\s+)?(?:open|launch|start|run)\s+([a-zA-Z0-9._\s-]{2,30})$/i);
   if (genericOpen) {
     const target = genericOpen[1].trim();
     onStep?.(`Opening ${target}...`);
     const res = await openAppWithStatus(target);
     if (res.ok) {
-      return { handled: true, appName: res.appName, statusMessage: res.statusMessage };
+      return { handled: true, appName: res.appName, statusMessage: res.statusMessage, ragCitations };
     }
   }
 
-  return { handled: false, statusMessage: '' };
+  return { handled: false, statusMessage: '', ragCitations };
 }
 
 /**
@@ -1225,6 +1334,18 @@ async function executeOsAutomationScript(
           logs.push(typed ? `Entered "${val}".` : `Input "${target}" not found.`);
         }
         await new Promise((r) => setTimeout(r, 450));
+      } else if (act === 'scroll') {
+        if (HarkBridge?.scrollScreen) {
+          await HarkBridge.scrollScreen(val || target || 'down');
+          logs.push(`Scrolled ${val || target || 'down'}.`);
+        }
+        await new Promise((r) => setTimeout(r, 450));
+      } else if (act === 'global_action') {
+        if (HarkBridge?.globalAction) {
+          await HarkBridge.globalAction(target || val || 'back');
+          logs.push(`Executed global action: ${target || val}.`);
+        }
+        await new Promise((r) => setTimeout(r, 450));
       } else if (act === 'wait') {
         await new Promise((r) => setTimeout(r, Math.min(5000, Number(val) || 1000)));
         logs.push(`Waited ${val || 1000}ms.`);
@@ -1238,7 +1359,7 @@ async function executeOsAutomationScript(
 }
 
 /* ------------------------------------------------------------------ */
-/* Agent: Pulse drives its in-app browser (only when needed)           */
+/* Agent: Pulse drives Installed Apps + In-App Browser with RAG        */
 /* ------------------------------------------------------------------ */
 
 type PageSnap = { url: string; title: string; els: { i: number; tag: string; label: string }[]; text: string };
@@ -1265,7 +1386,7 @@ const AgentBus = (() => {
     runner: () => runner,
     begin(goal: string) {
       stopped = false;
-      status = { running: true, goal, step: 'Starting…' };
+      status = { running: true, goal, step: 'Retrieving RAG context…' };
       emit();
     },
     step(step: string) {
@@ -1337,12 +1458,13 @@ return {ok:false,msg:'unknown action'};
 `;
 
 const AGENT_SYSTEM = [
-  'You are Pulse OS Agent. You operate both installed Android apps and the web browser.',
-  'If the user wants to use an installed mobile app, use open_app immediately.',
-  'If the user asks to log in or fill forms, use the saved user login credentials provided in context.',
+  'You are Pulse OS v4.0 Agent with integrated RAG AI. You operate both installed Android apps and the web browser.',
+  'Always use the RETRIEVED AGENTIC RAG KNOWLEDGE provided in the prompt to fill in exact user addresses, saved logins, phone numbers, document facts, and app workflow steps.',
+  'If the user wants to use an installed mobile app (or buy groceries/food/products, play videos/music, book a ride, or send a message), use open_app immediately.',
   'Reply with ONE JSON object: {"thought": "<=12 words describing step", "action": {...}}.',
   'Actions:',
-  '{"type":"open_app","app":"blinkit|uber|meesho|whatsapp|instagram|telegram|freefire|zepto|swiggy|zomato|ola|rapido|flipkart|amazon|phonepe|gpay|paytm|maps|navigate|youtube|spotify|phone|sms|email|calendar|playstore","query":"clean search query","to":"phone","text":"message","ui_steps":[{"step":1,"action":"tap_text","target":"Search"},{"step":2,"action":"input_text","target":"Search","value":"milk"}]}',
+  '{"type":"open_app","app":"blinkit|uber|meesho|whatsapp|instagram|telegram|freefire|zepto|swiggy|zomato|ola|rapido|flipkart|amazon|phonepe|gpay|paytm|maps|navigate|youtube|spotify|phone|sms|email|calendar|playstore","query":"clean search query resolved via RAG","to":"phone","text":"message","ui_steps":[{"step":1,"action":"tap_text","target":"Search"},{"step":2,"action":"input_text","target":"Search","value":"milk"}]}',
+  '{"type":"os_step","steps":[{"step":1,"action":"tap_text|input_text|tap_xy|scroll|global_action","target":"...","value":"..."}]}',
   '{"type":"navigate","url":"https://..."}',
   '{"type":"click","i":N}',
   '{"type":"type","i":N,"text":"...","submit":true|false}',
@@ -1352,7 +1474,7 @@ const AGENT_SYSTEM = [
 ].join('\n');
 
 const AGENT_RE =
-  /\b(open|launch|start|run|go to|goto|search|find|look ?up|book|order|play|send|message|whatsapp|blinkit|uber|meesho|free ?fire|instagram|telegram|zepto|swiggy|zomato|flipkart|amazon|youtube|spotify|ola|rapido|phonepe|gpay|paytm|call|dial|navigate|directions|buy|watch|listen|browse|visit|login|log in|sign in|tap|click)\b/i;
+  /\b(open|launch|start|run|go to|goto|search|find|look ?up|book|order|play|send|message|whatsapp|blinkit|uber|meesho|free ?fire|instagram|telegram|zepto|swiggy|zomato|flipkart|amazon|youtube|spotify|ola|rapido|phonepe|gpay|paytm|call|dial|navigate|directions|buy|watch|listen|browse|visit|login|log in|sign in|tap|click|flashlight|torch|volume)\b/i;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -1377,31 +1499,47 @@ async function runAgent(o: {
   model: string;
   goal: string;
   context: string;
+  ragContextBlock: string;
   userAuth: UserAuthData;
+  ragIndex: RagChunk[];
   onStep: (label: string) => void;
 }): Promise<string> {
-  // 1. Always try direct native app execution first so we never waste time or show fake text
-  const direct = await tryDirectDeviceExecution(o.goal, o.context, o.userAuth, o.onStep);
+  // 1. Try RAG-grounded direct native app execution first
+  const direct = await tryDirectDeviceExecution(o.goal, o.userAuth, o.ragIndex, o.onStep);
   if (direct.handled) {
     return direct.statusMessage;
   }
 
   const runner = AgentBus.runner();
-  if (!runner) throw new Error('Browser runner is initializing. Try again.');
+  let osScreenNodes = '';
+  if (Platform.OS === 'android' && HarkBridge?.dumpScreenNodes) {
+    try {
+      osScreenNodes = await HarkBridge.dumpScreenNodes();
+    } catch {
+      osScreenNodes = '';
+    }
+  }
+
   const done: string[] = [];
-  for (let n = 0; n < 15; n++) {
+  for (let n = 0; n < 12; n++) {
     if (AgentBus.isStopped()) return 'Stopped.';
-    const snap = await agentSnapshot();
+    const snap = runner ? await agentSnapshot() : null;
     const page = snap
       ? 'URL: ' + snap.url + '\nTitle: ' + snap.title + '\nElements:\n' +
         snap.els.map((e) => '[' + e.i + '] ' + e.tag + ': ' + e.label).join('\n') +
         '\nVisible text:\n' + snap.text
-      : 'No page is open yet (blank).';
-    const prompt =
-      'Goal: ' + o.goal +
-      (o.context ? '\nContext & Saved User Login Data:\n' + o.context : '') +
-      '\nSteps so far:\n' + (done.length ? done.map((d, i) => i + 1 + '. ' + d).join('\n') : '(none)') +
-      '\n\nCurrent page:\n' + page;
+      : 'No web page open yet.';
+    const prompt = [
+      'Goal: ' + o.goal,
+      o.ragContextBlock,
+      o.context ? 'User Context & Vault:\n' + o.context : '',
+      osScreenNodes ? 'Active Android Screen Nodes:\n' + osScreenNodes.slice(0, 2000) : '',
+      'Steps completed so far:\n' + (done.length ? done.map((d, i) => i + 1 + '. ' + d).join('\n') : '(none)'),
+      'Current Browser State:\n' + page,
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+
     const { json } = await geminiJson(o.apiKey, o.model, AGENT_SYSTEM, [{ role: 'user', parts: [{ text: prompt }] }]);
     const a: any = json?.action || {};
     const thought = String(json?.thought || '').trim();
@@ -1418,9 +1556,19 @@ async function runAgent(o: {
       return res.statusMessage;
     }
 
-    if ((type === 'answer' || type === 'ask') && done.length === 0) {
+    if (type === 'os_step' && Array.isArray(a.steps)) {
+      o.onStep(thought || 'Executing OS UI steps');
+      const scriptRes = await executeOsAutomationScript(a.steps, o.onStep);
+      return scriptRes.log.join('\n') || 'Completed OS steps.';
+    }
+
+    if (!runner) {
+      return String(a.text || thought || 'Action dispatched.');
+    }
+
+    if ((type === 'answer' || type === 'ask') && done.length === 0 && !o.ragContextBlock) {
       const searchTarget = searchUrl(o.goal);
-      o.onStep('Searching: ' + o.goal.slice(0, 40));
+      o.onStep('Searching web: ' + o.goal.slice(0, 40));
       runner.navigate(searchTarget);
       await waitForPage();
       done.push('navigate ' + searchTarget);
@@ -1456,14 +1604,14 @@ async function runAgent(o: {
       await sleep(300);
       done.push('scroll ' + (up ? 'up' : 'down'));
     } else {
-      done.push('invalid action ' + JSON.stringify(a).slice(0, 80));
+      done.push('step ' + JSON.stringify(a).slice(0, 80));
     }
   }
-  return 'Completed browser automation steps.';
+  return 'Completed agentic automation steps.';
 }
 
 /* ------------------------------------------------------------------ */
-/* Conversations (plain side drawer, no animations)                    */
+/* Conversations Persistence                                           */
 /* ------------------------------------------------------------------ */
 
 type Convo = { id: string; title: string; summary: string; updatedAt: number; messages: ChatMessage[] };
@@ -1528,7 +1676,335 @@ function timeAgo(ts: number) {
 }
 
 /* ------------------------------------------------------------------ */
-/* LOGIN & USER DATA SCREEN (Saves User Login Data & Runs Work)        */
+/* RAG AI KNOWLEDGE VAULT & AGENTIC TASK STUDIO SCREEN                 */
+/* ------------------------------------------------------------------ */
+
+function RagKnowledgeScreen({
+  ragIndex,
+  setRagIndex,
+  apiKey,
+  onRunAgentWithQuery,
+}: {
+  ragIndex: RagChunk[];
+  setRagIndex: (next: RagChunk[]) => void;
+  apiKey: string;
+  onRunAgentWithQuery: (taskText: string) => void;
+}) {
+  const [searchQuery, setSearchQuery] = useState('');
+  const [filterCat, setFilterCat] = useState<'ALL' | RagCategory>('ALL');
+  const [docTitle, setDocTitle] = useState('');
+  const [docContent, setDocContent] = useState('');
+  const [docCat, setDocCat] = useState<RagCategory>('document');
+  const [docAppTag, setDocAppTag] = useState('');
+  const [urlInput, setUrlInput] = useState('');
+  const [busyIngest, setBusyIngest] = useState(false);
+  const [statusMsg, setStatusMsg] = useState('');
+
+  const searchResults: RagSearchResult[] = searchQuery.trim()
+    ? retrieveRagChunksSync(searchQuery, ragIndex, 8)
+    : [];
+
+  const filteredChunks = ragIndex.filter((c) => (filterCat === 'ALL' ? true : c.category === filterCat));
+
+  const handleAddDocument = async () => {
+    if (!docTitle.trim() || !docContent.trim()) {
+      Alert.alert('Missing fields', 'Enter both a title and knowledge content to index into RAG.');
+      return;
+    }
+    setBusyIngest(true);
+    try {
+      const updated = await ingestDocumentIntoRag(docTitle.trim(), docContent.trim(), docCat, {
+        appTag: docAppTag.trim() || undefined,
+        apiKey: apiKey || undefined,
+      });
+      setRagIndex(updated);
+      setDocTitle('');
+      setDocContent('');
+      setDocAppTag('');
+      setStatusMsg(`Indexed "${docTitle.trim()}" into RAG Knowledge Vault (${updated.length} total chunks).`);
+    } finally {
+      setBusyIngest(false);
+    }
+  };
+
+  const handleIngestUrlOrVideo = async () => {
+    const u = urlInput.trim();
+    if (!u) return;
+    setBusyIngest(true);
+    setStatusMsg('Fetching and chunking URL / YouTube transcript for RAG...');
+    try {
+      let extracted = '';
+      if (/youtube\.com\/watch|youtu\.be\/|youtube\.com\/shorts/i.test(u)) {
+        extracted = await fetchVideoLinkContext(u);
+      } else {
+        extracted = await quickVerifyUrlsInText(u);
+      }
+      if (!extracted.trim()) {
+        setStatusMsg('Could not extract text from URL.');
+      } else {
+        const updated = await ingestDocumentIntoRag(`Web/Video Source: ${hostOf(u)}`, extracted, 'web_clip', {
+          sourceUrl: u,
+          apiKey: apiKey || undefined,
+        });
+        setRagIndex(updated);
+        setUrlInput('');
+        setStatusMsg(`Indexed URL content into RAG (${updated.length} total chunks).`);
+      }
+    } catch (e: any) {
+      setStatusMsg(`Failed to ingest URL: ${e?.message || String(e)}`);
+    } finally {
+      setBusyIngest(false);
+    }
+  };
+
+  const handleIndexLiveScreen = async () => {
+    if (Platform.OS !== 'android' || !HarkBridge?.dumpScreenNodes) {
+      setStatusMsg('Live screen capture requires Android Accessibility Bridge.');
+      return;
+    }
+    setBusyIngest(true);
+    try {
+      const dump = await HarkBridge.dumpScreenNodes();
+      if (!dump || !String(dump).trim()) {
+        setStatusMsg('No active external screen nodes found. Ensure Accessibility Bridge is ON.');
+      } else {
+        const updated = await ingestDocumentIntoRag(
+          `Screen Snapshot (${new Date().toLocaleTimeString()})`,
+          String(dump),
+          'screen_dump',
+          { apiKey: apiKey || undefined },
+        );
+        setRagIndex(updated);
+        setStatusMsg('Indexed live Android screen nodes into RAG Knowledge Base.');
+      }
+    } finally {
+      setBusyIngest(false);
+    }
+  };
+
+  const deleteChunk = async (id: string) => {
+    const next = ragIndex.filter((c) => c.id !== id);
+    setRagIndex(next);
+    await saveRagIndex(next);
+  };
+
+  const resetPlaybooks = async () => {
+    const existingDynamic = ragIndex.filter((c) => c.category !== 'playbook');
+    const merged = [...DEFAULT_RAG_PLAYBOOKS, ...existingDynamic];
+    setRagIndex(merged);
+    await saveRagIndex(merged);
+    setStatusMsg('Restored built-in OS Automation Playbooks.');
+  };
+
+  const categories: ('ALL' | RagCategory)[] = [
+    'ALL',
+    'playbook',
+    'user_vault',
+    'document',
+    'note',
+    'web_clip',
+    'screen_dump',
+    'task_memory',
+  ];
+
+  return (
+    <ScrollView contentContainerStyle={{ padding: 14, gap: 14, paddingBottom: 44 }} keyboardShouldPersistTaps="handled">
+      <View style={styles.rowBetween}>
+        <View>
+          <Text style={styles.sectionTitle}>Agentic RAG Knowledge Vault</Text>
+          <Text style={styles.mutedSmall}>
+            {ragIndex.length} knowledge chunks active · Grounds all chat & OS automation tasks
+          </Text>
+        </View>
+        <Pressable onPress={handleIndexLiveScreen} style={[styles.chip, { borderColor: C.rag }]}>
+          <Text style={[styles.chipText, { color: '#5EEAD4' }]}>+ Index Screen</Text>
+        </Pressable>
+      </View>
+
+      {statusMsg ? (
+        <View style={[styles.settingsCard, { borderColor: C.rag, paddingVertical: 10 }]}>
+          <Text style={{ color: '#5EEAD4', fontSize: 13, fontWeight: '600' }}>{statusMsg}</Text>
+        </View>
+      ) : null}
+
+      {/* 1. Live RAG Retrieval & Agentic Task Launcher */}
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>Test RAG Retrieval & Run Agentic Task</Text>
+        <Text style={styles.mutedSmall}>
+          Search your RAG knowledge base or enter a task (e.g., "order my usual groceries on Blinkit", "book Uber to my office", "login to Flipkart").
+        </Text>
+        <TextInput
+          value={searchQuery}
+          onChangeText={setSearchQuery}
+          placeholder="Enter query or agentic task to test RAG retrieval..."
+          placeholderTextColor={C.muted}
+          style={styles.input}
+        />
+        {searchQuery.trim() ? (
+          <View style={{ gap: 8, marginTop: 4 }}>
+            <Pressable
+              onPress={() => onRunAgentWithQuery(searchQuery.trim())}
+              style={[styles.primaryBtn, { backgroundColor: C.rag, marginTop: 2 }]}
+            >
+              <Text style={styles.primaryBtnText}>⚡ Execute Agentic Task with RAG ({searchResults.length} matches)</Text>
+            </Pressable>
+            {searchResults.length === 0 ? (
+              <Text style={styles.mutedSmall}>No matching RAG chunks above threshold.</Text>
+            ) : (
+              searchResults.map((r) => (
+                <View
+                  key={r.chunk.id}
+                  style={{
+                    padding: 10,
+                    borderRadius: 6,
+                    backgroundColor: C.bg,
+                    borderWidth: 1,
+                    borderColor: C.rag,
+                    gap: 4,
+                  }}
+                >
+                  <View style={styles.rowBetween}>
+                    <Text style={{ color: '#5EEAD4', fontWeight: '700', fontSize: 13, flex: 1 }} numberOfLines={1}>
+                      {r.chunk.title}
+                    </Text>
+                    <Text style={{ color: C.good, fontWeight: '700', fontSize: 12 }}>{r.score}% match</Text>
+                  </View>
+                  <Text style={{ color: C.text, fontSize: 12 }} numberOfLines={3}>
+                    {r.chunk.content}
+                  </Text>
+                  {r.matchedTerms.length > 0 ? (
+                    <Text style={styles.mutedSmall}>Matched terms: {r.matchedTerms.join(', ')}</Text>
+                  ) : null}
+                </View>
+              ))
+            )}
+          </View>
+        ) : null}
+      </View>
+
+      {/* 2. Ingest Custom Knowledge / Usual Orders / App Playbooks */}
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>Add Document, Note, or Custom Playbook to RAG</Text>
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
+          {(['document', 'note', 'playbook', 'task_memory'] as RagCategory[]).map((cat) => (
+            <Pressable
+              key={cat}
+              onPress={() => setDocCat(cat)}
+              style={[styles.chip, docCat === cat && { borderColor: C.rag, backgroundColor: '#112E2B' }]}
+            >
+              <Text style={styles.chipText}>{cat.toUpperCase()}</Text>
+            </Pressable>
+          ))}
+        </View>
+        <TextInput
+          value={docTitle}
+          onChangeText={setDocTitle}
+          placeholder="Title (e.g., My Usual Grocery List, Office Address, Custom App Flow)"
+          placeholderTextColor={C.muted}
+          style={styles.input}
+        />
+        <TextInput
+          value={docAppTag}
+          onChangeText={setDocAppTag}
+          placeholder="Optional App Tag (e.g., blinkit, flipkart, whatsapp, uber)"
+          placeholderTextColor={C.muted}
+          autoCapitalize="none"
+          style={styles.input}
+        />
+        <TextInput
+          value={docContent}
+          onChangeText={setDocContent}
+          placeholder="Enter knowledge text, shopping items, addresses, contacts, or step-by-step instructions..."
+          placeholderTextColor={C.muted}
+          multiline
+          style={[styles.input, { minHeight: 80 }]}
+        />
+        <Pressable onPress={handleAddDocument} disabled={busyIngest} style={styles.primaryBtn}>
+          {busyIngest ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>+ Index into RAG Vault</Text>}
+        </Pressable>
+      </View>
+
+      {/* 3. Ingest Web URL or YouTube Video Transcript */}
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>Ingest Web Page or YouTube Video into RAG</Text>
+        <View style={{ flexDirection: 'row', gap: 8 }}>
+          <TextInput
+            value={urlInput}
+            onChangeText={setUrlInput}
+            placeholder="https://... or YouTube link"
+            placeholderTextColor={C.muted}
+            autoCapitalize="none"
+            keyboardType="url"
+            style={[styles.input, { flex: 1 }]}
+          />
+          <Pressable
+            onPress={handleIngestUrlOrVideo}
+            disabled={busyIngest}
+            style={[styles.primaryBtn, { marginTop: 0, paddingHorizontal: 14, justifyContent: 'center' }]}
+          >
+            <Text style={styles.primaryBtnText}>Ingest</Text>
+          </Pressable>
+        </View>
+      </View>
+
+      {/* 4. Browse & Manage Indexed RAG Chunks */}
+      <View style={styles.settingsCard}>
+        <View style={styles.rowBetween}>
+          <Text style={styles.cardTitle}>Indexed RAG Chunks ({filteredChunks.length})</Text>
+          <Pressable onPress={resetPlaybooks} style={styles.chip}>
+            <Text style={styles.chipText}>Restore Playbooks</Text>
+          </Pressable>
+        </View>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 6, paddingVertical: 4 }}>
+          {categories.map((cat) => (
+            <Pressable
+              key={cat}
+              onPress={() => setFilterCat(cat)}
+              style={[styles.chip, filterCat === cat && { borderColor: C.accent }]}
+            >
+              <Text style={styles.chipText}>{cat.toUpperCase()}</Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+
+        {filteredChunks.slice(0, 35).map((item) => (
+          <View
+            key={item.id}
+            style={{
+              padding: 10,
+              borderRadius: 6,
+              backgroundColor: C.bg,
+              borderWidth: 1,
+              borderColor: C.border,
+              marginTop: 6,
+              gap: 4,
+            }}
+          >
+            <View style={styles.rowBetween}>
+              <Text style={{ color: C.text, fontWeight: '700', fontSize: 13, flex: 1 }} numberOfLines={1}>
+                {item.title}
+              </Text>
+              <View style={styles.rowCenter}>
+                <View style={[styles.chip, { paddingVertical: 2, paddingHorizontal: 6 }]}>
+                  <Text style={{ color: '#5EEAD4', fontSize: 10, fontWeight: '700' }}>{item.category.toUpperCase()}</Text>
+                </View>
+                <Pressable onPress={() => deleteChunk(item.id)}>
+                  <Text style={{ color: C.danger, fontSize: 12, fontWeight: '600', marginLeft: 6 }}>Delete</Text>
+                </Pressable>
+              </View>
+            </View>
+            <Text style={{ color: C.muted, fontSize: 12 }} numberOfLines={3}>
+              {item.content}
+            </Text>
+          </View>
+        ))}
+      </View>
+    </ScrollView>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* LOGIN & USER DATA VAULT SCREEN (Auto-Syncs with Bridge & RAG)       */
 /* ------------------------------------------------------------------ */
 
 function LoginScreen({
@@ -1557,7 +2033,7 @@ function LoginScreen({
 
   const handleSaveLogin = () => {
     if (!name.trim() && !email.trim() && !phone.trim()) {
-      Alert.alert('Required', 'Please enter your Name, Email, or Phone number to log in.');
+      Alert.alert('Required', 'Please enter your Name, Email, or Phone number to save your profile vault.');
       return;
     }
     const nextAuth: UserAuthData = {
@@ -1575,7 +2051,7 @@ function LoginScreen({
       email: email.trim() || settings.email,
       ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
     });
-    setStatusMsg('User login data saved and synced with automation bridge.');
+    setStatusMsg('User login data saved & indexed into Agentic RAG Vault.');
     onDoneLogin?.();
   };
 
@@ -1607,7 +2083,7 @@ function LoginScreen({
     setAppKey('');
     setAppUser('');
     setAppPass('');
-    setStatusMsg(`Saved login credentials for ${entry.app}.`);
+    setStatusMsg(`Saved & indexed login credentials for ${entry.app}.`);
   };
 
   const removeSavedAppLogin = (id: string) => {
@@ -1627,134 +2103,57 @@ function LoginScreen({
   return (
     <ScrollView contentContainerStyle={{ padding: 16, gap: 14, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
       <View style={styles.rowBetween}>
-        <Text style={styles.sectionTitle}>User Login & Data</Text>
-        <View style={styles.chip}>
-          <Text style={styles.chipText}>{userAuth.isLoggedIn ? 'LOGGED IN' : 'NOT LOGGED IN'}</Text>
+        <Text style={styles.sectionTitle}>User Identity & Login Vault</Text>
+        <View style={[styles.chip, { borderColor: userAuth.isLoggedIn ? C.good : C.border }]}>
+          <Text style={styles.chipText}>{userAuth.isLoggedIn ? 'VAULT ACTIVE' : 'SETUP'}</Text>
         </View>
       </View>
 
       <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>Account Login Details</Text>
+        <Text style={styles.cardTitle}>Personal Profile & Default Auto-Login Data</Text>
         <Text style={styles.mutedSmall}>
-          Saves your user profile and login credentials on device so Pulse can log into apps/sites and complete tasks using your data.
+          Automatically synced with the Native Accessibility Bridge and Agentic RAG Knowledge Vault so tasks like "book Uber to my address" or "login to Flipkart" work hands-free.
         </Text>
 
         <Text style={styles.fieldLabel}>Full Name</Text>
-        <TextInput
-          value={name}
-          onChangeText={setName}
-          placeholder="Your name"
-          placeholderTextColor={C.muted}
-          style={styles.input}
-        />
+        <TextInput value={name} onChangeText={setName} placeholder="Your name" placeholderTextColor={C.muted} style={styles.input} />
 
-        <Text style={styles.fieldLabel}>Email / Username</Text>
-        <TextInput
-          value={email}
-          onChangeText={setEmail}
-          placeholder="user@example.com"
-          placeholderTextColor={C.muted}
-          autoCapitalize="none"
-          keyboardType="email-address"
-          style={styles.input}
-        />
+        <Text style={styles.fieldLabel}>Email / Default Username</Text>
+        <TextInput value={email} onChangeText={setEmail} placeholder="user@example.com" placeholderTextColor={C.muted} autoCapitalize="none" keyboardType="email-address" style={styles.input} />
 
         <Text style={styles.fieldLabel}>Phone Number (for WhatsApp, Shopping, Rides, OTP)</Text>
-        <TextInput
-          value={phone}
-          onChangeText={setPhone}
-          placeholder="10-digit mobile number"
-          placeholderTextColor={C.muted}
-          keyboardType="phone-pad"
-          style={styles.input}
-        />
+        <TextInput value={phone} onChangeText={setPhone} placeholder="10-digit mobile number" placeholderTextColor={C.muted} keyboardType="phone-pad" style={styles.input} />
 
         <Text style={styles.fieldLabel}>Default Password / PIN (for App & Web Auto-Login)</Text>
-        <TextInput
-          value={password}
-          onChangeText={setPassword}
-          placeholder="Password or PIN"
-          placeholderTextColor={C.muted}
-          secureTextEntry
-          autoCapitalize="none"
-          style={styles.input}
-        />
+        <TextInput value={password} onChangeText={setPassword} placeholder="Password or PIN" placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" style={styles.input} />
 
-        <Text style={styles.fieldLabel}>Default Address / City (for Delivery & Ride Apps)</Text>
-        <TextInput
-          value={address}
-          onChangeText={setAddress}
-          placeholder="Address or location"
-          placeholderTextColor={C.muted}
-          style={styles.input}
-        />
+        <Text style={styles.fieldLabel}>Default Delivery / Office Address (Used by RAG Agent)</Text>
+        <TextInput value={address} onChangeText={setAddress} placeholder="Full address or landmark" placeholderTextColor={C.muted} style={styles.input} />
 
-        <Text style={styles.fieldLabel}>Gemini API Key (Required for AI Tasks)</Text>
-        <TextInput
-          value={apiKey}
-          onChangeText={setApiKey}
-          placeholder="AIza..."
-          placeholderTextColor={C.muted}
-          secureTextEntry
-          autoCapitalize="none"
-          style={styles.input}
-        />
+        <Text style={styles.fieldLabel}>Gemini API Key (Required for AI & Vector RAG)</Text>
+        <TextInput value={apiKey} onChangeText={setApiKey} placeholder="AIza..." placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" style={styles.input} />
 
         <Pressable onPress={handleSaveLogin} style={styles.primaryBtn}>
-          <Text style={styles.primaryBtnText}>{userAuth.isLoggedIn ? 'Update Login Data' : 'Save & Login'}</Text>
+          <Text style={styles.primaryBtnText}>{userAuth.isLoggedIn ? 'Update & Sync Vault to RAG' : 'Save & Activate Vault'}</Text>
         </Pressable>
-
-        {userAuth.isLoggedIn ? (
-          <Pressable
-            onPress={() => {
-              saveAuth({ ...userAuth, isLoggedIn: false });
-              setStatusMsg('Logged out.');
-            }}
-            style={styles.secondaryBtn}
-          >
-            <Text style={styles.primaryBtnText}>Log Out</Text>
-          </Pressable>
-        ) : null}
 
         {statusMsg ? <Text style={{ color: C.good, fontSize: 13, marginTop: 4 }}>{statusMsg}</Text> : null}
       </View>
 
       <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>Saved App & Website Logins ({userAuth.savedLogins.length})</Text>
+        <Text style={styles.cardTitle}>Per-App & Website Credentials ({userAuth.savedLogins.length})</Text>
         <Text style={styles.mutedSmall}>
-          Add specific app credentials (e.g. Flipkart, Meesho, Instagram, Amazon). Tap "Login & Work" or say "login to Flipkart" in Chat.
+          Save specific app logins (Flipkart, Meesho, Instagram, Amazon). Tap "Login & Open" or ask in Chat.
         </Text>
 
         <Text style={styles.fieldLabel}>App or Website Name</Text>
-        <TextInput
-          value={appKey}
-          onChangeText={setAppKey}
-          placeholder="e.g. flipkart, meesho, instagram, amazon"
-          placeholderTextColor={C.muted}
-          autoCapitalize="none"
-          style={styles.input}
-        />
+        <TextInput value={appKey} onChangeText={setAppKey} placeholder="e.g. flipkart, meesho, instagram, amazon" placeholderTextColor={C.muted} autoCapitalize="none" style={styles.input} />
 
         <Text style={styles.fieldLabel}>Username / Email / Phone</Text>
-        <TextInput
-          value={appUser}
-          onChangeText={setAppUser}
-          placeholder="Username, email, or phone"
-          placeholderTextColor={C.muted}
-          autoCapitalize="none"
-          style={styles.input}
-        />
+        <TextInput value={appUser} onChangeText={setAppUser} placeholder="Username, email, or phone" placeholderTextColor={C.muted} autoCapitalize="none" style={styles.input} />
 
         <Text style={styles.fieldLabel}>Password</Text>
-        <TextInput
-          value={appPass}
-          onChangeText={setAppPass}
-          placeholder="Password"
-          placeholderTextColor={C.muted}
-          secureTextEntry
-          autoCapitalize="none"
-          style={styles.input}
-        />
+        <TextInput value={appPass} onChangeText={setAppPass} placeholder="Password" placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" style={styles.input} />
 
         <Pressable onPress={addSavedAppLogin} style={styles.secondaryBtn}>
           <Text style={styles.primaryBtnText}>+ Save App Login</Text>
@@ -1788,18 +2187,20 @@ function LoginScreen({
 }
 
 /* ------------------------------------------------------------------ */
-/* CLOUD & APPS TABS                                                   */
+/* CLOUD COMPUTER & HYBRID RAG WORKLOAD SCREEN                         */
 /* ------------------------------------------------------------------ */
 
 function CloudComputerScreen({
   settings,
   patchSettings,
+  ragIndex,
 }: {
   settings: Settings;
   patchSettings: (p: Partial<Settings>) => void;
+  ragIndex: RagChunk[];
 }) {
   const [status, setStatus] = useState<'checking' | 'online' | 'offline'>('checking');
-  const [taskType, setTaskType] = useState<'plan' | 'summarize' | 'budget' | 'echo'>('plan');
+  const [taskType, setTaskType] = useState<'plan' | 'rag_qa' | 'summarize' | 'budget'>('plan');
   const [taskInput, setTaskInput] = useState('');
   const [running, setRunning] = useState(false);
   const [output, setOutput] = useState('');
@@ -1828,28 +2229,38 @@ function CloudComputerScreen({
     setRunning(true);
     setOutput('');
     try {
-      if (status === 'online' && base) {
+      const ragCtx = buildAgenticRagContext(taskInput || taskType, ragIndex, 5);
+      if (status === 'online' && base && taskType !== 'rag_qa') {
         const payload =
           taskType === 'plan'
-            ? { summary: taskInput || 'Work sprint', checklist: ['Execute task', 'Verify output', 'Complete'], start: '09:00' }
+            ? { summary: taskInput || 'Work sprint', checklist: ['Retrieve RAG context', 'Execute OS task', 'Verify output'], start: '09:00' }
             : taskType === 'summarize'
-              ? { text: taskInput || 'Cloud workload.' }
-              : taskType === 'budget'
-                ? { income: 50000, items: [{ label: 'Server', amount: 2500 }, { label: 'API', amount: 1500 }] }
-                : { message: taskInput || 'Ping' };
+              ? { text: (taskInput || 'Cloud workload.') + '\n\n' + ragCtx.contextBlock }
+              : { income: 50000, items: [{ label: 'Server', amount: 2500 }, { label: 'API', amount: 1500 }] };
         const run = await runCloudTask(base, settings.cloudToken, settings.apiKey || undefined, taskType, payload);
         setOutput('Cloud Output:\n' + JSON.stringify(run?.result ?? run, null, 2));
       } else if (settings.apiKey) {
         const { json, model } = await geminiJson(
           settings.apiKey,
           settings.model || DEFAULT_MODEL,
-          'Execute the requested workload and return structured JSON.',
-          [{ role: 'user', parts: [{ text: 'Task: ' + taskType + '\nInput: ' + (taskInput || 'Generate task plan') }] }],
+          'Execute the requested workload using the provided Agentic RAG Knowledge and return structured JSON.',
+          [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text:
+                    `Task Type: ${taskType}\nUser Input: ${taskInput || 'Generate actionable plan'}\n\n` +
+                    (ragCtx.contextBlock || 'No specific RAG chunks matched.'),
+                },
+              ],
+            },
+          ],
           25000,
         );
-        setOutput('Hybrid Engine (' + model + '):\n' + JSON.stringify(json, null, 2));
+        setOutput(`RAG Hybrid Engine (${model} · ${ragCtx.results.length} RAG chunks used):\n` + JSON.stringify(json, null, 2));
       } else {
-        setOutput('Add your Gemini API key in LOGIN or SETTINGS.');
+        setOutput('Add your Gemini API key in LOGIN or SETTINGS to run hybrid RAG workloads.');
       }
     } catch (e: any) {
       setOutput('Error: ' + (e?.message || String(e)));
@@ -1861,10 +2272,10 @@ function CloudComputerScreen({
   return (
     <ScrollView contentContainerStyle={{ padding: 16, gap: 14, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
       <View style={styles.rowBetween}>
-        <Text style={styles.sectionTitle}>Cloud Computer</Text>
+        <Text style={styles.sectionTitle}>Cloud & Hybrid RAG Compute</Text>
         <View style={styles.chip}>
           <Text style={styles.chipText}>
-            {status === 'online' ? 'Remote Online' : status === 'checking' ? 'Checking...' : 'Local Engine'}
+            {status === 'online' ? 'Remote Online' : status === 'checking' ? 'Checking...' : 'Local RAG Engine'}
           </Text>
         </View>
       </View>
@@ -1879,17 +2290,17 @@ function CloudComputerScreen({
         </Pressable>
       </View>
       <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>Run Task</Text>
+        <Text style={styles.cardTitle}>Run RAG-Augmented Workload</Text>
         <View style={styles.segment}>
-          {(['plan', 'summarize', 'budget', 'echo'] as const).map((t) => (
+          {(['plan', 'rag_qa', 'summarize', 'budget'] as const).map((t) => (
             <Pressable key={t} onPress={() => setTaskType(t)} style={[styles.segItem, taskType === t && styles.segItemOn]}>
-              <Text style={[styles.segText, taskType === t && styles.segTextOn]}>{t === 'summarize' ? 'SUMMARY' : t.toUpperCase()}</Text>
+              <Text style={[styles.segText, taskType === t && styles.segTextOn]}>{t.toUpperCase()}</Text>
             </Pressable>
           ))}
         </View>
-        <TextInput value={taskInput} onChangeText={setTaskInput} placeholder="Enter task input..." placeholderTextColor={C.muted} multiline style={[styles.input, { minHeight: 70, marginTop: 8 }]} />
+        <TextInput value={taskInput} onChangeText={setTaskInput} placeholder="Enter task goal or question for RAG + Cloud..." placeholderTextColor={C.muted} multiline style={[styles.input, { minHeight: 70, marginTop: 8 }]} />
         <Pressable onPress={executeTask} disabled={running} style={styles.primaryBtn}>
-          {running ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Execute Task</Text>}
+          {running ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Execute Workload</Text>}
         </Pressable>
         {output ? (
           <View style={{ marginTop: 10, padding: 12, borderRadius: 6, backgroundColor: C.bg, borderWidth: 1, borderColor: C.border }}>
@@ -1901,21 +2312,59 @@ function CloudComputerScreen({
   );
 }
 
-function AppsScreen({ userAuth }: { userAuth: UserAuthData }) {
+/* ------------------------------------------------------------------ */
+/* APPS & SYSTEM HARDWARE CONTROL CENTER SCREEN                        */
+/* ------------------------------------------------------------------ */
+
+function AppsScreen({
+  userAuth,
+  ragIndex,
+}: {
+  userAuth: UserAuthData;
+  ragIndex: RagChunk[];
+}) {
   const [text, setText] = useState('');
   const [to, setTo] = useState(userAuth.phone || '');
   const [last, setLast] = useState('');
   const [installedApps, setInstalledApps] = useState<{ label: string; packageName: string }[]>([]);
+  const [deviceInfo, setDeviceInfo] = useState<any>(null);
+  const [torchOn, setTorchOn] = useState(false);
+
+  const refreshTelemetry = useCallback(async () => {
+    if (Platform.OS !== 'android' || !HarkBridge) return;
+    try {
+      if (HarkBridge.getDeviceStatus) {
+        const st = await HarkBridge.getDeviceStatus();
+        setDeviceInfo(st);
+        if (typeof st?.torchOn === 'boolean') setTorchOn(st.torchOn);
+      }
+      if (HarkBridge.getInstalledApps) {
+        const list = await HarkBridge.getInstalledApps();
+        if (Array.isArray(list)) setInstalledApps(list);
+      }
+    } catch {}
+  }, []);
 
   useEffect(() => {
-    if (Platform.OS === 'android' && HarkBridge?.getInstalledApps) {
-      HarkBridge.getInstalledApps()
-        .then((list: any) => {
-          if (Array.isArray(list)) setInstalledApps(list);
-        })
-        .catch(() => undefined);
+    refreshTelemetry();
+  }, [refreshTelemetry]);
+
+  const fillFromRag = () => {
+    if (!text.trim()) {
+      if (userAuth.address) {
+        setText(userAuth.address);
+        setLast(`Filled saved address from RAG Vault: "${userAuth.address}"`);
+      }
+      return;
     }
-  }, []);
+    const ctx = buildAgenticRagContext(text, ragIndex, 2);
+    if (ctx.resolvedHintQuery) {
+      setText(ctx.resolvedHintQuery);
+      setLast(`Resolved via RAG: "${ctx.resolvedHintQuery}"`);
+    } else if (ctx.results[0]) {
+      setLast(`Top RAG match (${ctx.results[0].score}%): ${ctx.results[0].chunk.title}`);
+    }
+  };
 
   const launch = async (idOrPkg: string) => {
     const cleanQ = text.trim();
@@ -1926,40 +2375,126 @@ function AppsScreen({ userAuth }: { userAuth: UserAuthData }) {
     setLast(res.statusMessage);
   };
 
+  const toggleFlashlight = async () => {
+    if (Platform.OS !== 'android' || !HarkBridge?.toggleTorch) return;
+    const next = !torchOn;
+    const ok = await HarkBridge.toggleTorch(next);
+    if (ok) {
+      setTorchOn(next);
+      setLast(`Flashlight turned ${next ? 'ON' : 'OFF'}.`);
+    }
+  };
+
+  const setDeviceVol = async (pct: number) => {
+    if (Platform.OS !== 'android' || !HarkBridge?.setVolume) return;
+    await HarkBridge.setVolume(pct);
+    setLast(`Media volume set to ${pct}%.`);
+    refreshTelemetry();
+  };
+
+  const triggerGlobal = async (act: string) => {
+    if (Platform.OS !== 'android' || !HarkBridge?.globalAction) return;
+    const ok = await HarkBridge.globalAction(act);
+    setLast(ok ? `Triggered global ${act.toUpperCase()}.` : `Enable Accessibility Bridge to use ${act.toUpperCase()}.`);
+  };
+
   return (
-    <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
+    <ScrollView contentContainerStyle={{ padding: 16, gap: 14, paddingBottom: 44 }} keyboardShouldPersistTaps="handled">
       <View style={styles.rowBetween}>
-        <Text style={styles.sectionTitle}>Apps & Direct Actions</Text>
+        <Text style={styles.sectionTitle}>Apps & System Controls</Text>
         <Pressable onPress={() => openAppWithStatus('accessibility')} style={styles.chip}>
-          <Text style={styles.chipText}>Accessibility Bridge</Text>
+          <Text style={styles.chipText}>
+            {deviceInfo?.accessibilityEnabled ? 'Bridge: ON' : 'Enable Bridge'}
+          </Text>
         </Pressable>
       </View>
-      <Text style={[styles.mutedSmall, { marginTop: 4 }]}>
-        Enter a search term, product to order, video to play, or message, then tap an app to open and execute it.
-      </Text>
-      <TextInput
-        value={text}
-        onChangeText={setText}
-        placeholder="Search query, product to buy, video to play, or message..."
-        placeholderTextColor={C.muted}
-        style={[styles.input, { marginTop: 10 }]}
-      />
-      <TextInput
-        value={to}
-        onChangeText={setTo}
-        placeholder="Phone number or @username (for WhatsApp, Telegram, Call, SMS)"
-        placeholderTextColor={C.muted}
-        keyboardType="default"
-        style={[styles.input, { marginTop: 8 }]}
-      />
-      {last ? (
-        <View style={[styles.settingsCard, { marginTop: 10 }]}>
-          <Text style={styles.bubbleText}>{last}</Text>
+
+      {/* Hardware & System Quick Controls */}
+      <View style={styles.settingsCard}>
+        <View style={styles.rowBetween}>
+          <Text style={styles.cardTitle}>OS Hardware & Global Controls</Text>
+          <Pressable onPress={refreshTelemetry} style={styles.chip}>
+            <Text style={styles.chipText}>
+              {deviceInfo?.batteryPct > 0 ? `🔋 ${deviceInfo.batteryPct}%` : 'Refresh'}
+            </Text>
+          </Pressable>
         </View>
-      ) : null}
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+          <Pressable
+            onPress={toggleFlashlight}
+            style={[styles.chip, torchOn && { borderColor: C.warn, backgroundColor: '#3B2506' }]}
+          >
+            <Text style={styles.chipText}>{torchOn ? '🔦 Torch: ON' : '🔦 Torch: OFF'}</Text>
+          </Pressable>
+          {[0, 40, 75, 100].map((v) => (
+            <Pressable key={v} onPress={() => setDeviceVol(v)} style={styles.chip}>
+              <Text style={styles.chipText}>🔊 {v}%</Text>
+            </Pressable>
+          ))}
+          <Pressable
+            onPress={() => HarkBridge?.vibrate?.(120)}
+            style={styles.chip}
+          >
+            <Text style={styles.chipText}>📳 Haptic</Text>
+          </Pressable>
+        </View>
+
+        <Text style={styles.fieldLabel}>Global Navigation & System Panels</Text>
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
+          {(['back', 'home', 'recents', 'notifications', 'quick_settings'] as const).map((g) => (
+            <Pressable key={g} onPress={() => triggerGlobal(g)} style={styles.chip}>
+              <Text style={styles.chipText}>{g.replace('_', ' ').toUpperCase()}</Text>
+            </Pressable>
+          ))}
+          {(['wifi', 'bluetooth', 'display', 'sound'] as const).map((p) => (
+            <Pressable
+              key={p}
+              onPress={() => HarkBridge?.openSystemSettings?.(p)}
+              style={[styles.chip, { borderColor: C.accent }]}
+            >
+              <Text style={styles.chipText}>⚙️ {p.toUpperCase()}</Text>
+            </Pressable>
+          ))}
+        </View>
+      </View>
+
+      {/* Direct App Action Launcher */}
+      <View style={styles.settingsCard}>
+        <View style={styles.rowBetween}>
+          <Text style={styles.cardTitle}>Direct App Workflow Launcher</Text>
+          <Pressable onPress={fillFromRag} style={[styles.chip, { borderColor: C.rag }]}>
+            <Text style={[styles.chipText, { color: '#5EEAD4' }]}>⚡ Resolve via RAG</Text>
+          </Pressable>
+        </View>
+        <Text style={styles.mutedSmall}>
+          Enter a search query, product to buy, video to play, or message, then tap an app below to launch & automate it.
+        </Text>
+        <TextInput
+          value={text}
+          onChangeText={setText}
+          placeholder="Search query, product to buy, video to play, or message..."
+          placeholderTextColor={C.muted}
+          style={styles.input}
+        />
+        <TextInput
+          value={to}
+          onChangeText={setTo}
+          placeholder="Phone number or @username (for WhatsApp, Telegram, Call, SMS)"
+          placeholderTextColor={C.muted}
+          keyboardType="default"
+          style={styles.input}
+        />
+        {last ? (
+          <View style={{ padding: 10, borderRadius: 6, backgroundColor: C.bg, borderWidth: 1, borderColor: C.accent }}>
+            <Text style={styles.bubbleText}>{last}</Text>
+          </View>
+        ) : null}
+      </View>
+
       <View style={styles.appGrid}>
         {APPS.map((a) => (
           <Pressable key={a.id} onPress={() => launch(a.id)} style={styles.appTile} accessibilityLabel={'Open ' + a.name}>
+            <Text style={{ fontSize: 18 }}>{a.icon}</Text>
             <Text style={styles.appName} numberOfLines={1}>{a.name}</Text>
             <Text style={[styles.mutedSmall, { fontSize: 10 }]} numberOfLines={1}>{a.hint}</Text>
           </Pressable>
@@ -1967,8 +2502,8 @@ function AppsScreen({ userAuth }: { userAuth: UserAuthData }) {
       </View>
 
       {installedApps.length > 0 ? (
-        <View style={{ marginTop: 20 }}>
-          <Text style={styles.sectionTitle}>Installed Device Apps ({installedApps.length})</Text>
+        <View style={{ marginTop: 12 }}>
+          <Text style={styles.sectionTitle}>All Installed Device Apps ({installedApps.length})</Text>
           <View style={styles.appGrid}>
             {installedApps.map((item) => (
               <Pressable
@@ -1986,7 +2521,7 @@ function AppsScreen({ userAuth }: { userAuth: UserAuthData }) {
   );
 }
 
-/* ---- Cloud backend ---- */
+/* ---- Cloud backend helpers ---- */
 
 function normalizeCloudUrl(raw: string): string {
   let s = raw.trim().replace(/\s+/g, '');
@@ -2129,12 +2664,8 @@ function mailtoUrl(subject: string, body: string) {
   return 'mailto:?subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(body);
 }
 
-function smsUrl(body: string) {
-  return 'sms:?body=' + encodeURIComponent(body);
-}
-
 /* ------------------------------------------------------------------ */
-/* Multimodal Picker HTML (Plain UI)                                   */
+/* Multimodal Picker HTML                                              */
 /* ------------------------------------------------------------------ */
 
 const MULTIMODAL_PICKER_HTML = `<!DOCTYPE html>
@@ -2143,26 +2674,26 @@ const MULTIMODAL_PICKER_HTML = `<!DOCTYPE html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
 <style>
-  body { background: #1C1C1C; color: #F0F0F0; font-family: system-ui, sans-serif; margin: 0; padding: 16px; }
+  body { background: #131A26; color: #F3F6FA; font-family: system-ui, sans-serif; margin: 0; padding: 16px; }
   h3 { margin: 0 0 6px 0; font-size: 16px; color: #fff; }
-  p { margin: 0 0 12px 0; font-size: 12px; color: #9E9E9E; }
+  p { margin: 0 0 12px 0; font-size: 12px; color: #94A3B8; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
-  .btn { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 12px 8px; border-radius: 6px; background: #252525; border: 1px solid #383838; color: #F0F0F0; font-weight: 600; font-size: 13px; cursor: pointer; text-align: center; gap: 4px; }
-  .box { background: #252525; border: 1px solid #383838; border-radius: 6px; padding: 12px; margin-top: 8px; }
-  input[type="url"], input[type="text"] { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 6px; border: 1px solid #383838; background: #121212; color: #fff; font-size: 14px; margin-top: 6px; }
+  .btn { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 12px 8px; border-radius: 6px; background: #1B2434; border: 1px solid #2A364B; color: #F3F6FA; font-weight: 600; font-size: 13px; cursor: pointer; text-align: center; gap: 4px; }
+  .box { background: #1B2434; border: 1px solid #2A364B; border-radius: 6px; padding: 12px; margin-top: 8px; }
+  input[type="url"], input[type="text"] { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 6px; border: 1px solid #2A364B; background: #0B0F17; color: #fff; font-size: 14px; margin-top: 6px; }
   .act { width: 100%; margin-top: 8px; padding: 10px; border-radius: 6px; border: none; background: #2563EB; color: #fff; font-weight: 600; font-size: 14px; cursor: pointer; }
-  .status { margin-top: 8px; font-size: 12px; color: #9E9E9E; text-align: center; }
+  .status { margin-top: 8px; font-size: 12px; color: #94A3B8; text-align: center; }
   input[type="file"] { display: none; }
 </style>
 </head>
 <body>
-  <h3>Attach File or Link</h3>
-  <p>Select a file or paste a video link for analysis.</p>
+  <h3>Attach File or Link (Auto-Indexes into RAG)</h3>
+  <p>Select an image, PDF, document, or video link for analysis and RAG indexing.</p>
   <div class="grid">
-    <label class="btn" for="imgInput"><span>Photo / Image</span></label>
-    <label class="btn" for="camInput"><span>Camera</span></label>
-    <label class="btn" for="docInput"><span>Document / PDF</span></label>
-    <label class="btn" for="vidInput"><span>Video File</span></label>
+    <label class="btn" for="imgInput"><span>📷 Photo / Image</span></label>
+    <label class="btn" for="camInput"><span>📸 Camera</span></label>
+    <label class="btn" for="docInput"><span>📄 Document / PDF</span></label>
+    <label class="btn" for="vidInput"><span>🎬 Video File</span></label>
   </div>
   <input id="imgInput" type="file" accept="image/*" />
   <input id="camInput" type="file" accept="image/*" capture="environment" />
@@ -2171,7 +2702,7 @@ const MULTIMODAL_PICKER_HTML = `<!DOCTYPE html>
   <div class="box">
     <div style="font-size:13px;font-weight:600;">YouTube / Video URL</div>
     <input id="ytUrl" type="url" placeholder="https://www.youtube.com/watch?v=..." />
-    <button class="act" id="ytBtn">Attach Link</button>
+    <button class="act" id="ytBtn">Attach Video Link</button>
   </div>
   <div id="status" class="status"></div>
 <script>
@@ -2212,7 +2743,7 @@ const MULTIMODAL_PICKER_HTML = `<!DOCTYPE html>
 </html>`;
 
 /* ------------------------------------------------------------------ */
-/* Settings model (Voice OFF by default — silent execution)            */
+/* Settings model                                                      */
 /* ------------------------------------------------------------------ */
 
 const STORAGE_SETTINGS = 'pulseos.settings.v2';
@@ -2224,6 +2755,8 @@ type Settings = {
   avatar: string;
   profilePhotoUri?: string;
   selfLearn?: boolean;
+  ragEnabled: boolean;
+  autoIndexAttachments: boolean;
   focusGoalMin: number;
   personalize: boolean;
   apiKey: string;
@@ -2256,6 +2789,8 @@ const DEFAULT_SETTINGS: Settings = {
   avatar: 'P',
   profilePhotoUri: '',
   selfLearn: true,
+  ragEnabled: true,
+  autoIndexAttachments: true,
   focusGoalMin: 480,
   personalize: true,
   apiKey: '',
@@ -2286,14 +2821,15 @@ async function loadSettings(): Promise<Settings> {
     try {
       const saved: any = JSON.parse(raw);
       const merged: Settings = { ...DEFAULT_SETTINGS, ...saved };
-      if (!saved.rev || saved.rev < 5) {
+      if (!saved.rev || saved.rev < 6) {
         merged.speed = 'fast';
         merged.fastModel = FAST_MODEL;
         merged.model = DEFAULT_MODEL;
         merged.cloudMode = false;
-        merged.voiceOn = false;
+        merged.ragEnabled = true;
+        merged.autoIndexAttachments = true;
         if (!merged.cloudUrl) merged.cloudUrl = DEFAULT_CLOUD_URL;
-        merged.rev = 5;
+        merged.rev = 6;
         await AsyncStorage.setItem(STORAGE_SETTINGS, JSON.stringify(merged));
       }
       return merged;
@@ -2315,7 +2851,7 @@ async function loadSettings(): Promise<Settings> {
     cloudUrl: cu || DEFAULT_CLOUD_URL,
     cloudToken: ct || '',
     cloudMode: false,
-    rev: 5,
+    rev: 6,
   };
   await AsyncStorage.setItem(STORAGE_SETTINGS, JSON.stringify(s));
   return s;
@@ -2438,23 +2974,43 @@ export default function App() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const settingsRef = useRef<Settings>(DEFAULT_SETTINGS);
   const [userAuth, setUserAuth] = useState<UserAuthData>(DEFAULT_USER_AUTH);
+  const [ragIndex, setRagIndex] = useState<RagChunk[]>(DEFAULT_RAG_PLAYBOOKS);
   const [authLoaded, setAuthLoaded] = useState(false);
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  const [bridgeActive, setBridgeActive] = useState<boolean>(false);
+  const [externalCommand, setExternalCommand] = useState<string>('');
+
+  const checkBridgeState = useCallback(async () => {
+    if (Platform.OS !== 'android' || !HarkBridge?.isAccessibilityEnabled) return;
+    try {
+      const en = await HarkBridge.isAccessibilityEnabled();
+      setBridgeActive(!!en);
+    } catch {
+      setBridgeActive(false);
+    }
+  }, []);
 
   useEffect(() => {
     Speech.stop();
-    Promise.all([loadSettings(), loadUserAuth()]).then(([s, auth]) => {
+    Promise.all([loadSettings(), loadUserAuth(), loadRagIndex()]).then(async ([s, auth, loadedRag]) => {
       settingsRef.current = s;
       setSettings(s);
       setUserAuth(auth);
+      const syncedRag = await syncUserVaultToRag(auth).catch(() => loadedRag);
+      setRagIndex(syncedRag);
       setAuthLoaded(true);
+      checkBridgeState();
       if (s.autoCheckUpdates) {
         checkForUpdate(DEFAULT_UPDATE_REPO, s.updateToken)
           .then((u) => setUpdate(u.available ? u : null))
           .catch(() => undefined);
       }
     });
-  }, []);
+    const sub = AppState.addEventListener('change', (st) => {
+      if (st === 'active') checkBridgeState();
+    });
+    return () => sub.remove();
+  }, [checkBridgeState]);
 
   const patchSettings = useCallback((patch: Partial<Settings>) => {
     const next = { ...settingsRef.current, ...patch };
@@ -2465,7 +3021,14 @@ export default function App() {
 
   const updateAuth = useCallback((next: UserAuthData) => {
     setUserAuth(next);
-    saveUserAuth(next).catch(() => undefined);
+    saveUserAuth(next)
+      .then((updatedRag) => setRagIndex(updatedRag))
+      .catch(() => undefined);
+  }, []);
+
+  const triggerAgentTaskFromAnywhere = useCallback((cmd: string) => {
+    setExternalCommand(cmd);
+    setTab('CHAT');
   }, []);
 
   if (!settings || !authLoaded) {
@@ -2476,13 +3039,13 @@ export default function App() {
     );
   }
 
-  // First-time Login Gate: if user has not logged in yet, show the plain Login & Setup screen
+  // First-time Login Gate
   if (!userAuth.isLoggedIn) {
     return (
       <SafeAreaView style={styles.root}>
         <StatusBar style="light" backgroundColor={C.bg} />
         <View style={styles.header}>
-          <Text style={styles.brand}>Pulse OS</Text>
+          <Text style={styles.brand}>Pulse OS 4.0 · Agentic RAG</Text>
           <Pressable
             onPress={() => updateAuth({ ...userAuth, isLoggedIn: true })}
             style={styles.chip}
@@ -2503,11 +3066,12 @@ export default function App() {
 
   const tabs: { id: Tab; label: string }[] = [
     { id: 'CHAT', label: 'CHAT' },
+    { id: 'RAG', label: 'RAG AI' },
     { id: 'APPS', label: 'APPS' },
-    { id: 'LOGIN', label: 'LOGIN' },
+    { id: 'LOGIN', label: 'VAULT' },
+    { id: 'LIVE', label: 'STUDIO' },
     { id: 'CLOUD', label: 'CLOUD' },
-    { id: 'LIVE', label: 'BROWSER' },
-    { id: 'SETTINGS', label: 'SETTINGS' },
+    { id: 'SETTINGS', label: 'SETUP' },
   ];
 
   const displayUser = userAuth.name.trim() || settings.name.trim();
@@ -2516,21 +3080,48 @@ export default function App() {
     <SafeAreaView style={styles.root}>
       <StatusBar style="light" backgroundColor={C.bg} />
       <View style={styles.header}>
-        <View>
-          <Text style={styles.brand}>Pulse OS</Text>
-          <Text style={styles.brandSub}>
-            {displayUser ? `User: ${displayUser}` : 'Ready'}
+        <View style={{ flexShrink: 1 }}>
+          <Text style={styles.brand}>Pulse OS 4.0</Text>
+          <Text style={styles.brandSub} numberOfLines={1}>
+            {displayUser ? `${displayUser} · ` : ''}RAG ({ragIndex.length})
           </Text>
         </View>
         <View style={styles.rowCenter}>
-          <Pressable onPress={() => setTab('LOGIN')} style={styles.chip}>
-            <Text style={styles.chipText}>{displayUser ? 'Account' : 'Login'}</Text>
+          <Pressable
+            onPress={() => setTab('RAG')}
+            style={[styles.chip, { borderColor: C.rag }]}
+          >
+            <Text style={[styles.chipText, { color: '#5EEAD4' }]}>RAG: {ragIndex.length}</Text>
           </Pressable>
-          <Pressable onPress={() => openAppWithStatus('accessibility')} style={styles.chip}>
-            <Text style={styles.chipText}>Bridge</Text>
+          <Pressable
+            onPress={() => openAppWithStatus('accessibility')}
+            style={[
+              styles.chip,
+              { borderColor: bridgeActive ? C.good : C.warn },
+            ]}
+          >
+            <Text
+              style={[
+                styles.chipText,
+                { color: bridgeActive ? '#4ADE80' : '#FBBF24' },
+              ]}
+            >
+              {bridgeActive ? 'Bridge: ON' : 'Bridge: OFF'}
+            </Text>
           </Pressable>
         </View>
       </View>
+
+      {!bridgeActive && Platform.OS === 'android' ? (
+        <Pressable
+          onPress={() => openAppWithStatus('accessibility')}
+          style={[styles.updateBanner, { borderBottomColor: C.warn }]}
+        >
+          <Text style={[styles.updateBannerText, { color: '#FBBF24' }]}>
+            ⚠️ Accessibility Bridge is OFF. Tap here to enable "Pulse OS Assistive Bridge" so app search & clicks work!
+          </Text>
+        </Pressable>
+      ) : null}
 
       {update && tab !== 'SETTINGS' ? (
         <Pressable onPress={() => setTab('SETTINGS')} style={styles.updateBanner}>
@@ -2545,12 +3136,24 @@ export default function App() {
           <ChatScreen
             settings={settings}
             userAuth={userAuth}
+            ragIndex={ragIndex}
+            setRagIndex={setRagIndex}
+            externalCommand={externalCommand}
+            clearExternalCommand={() => setExternalCommand('')}
             patchSettings={patchSettings}
             openSettings={() => setTab('SETTINGS')}
           />
         </View>
+        <View style={[styles.fill, tab !== 'RAG' && styles.hidden]}>
+          <RagKnowledgeScreen
+            ragIndex={ragIndex}
+            setRagIndex={setRagIndex}
+            apiKey={settings.apiKey}
+            onRunAgentWithQuery={triggerAgentTaskFromAnywhere}
+          />
+        </View>
         <View style={[styles.fill, tab !== 'APPS' && styles.hidden]}>
-          <AppsScreen userAuth={userAuth} />
+          <AppsScreen userAuth={userAuth} ragIndex={ragIndex} />
         </View>
         <View style={[styles.fill, tab !== 'LOGIN' && styles.hidden]}>
           <LoginScreen
@@ -2560,20 +3163,27 @@ export default function App() {
             patchSettings={patchSettings}
           />
         </View>
-        <View style={[styles.fill, tab !== 'CLOUD' && styles.hidden]}>
-          <CloudComputerScreen settings={settings} patchSettings={patchSettings} />
-        </View>
         <View
           style={[styles.fill, tab !== 'LIVE' && styles.offscreen]}
           pointerEvents={tab === 'LIVE' ? 'auto' : 'none'}
           importantForAccessibility={tab === 'LIVE' ? 'auto' : 'no-hide-descendants'}
         >
-          <WorkspaceScreen homeUrl={settings.homeUrl} confirmFirst={settings.confirmBeforeComplete} />
+          <WorkspaceScreen
+            homeUrl={settings.homeUrl}
+            ragIndex={ragIndex}
+            setRagIndex={setRagIndex}
+            apiKey={settings.apiKey}
+            onRunRoutine={triggerAgentTaskFromAnywhere}
+          />
+        </View>
+        <View style={[styles.fill, tab !== 'CLOUD' && styles.hidden]}>
+          <CloudComputerScreen settings={settings} patchSettings={patchSettings} ragIndex={ragIndex} />
         </View>
         <View style={[styles.fill, tab !== 'SETTINGS' && styles.hidden]}>
           <SettingsScreen
             settings={settings}
             patchSettings={patchSettings}
+            ragIndex={ragIndex}
             update={update}
             setUpdate={setUpdate}
           />
@@ -2598,17 +3208,25 @@ export default function App() {
 }
 
 /* ------------------------------------------------------------------ */
-/* CHAT (Direct Task Execution + Attachments + Silent Operation)       */
+/* CHAT SCREEN (Agentic RAG + Direct Execution + Rich Interactive UI)  */
 /* ------------------------------------------------------------------ */
 
 function ChatScreen({
   settings,
   userAuth,
+  ragIndex,
+  setRagIndex,
+  externalCommand,
+  clearExternalCommand,
   patchSettings,
   openSettings,
 }: {
   settings: Settings;
   userAuth: UserAuthData;
+  ragIndex: RagChunk[];
+  setRagIndex: (next: RagChunk[]) => void;
+  externalCommand: string;
+  clearExternalCommand: () => void;
   patchSettings: (p: Partial<Settings>) => void;
   openSettings: () => void;
 }) {
@@ -2618,6 +3236,8 @@ function ChatScreen({
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [listening, setListening] = useState(false);
+  const [handsFree, setHandsFree] = useState(false);
+  const handsFreeRef = useRef(false);
   const [attachModal, setAttachModal] = useState(false);
   const [pendingAttachment, setPendingAttachment] = useState<AttachmentItem | null>(null);
   const [smartMemory, setSmartMemory] = useState<string[]>([]);
@@ -2652,8 +3272,20 @@ function ChatScreen({
           (res.status === 'verified' || res.status === 'needs_confirmation' || res.status === 'error')
         ) {
           lastPolledAutomationTs.current = res.ts;
-          const badge = res.cartVerified ? '[Done]' : '[Status]';
-          const statusLine = `${badge} ${res.message || res.cartSummary || ''}`;
+          const badge = res.cartVerified ? '[Verified]' : '[OS Status]';
+          const stepTrace = Array.isArray(res.stepLogs) && res.stepLogs.length
+            ? `\nSteps: ${res.stepLogs.join(' -> ')}`
+            : '';
+          const statusLine = `${badge} ${res.message || res.cartSummary || ''}${stepTrace}`;
+          if (res.screenDump && String(res.screenDump).trim().length > 20) {
+            ingestDocumentIntoRag(
+              `Auto Screen Capture: ${res.cartSummary || res.message || 'App Workflow'}`,
+              String(res.screenDump),
+              'screen_dump',
+            )
+              .then(setRagIndex)
+              .catch(() => undefined);
+          }
           setMessages((prev) => {
             if (!prev.length) return prev;
             const copy = [...prev];
@@ -2661,7 +3293,7 @@ function ChatScreen({
               if (copy[i].role === 'assistant') {
                 copy[i] = {
                   ...copy[i],
-                  text: copy[i].text.includes(statusLine) ? copy[i].text : `${copy[i].text}\n\n${statusLine}`,
+                  text: copy[i].text.includes(res.message || '__none__') ? copy[i].text : `${copy[i].text}\n\n${statusLine}`,
                   verificationShotUri: res.screenshot || copy[i].verificationShotUri,
                   verificationSummary: res.cartSummary || res.message,
                 };
@@ -2676,12 +3308,12 @@ function ChatScreen({
     const sub = AppState.addEventListener('change', (state) => {
       if (state === 'active') checkResult();
     });
-    const timer = setInterval(checkResult, 2500);
+    const timer = setInterval(checkResult, 2000);
     return () => {
       sub.remove();
       clearInterval(timer);
     };
-  }, []);
+  }, [setRagIndex]);
 
   const checkCloud = useCallback(async (base: string) => {
     if (!base) {
@@ -2848,8 +3480,16 @@ function ChatScreen({
             kind: 'video_link',
             textContent: videoCtx,
           });
+          if (settings.autoIndexAttachments && videoCtx.trim()) {
+            ingestDocumentIntoRag(`Video: ${d.name || d.uri}`, videoCtx, 'web_clip', {
+              sourceUrl: String(d.uri),
+              apiKey: apiKey || undefined,
+            })
+              .then(setRagIndex)
+              .catch(() => undefined);
+          }
         } else {
-          setPendingAttachment({
+          const item: AttachmentItem = {
             uri: String(d.uri || ''),
             name: String(d.name || 'Attachment'),
             mimeType: String(d.mimeType || 'application/octet-stream'),
@@ -2857,7 +3497,15 @@ function ChatScreen({
             base64: d.base64 ? String(d.base64) : undefined,
             textContent: d.textContent ? String(d.textContent) : undefined,
             sizeBytes: Number(d.sizeBytes) || 0,
-          });
+          };
+          setPendingAttachment(item);
+          if (settings.autoIndexAttachments && item.textContent) {
+            ingestDocumentIntoRag(`File: ${item.name}`, item.textContent, 'document', {
+              apiKey: apiKey || undefined,
+            })
+              .then(setRagIndex)
+              .catch(() => undefined);
+          }
         }
       }
     } catch {
@@ -2866,14 +3514,23 @@ function ChatScreen({
   };
 
   useEffect(() => {
+    if (externalCommand && !busy) {
+      const cmd = externalCommand;
+      clearExternalCommand();
+      setInput(cmd);
+      pendingVoiceAutoSendRef.current = cmd;
+    }
+  }, [externalCommand, busy, clearExternalCommand]);
+
+  useEffect(() => {
     if (pendingVoiceAutoSendRef.current && input === pendingVoiceAutoSendRef.current && !busy) {
       pendingVoiceAutoSendRef.current = '';
       send();
     }
   });
 
-  const send = async () => {
-    const rawInput = input.trim();
+  const send = async (overrideText?: string) => {
+    const rawInput = (overrideText ?? input).trim();
     const attached = pendingAttachment;
     if (!rawInput && !attached) return;
     if (busy) return;
@@ -2892,10 +3549,19 @@ function ChatScreen({
       .map((m) => (m.role === 'user' ? 'User: ' : 'Pulse: ') + m.text.slice(0, 300))
       .join('\n');
 
-    // 1. ALWAYS try direct native app execution FIRST (even before checking API key!)
-    // This guarantees app opening, searching, ordering, playing videos, and logging in ALWAYS execute on the device and NEVER return fake plain text.
+    // Stage 1: Retrieve Agentic RAG Knowledge for this command
+    const ragCtx = settings.ragEnabled ? buildAgenticRagContext(text, ragIndex, 5) : { results: [], contextBlock: '' };
+    const ragCitations: RagCitation[] = ragCtx.results.map((r) => ({
+      id: r.chunk.id,
+      title: r.chunk.title,
+      category: r.chunk.category,
+      score: r.score,
+      snippet: r.chunk.content.slice(0, 140),
+    }));
+
+    // Stage 2: Try RAG-Grounded Direct Native Device Execution FIRST
     if (!attached && mode !== 'chat') {
-      const directExec = await tryDirectDeviceExecution(rawInput, recentContext, userAuth);
+      const directExec = await tryDirectDeviceExecution(rawInput, userAuth, ragIndex);
       if (directExec.handled) {
         setInput('');
         const userMsg: ChatMessage = { id: uid(), role: 'user', text: rawInput, ts: Date.now() };
@@ -2903,16 +3569,34 @@ function ChatScreen({
           id: uid(),
           role: 'assistant',
           text: directExec.statusMessage,
+          ragCitations: directExec.ragCitations,
           reply: {
             direct_response: directExec.statusMessage,
-            proactive_checklist: [],
+            proactive_checklist: [
+              directExec.appName ? `Verify ${directExec.appName} screen state` : 'Verify device state',
+              'Capture screen verification in STUDIO -> OS Bridge',
+            ],
             one_line_summary: directExec.statusMessage,
-            source_verified: 'Verified',
+            source_verified: 'Executed with Agentic RAG',
+            rag_citations: directExec.ragCitations,
           },
+          steps: [
+            { label: `RAG Retrieved (${directExec.ragCitations?.length || 0} chunks)`, status: 'done', startedAt: Date.now() - 120, ms: 60 },
+            { label: directExec.statusMessage.slice(0, 65), status: 'done', startedAt: Date.now() - 60, ms: 60 },
+          ],
           source: 'device',
           ts: Date.now(),
         };
         setMessages((prev) => [...prev, userMsg, botMsg]);
+        // Index completed agentic action into RAG task_memory
+        ingestDocumentIntoRag(
+          `Completed Task: ${rawInput.slice(0, 45)}`,
+          `User Command: "${rawInput}" -> Result: ${directExec.statusMessage}`,
+          'task_memory',
+          { appTag: directExec.appName?.toLowerCase() },
+        )
+          .then(setRagIndex)
+          .catch(() => undefined);
         return;
       }
     }
@@ -2934,7 +3618,11 @@ function ChatScreen({
     const botId = uid();
     let steps: Step[] = [
       {
-        label: attached ? `Reading ${attached.name.slice(0, 28)}` : 'Processing request',
+        label: ragCitations.length
+          ? `RAG Retrieved ${ragCitations.length} chunks (top: ${ragCitations[0].score}%)`
+          : attached
+            ? `Reading ${attached.name.slice(0, 28)}`
+            : 'Processing request',
         status: 'active',
         startedAt: Date.now(),
       },
@@ -2954,7 +3642,16 @@ function ChatScreen({
 
     setMessages([
       ...next,
-      { id: botId, role: 'assistant', text: '', source: 'device', streaming: true, steps: [...steps], ts: Date.now() },
+      {
+        id: botId,
+        role: 'assistant',
+        text: '',
+        ragCitations,
+        source: 'device',
+        streaming: true,
+        steps: [...steps],
+        ts: Date.now(),
+      },
     ]);
     setInput('');
     setPendingAttachment(null);
@@ -2962,8 +3659,13 @@ function ChatScreen({
 
     let verifiedSourceContext = '';
     if (/https?:\/\//i.test(text)) {
-      step('Checking source link');
+      step('Checking & indexing source link into RAG');
       verifiedSourceContext = await quickVerifyUrlsInText(text);
+      if (verifiedSourceContext.trim()) {
+        ingestDocumentIntoRag(`Link Context: ${text.slice(0, 40)}`, verifiedSourceContext, 'web_clip')
+          .then(setRagIndex)
+          .catch(() => undefined);
+      }
     }
 
     const ctx = [profileContext(settings, userAuth), verifiedSourceContext].filter(Boolean).join('\n\n');
@@ -2979,7 +3681,9 @@ function ChatScreen({
           model: agentModel,
           goal: text,
           context: [recentContext, ctx].filter(Boolean).join('\n\n'),
+          ragContextBlock: ragCtx.contextBlock,
           userAuth,
+          ragIndex,
           onStep: (label) => {
             step(label);
             AgentBus.step(label);
@@ -2991,7 +3695,14 @@ function ChatScreen({
           id: botId,
           role: 'assistant',
           text: answer,
-          reply: { direct_response: answer, proactive_checklist: [], one_line_summary: answer.slice(0, 100), source_verified: 'Verified' },
+          ragCitations,
+          reply: {
+            direct_response: answer,
+            proactive_checklist: ['Open STUDIO -> OS Bridge to inspect screen nodes', 'Save workflow to Routines'],
+            one_line_summary: answer.slice(0, 100),
+            source_verified: 'Verified with Agentic RAG',
+            rag_citations: ragCitations,
+          },
           source: 'device',
           streaming: false,
           steps: [...steps],
@@ -3015,9 +3726,16 @@ function ChatScreen({
       let result: { reply: PulseReply; modelUsed: string } | null = null;
       let source: 'cloud' | 'device' = 'device';
       if (useCloud) {
-        step('Running on cloud server');
+        step('Running on cloud server with RAG');
         try {
-          result = await callCloudChat(cloudUrl, cloudToken, keyForCloud(), next, ctx, smartMemory);
+          result = await callCloudChat(
+            cloudUrl,
+            cloudToken,
+            keyForCloud(),
+            next,
+            [ctx, ragCtx.contextBlock].filter(Boolean).join('\n\n'),
+            smartMemory,
+          );
           source = 'cloud';
           setCloudStatus('online');
         } catch (cloudErr: any) {
@@ -3028,7 +3746,7 @@ function ChatScreen({
       }
       if (!result) {
         const useModel = model || FAST_MODEL;
-        step('Running ' + modelLabel(useModel));
+        step('Running ' + modelLabel(useModel) + (ragCitations.length ? ' + RAG' : ''));
         let writing = false;
         let lastUi = 0;
         result = await streamGemini(
@@ -3037,12 +3755,13 @@ function ChatScreen({
           next,
           ctx,
           smartMemory,
+          ragCtx.contextBlock,
           settings.temperature,
           settings.speed,
           (visible) => {
             if (!writing && visible.trim()) {
               writing = true;
-              step('Generating response');
+              step('Generating RAG-grounded response');
             }
             const now = Date.now();
             if (now - lastUi >= 45) {
@@ -3053,17 +3772,26 @@ function ChatScreen({
         );
       }
       const { reply } = result;
+      reply.rag_citations = ragCitations;
+
       if (reply.memory_facts && reply.memory_facts.length) {
         saveSmartMemoryFacts(reply.memory_facts).then(setSmartMemory).catch(() => undefined);
+        ingestDocumentIntoRag(
+          `Learned Memory (${new Date().toLocaleDateString()})`,
+          reply.memory_facts.join('\n'),
+          'task_memory',
+        )
+          .then(setRagIndex)
+          .catch(() => undefined);
       }
 
-      // If the LLM returned an automation_script, execute it on the device so it actually does the work!
+      // Execute any returned automation_script on the device!
       let execLogText = '';
       if (reply.automation_script && reply.automation_script.length > 0) {
-        step('Executing device actions');
+        step('Executing device automation script');
         const execRes = await executeOsAutomationScript(reply.automation_script, (msg) => step(msg));
         if (execRes.log.length > 0) {
-          execLogText = '\n\nExecuted:\n- ' + execRes.log.join('\n- ');
+          execLogText = '\n\nExecuted on Device:\n• ' + execRes.log.join('\n• ');
         }
       }
 
@@ -3075,6 +3803,7 @@ function ChatScreen({
         role: 'assistant',
         text: finalText,
         reply,
+        ragCitations,
         source,
         streaming: false,
         steps: [...steps],
@@ -3082,6 +3811,19 @@ function ChatScreen({
       };
       setMessages((prev) => (prev.some((m) => m.id === botId) ? prev.map((m) => (m.id === botId ? botMsg : m)) : [...prev, botMsg]));
       refreshSummary(convoId, [...next, botMsg]);
+
+      if (settings.voiceOn && finalText) {
+        Speech.speak(finalText.slice(0, 450), {
+          language: settings.voiceLang || 'en-IN',
+          rate: settings.voiceRate || 1.0,
+          pitch: settings.voicePitch || 1.0,
+          onDone: () => {
+            if (handsFreeRef.current) startVoiceInput();
+          },
+        });
+      } else if (handsFreeRef.current) {
+        setTimeout(() => startVoiceInput(), 600);
+      }
     } catch (e: any) {
       setMessages((prev) => [
         ...prev.filter((m) => m.id !== botId),
@@ -3100,51 +3842,69 @@ function ChatScreen({
     );
   }
 
+  const quickCommands = [
+    { label: '⚡ Blinkit Milk', cmd: 'open blinkit and order milk' },
+    { label: '▶️ YouTube Telugu', cmd: 'open youtube and play telugu hit songs' },
+    { label: '🛒 Flipkart Shoes', cmd: 'open flipkart and search running shoes' },
+    { label: '🚕 Uber to Address', cmd: 'open uber and book a ride to my address' },
+    { label: '🔐 Auto-Login', cmd: 'login to instagram' },
+  ];
+
   return (
     <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
       <View style={styles.chatToolbar}>
         <Pressable onPress={() => setDrawer(true)} style={styles.chip} accessibilityLabel="Open chats">
-          <Text style={styles.chipText}>Chats</Text>
+          <Text style={styles.chipText}>☰ Chats</Text>
         </Pressable>
         <Pressable onPress={() => setModelPicker(true)} style={[styles.chip, { flexShrink: 1 }]} accessibilityLabel="Choose model">
           <Text style={styles.chipText} numberOfLines={1}>
             {!apiKey && cloudMode && cloudUrl ? 'Cloud' : modelLabel(model || FAST_MODEL)}
           </Text>
         </Pressable>
-        {smartMemory.length > 0 ? (
-          <Pressable
-            onPress={() =>
-              Alert.alert(
-                'Context Memory',
-                smartMemory.map((m, i) => `${i + 1}. ${m}`).join('\n'),
-                [
-                  { text: 'Close', style: 'cancel' },
-                  {
-                    text: 'Clear',
-                    style: 'destructive',
-                    onPress: () => {
-                      AsyncStorage.removeItem(STORAGE_SMART_MEMORY);
-                      setSmartMemory([]);
-                    },
-                  },
-                ],
-              )
-            }
-            style={styles.chip}
-          >
-            <Text style={styles.chipText}>Memory ({smartMemory.length})</Text>
-          </Pressable>
-        ) : null}
+        <Pressable
+          onPress={() => patchSettings({ ragEnabled: !settings.ragEnabled })}
+          style={[styles.chip, settings.ragEnabled && { borderColor: C.rag, backgroundColor: '#112E2B' }]}
+        >
+          <Text style={[styles.chipText, settings.ragEnabled && { color: '#5EEAD4' }]}>
+            RAG: {settings.ragEnabled ? 'ON' : 'OFF'}
+          </Text>
+        </Pressable>
         <View style={{ flex: 1 }} />
         <Pressable
           onPress={() => setMode((m) => (m === 'auto' ? 'agent' : m === 'agent' ? 'chat' : 'auto'))}
           style={[styles.chip, mode === 'agent' && { borderColor: C.accent }]}
         >
-          <Text style={styles.chipText}>Mode: {mode.toUpperCase()}</Text>
+          <Text style={styles.chipText}>{mode.toUpperCase()}</Text>
+        </Pressable>
+        <Pressable
+          onPress={() => {
+            const nextHf = !handsFree;
+            setHandsFree(nextHf);
+            handsFreeRef.current = nextHf;
+            if (nextHf) startVoiceInput();
+          }}
+          style={[styles.chip, handsFree && { borderColor: C.good }]}
+        >
+          <Text style={styles.chipText}>{handsFree ? '🎙️ Loop ON' : '🎙️ Loop'}</Text>
         </Pressable>
         <Pressable onPress={newChat} style={styles.chip}>
-          <Text style={styles.chipText}>New</Text>
+          <Text style={styles.chipText}>+ New</Text>
         </Pressable>
+      </View>
+
+      {/* Quick Action Command Strip */}
+      <View style={{ borderBottomWidth: 1, borderBottomColor: C.border, backgroundColor: C.panel }}>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 10, paddingVertical: 6, gap: 6 }}>
+          {quickCommands.map((q) => (
+            <Pressable
+              key={q.label}
+              onPress={() => send(q.cmd)}
+              style={[styles.chip, { backgroundColor: C.bg }]}
+            >
+              <Text style={[styles.chipText, { fontSize: 11 }]}>{q.label}</Text>
+            </Pressable>
+          ))}
+        </ScrollView>
       </View>
 
       <FlatList
@@ -3163,9 +3923,9 @@ function ChatScreen({
         }}
         ListEmptyComponent={
           <View style={styles.empty}>
-            <Text style={styles.emptyTitle}>Pulse OS Ready</Text>
+            <Text style={styles.emptyTitle}>Pulse OS 4.0 · Agentic RAG Ready</Text>
             <Text style={[styles.muted, { textAlign: 'center' }]}>
-              Enter a task below (e.g., "order milk on Blinkit", "play Telugu songs on YouTube", "search shoes on Flipkart", or "login to Instagram").
+              Every task is grounded in your on-device RAG Knowledge Vault ({ragIndex.length} chunks). Try: "order milk on Blinkit", "play Telugu songs on YouTube", "book Uber to my address", or attach any PDF/image/video link.
             </Text>
             {!apiKey && !(cloudMode && cloudUrl) ? (
               <Pressable onPress={openSettings} style={[styles.primaryBtn, { paddingHorizontal: 18 }]}>
@@ -3174,14 +3934,24 @@ function ChatScreen({
             ) : null}
           </View>
         }
-        renderItem={({ item }) => <MessageBubble msg={item} />}
+        renderItem={({ item }) => (
+          <MessageBubble
+            msg={item}
+            onRunCommand={(cmd) => send(cmd)}
+            onSaveToRag={async (title, content) => {
+              const updated = await ingestDocumentIntoRag(title, content, 'note', { apiKey: apiKey || undefined });
+              setRagIndex(updated);
+              Alert.alert('Saved to RAG', `Indexed "${title}" into your RAG Knowledge Vault.`);
+            }}
+          />
+        )}
       />
 
       {pendingAttachment ? (
         <View style={styles.attachmentPreviewBar}>
           <View style={{ flex: 1 }}>
             <Text style={styles.convoTitle} numberOfLines={1}>{pendingAttachment.name}</Text>
-            <Text style={styles.mutedSmall}>{pendingAttachment.kind.toUpperCase()} attached</Text>
+            <Text style={styles.mutedSmall}>{pendingAttachment.kind.toUpperCase()} attached · Auto-indexed to RAG</Text>
           </View>
           <Pressable onPress={() => setPendingAttachment(null)} style={styles.chip}>
             <Text style={styles.chipText}>Remove</Text>
@@ -3196,7 +3966,7 @@ function ChatScreen({
           style={styles.iconBtn}
           accessibilityLabel="Attach file"
         >
-          <Text style={styles.chipText}>File</Text>
+          <Text style={styles.chipText}>+ File</Text>
         </Pressable>
 
         {Platform.OS === 'android' ? (
@@ -3206,7 +3976,7 @@ function ChatScreen({
             style={[styles.iconBtn, listening && { borderColor: C.danger }]}
             accessibilityLabel="Dictate command"
           >
-            <Text style={styles.chipText}>{listening ? 'Stop' : 'Mic'}</Text>
+            <Text style={styles.chipText}>{listening ? 'Stop' : '🎙️ Mic'}</Text>
           </Pressable>
         ) : null}
 
@@ -3214,24 +3984,24 @@ function ChatScreen({
           ref={inputRef}
           value={input}
           onChangeText={setInput}
-          placeholder="Type command or question..."
+          placeholder="Type agentic command or RAG question..."
           placeholderTextColor={C.muted}
           style={styles.composerInput}
           multiline
           editable={!busy}
-          onSubmitEditing={send}
+          onSubmitEditing={() => send()}
         />
-        <Pressable onPress={send} disabled={busy} style={[styles.sendBtn, busy && { opacity: 0.6 }]}>
+        <Pressable onPress={() => send()} disabled={busy} style={[styles.sendBtn, busy && { opacity: 0.6 }]}>
           {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.sendText}>Run</Text>}
         </Pressable>
       </View>
 
-      {/* Multimodal Attachment Modal (No Animation) */}
+      {/* Multimodal Attachment Modal */}
       <Modal visible={attachModal} transparent animationType="none" onRequestClose={() => setAttachModal(false)}>
         <View style={styles.modalBackdrop}>
-          <View style={[styles.modalCard, { height: 380, padding: 0, overflow: 'hidden' }]}>
+          <View style={[styles.modalCard, { height: 390, padding: 0, overflow: 'hidden' }]}>
             <View style={[styles.rowBetween, { paddingHorizontal: 14, paddingTop: 12 }]}>
-              <Text style={styles.cardTitle}>Attach File</Text>
+              <Text style={styles.cardTitle}>Attach File or Video Link</Text>
               <Pressable onPress={() => setAttachModal(false)} style={styles.chip}>
                 <Text style={styles.chipText}>Close</Text>
               </Pressable>
@@ -3257,7 +4027,7 @@ function ChatScreen({
             <View style={styles.rowBetween}>
               <Text style={styles.cardTitle}>Chat History</Text>
               <Pressable onPress={newChat} style={styles.chip}>
-                <Text style={styles.chipText}>New</Text>
+                <Text style={styles.chipText}>+ New</Text>
               </Pressable>
             </View>
             <ScrollView style={{ marginTop: 10 }} contentContainerStyle={{ gap: 8, paddingBottom: 30 }}>
@@ -3288,7 +4058,7 @@ function ChatScreen({
       <Modal visible={modelPicker} transparent animationType="none" onRequestClose={() => setModelPicker(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setModelPicker(false)}>
           <View style={styles.modalCard}>
-            <Text style={styles.cardTitle}>Select Model</Text>
+            <Text style={styles.cardTitle}>Select Gemini Model</Text>
             {MODEL_CHOICES.map((m) => (
               <Pressable
                 key={m.id}
@@ -3309,7 +4079,21 @@ function ChatScreen({
   );
 }
 
-function MessageBubble({ msg }: { msg: ChatMessage }) {
+/* ------------------------------------------------------------------ */
+/* RICH INTERACTIVE MESSAGE BUBBLE (RAG Citations, Checklists, Actions)*/
+/* ------------------------------------------------------------------ */
+
+function MessageBubble({
+  msg,
+  onRunCommand,
+  onSaveToRag,
+}: {
+  msg: ChatMessage;
+  onRunCommand: (cmd: string) => void;
+  onSaveToRag: (title: string, content: string) => void;
+}) {
+  const [showRagDetails, setShowRagDetails] = useState(false);
+
   if (msg.role === 'user') {
     return (
       <View style={[styles.bubble, styles.userBubble]}>
@@ -3319,7 +4103,7 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
               <Image source={{ uri: msg.attachment.uri }} style={{ width: 180, height: 130, borderRadius: 6, marginBottom: 4 }} resizeMode="cover" />
             ) : null}
             <Text style={{ color: '#fff', fontSize: 12, fontWeight: '600' }}>
-              File: {msg.attachment.name}
+              📎 {msg.attachment.name}
             </Text>
           </View>
         ) : null}
@@ -3334,19 +4118,115 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
       </View>
     );
   }
+
+  const citations = msg.ragCitations || msg.reply?.rag_citations || [];
+  const checklist = msg.reply?.proactive_checklist || [];
+  const script = msg.reply?.automation_script || [];
+
   return (
-    <View style={{ marginBottom: 10 }}>
+    <View style={{ marginBottom: 12 }}>
       <View style={[styles.bubble, styles.botBubble]}>
         {msg.steps && msg.steps.length ? <StepsView steps={msg.steps} streaming={msg.streaming} /> : null}
+
+        {/* RAG Grounding Pill */}
+        {citations.length > 0 ? (
+          <View style={{ marginBottom: 8 }}>
+            <Pressable
+              onPress={() => setShowRagDetails((v) => !v)}
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                paddingHorizontal: 8,
+                paddingVertical: 5,
+                borderRadius: 5,
+                backgroundColor: '#112E2B',
+                borderWidth: 1,
+                borderColor: C.rag,
+              }}
+            >
+              <Text style={{ color: '#5EEAD4', fontSize: 11, fontWeight: '700' }}>
+                🧠 Grounded with {citations.length} RAG chunk{citations.length === 1 ? '' : 's'} (Top: {citations[0].title.slice(0, 26)} · {citations[0].score}%)
+              </Text>
+              <Text style={{ color: '#5EEAD4', fontSize: 11 }}>{showRagDetails ? 'Hide' : 'View'}</Text>
+            </Pressable>
+            {showRagDetails ? (
+              <View style={{ marginTop: 6, gap: 4, padding: 8, borderRadius: 5, backgroundColor: C.bg, borderWidth: 1, borderColor: C.border }}>
+                {citations.map((c) => (
+                  <View key={c.id} style={{ marginBottom: 4 }}>
+                    <Text style={{ color: '#5EEAD4', fontSize: 11, fontWeight: '700' }}>
+                      [{c.category.toUpperCase()}] {c.title} ({c.score}%)
+                    </Text>
+                    <Text style={{ color: C.muted, fontSize: 11 }} numberOfLines={2}>
+                      {c.snippet}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            ) : null}
+          </View>
+        ) : null}
+
+        {/* Main Response Text */}
         {msg.streaming && !msg.text && msg.steps && msg.steps.length ? null : msg.streaming && !msg.text ? (
           <Text style={styles.muted}>Working...</Text>
         ) : (
           <Text style={styles.bubbleText}>{msg.text}</Text>
         )}
+
+        {/* Re-Run Automation Script Card */}
+        {!msg.streaming && script.length > 0 ? (
+          <View style={{ marginTop: 10, padding: 10, borderRadius: 6, backgroundColor: C.bg, borderWidth: 1, borderColor: C.accent, gap: 6 }}>
+            <View style={styles.rowBetween}>
+              <Text style={{ color: C.accent2, fontSize: 12, fontWeight: '700' }}>
+                ⚡ OS Automation Script ({script.length} steps)
+              </Text>
+              <Pressable
+                onPress={() => executeOsAutomationScript(script)}
+                style={[styles.chip, { borderColor: C.accent, paddingVertical: 4 }]}
+              >
+                <Text style={styles.chipText}>▶ Re-Run on Device</Text>
+              </Pressable>
+            </View>
+            {script.map((s, idx) => (
+              <Text key={idx} style={{ color: C.muted, fontSize: 11 }}>
+                {idx + 1}. {s.action} → {s.target} {s.value ? `("${s.value}")` : ''}
+              </Text>
+            ))}
+          </View>
+        ) : null}
+
+        {/* Interactive Proactive Follow-up Checklist */}
+        {!msg.streaming && checklist.length > 0 ? (
+          <View style={{ marginTop: 10, paddingTop: 8, borderTopWidth: 1, borderTopColor: C.border, gap: 6 }}>
+            <Text style={{ color: C.muted, fontSize: 11, fontWeight: '700' }}>NEXT AGENTIC ACTIONS:</Text>
+            {checklist.map((item, idx) => (
+              <Pressable
+                key={idx}
+                onPress={() => onRunCommand(item)}
+                style={{
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  padding: 8,
+                  borderRadius: 6,
+                  backgroundColor: C.panel2,
+                  borderWidth: 1,
+                  borderColor: C.border,
+                }}
+              >
+                <Text style={{ color: C.text, fontSize: 12, flex: 1, marginRight: 8 }}>• {item}</Text>
+                <Text style={{ color: C.accent2, fontSize: 11, fontWeight: '700' }}>Run →</Text>
+              </Pressable>
+            ))}
+          </View>
+        ) : null}
+
+        {/* Screen Verification Card */}
         {msg.verificationShotUri ? (
-          <View style={{ marginTop: 8, borderRadius: 6, borderWidth: 1, borderColor: C.border, backgroundColor: C.bg, padding: 8, gap: 4 }}>
+          <View style={{ marginTop: 10, borderRadius: 6, borderWidth: 1, borderColor: C.good, backgroundColor: C.bg, padding: 8, gap: 4 }}>
             <Text style={{ color: C.good, fontSize: 12, fontWeight: '700' }}>
-              Screen Verification
+              ✓ Live Screen Verification
             </Text>
             <Image
               source={{ uri: msg.verificationShotUri }}
@@ -3358,13 +4238,56 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
             ) : null}
           </View>
         ) : null}
+
+        {/* Bubble Bottom Action Bar */}
+        {!msg.streaming && msg.text ? (
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 10, paddingTop: 8, borderTopWidth: 1, borderTopColor: C.border }}>
+            <Pressable
+              onPress={() => Speech.speak(msg.text.slice(0, 600), { language: 'en-IN' })}
+              style={[styles.chip, { paddingVertical: 4, paddingHorizontal: 8 }]}
+            >
+              <Text style={[styles.chipText, { fontSize: 11 }]}>🔊 Speak</Text>
+            </Pressable>
+            <Pressable
+              onPress={() => Speech.stop()}
+              style={[styles.chip, { paddingVertical: 4, paddingHorizontal: 8 }]}
+            >
+              <Text style={[styles.chipText, { fontSize: 11 }]}>⏹ Stop</Text>
+            </Pressable>
+            <Pressable
+              onPress={() => {
+                if (HarkBridge?.copyToClipboard) {
+                  HarkBridge.copyToClipboard(msg.text);
+                  Alert.alert('Copied', 'Response copied to clipboard.');
+                }
+              }}
+              style={[styles.chip, { paddingVertical: 4, paddingHorizontal: 8 }]}
+            >
+              <Text style={[styles.chipText, { fontSize: 11 }]}>📋 Copy</Text>
+            </Pressable>
+            <Pressable
+              onPress={() => onSaveToRag(msg.reply?.one_line_summary || msg.text.slice(0, 36), msg.text)}
+              style={[styles.chip, { paddingVertical: 4, paddingHorizontal: 8, borderColor: C.rag }]}
+            >
+              <Text style={[styles.chipText, { fontSize: 11, color: '#5EEAD4' }]}>🧠 Save to RAG</Text>
+            </Pressable>
+            {Platform.OS === 'android' && HarkBridge?.shareText ? (
+              <Pressable
+                onPress={() => HarkBridge.shareText(msg.text, 'Pulse OS Response')}
+                style={[styles.chip, { paddingVertical: 4, paddingHorizontal: 8 }]}
+              >
+                <Text style={[styles.chipText, { fontSize: 11 }]}>↗ Share</Text>
+              </Pressable>
+            ) : null}
+          </View>
+        ) : null}
       </View>
     </View>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/* WORKSPACE / BROWSER TAB (Only active when user opens BROWSER tab)  */
+/* STUDIO / LIVE WORKSPACE TAB (Browser + OS Bridge + Routines/Tools) */
 /* ------------------------------------------------------------------ */
 
 const HOME_URL = 'https://www.google.com';
@@ -3377,12 +4300,25 @@ function normalizeUrl(raw: string): string {
   return searchUrl(s);
 }
 
-function WidgetsScreen() {
+function WidgetsScreen({
+  ragIndex,
+  setRagIndex,
+  apiKey,
+  onRunRoutine,
+}: {
+  ragIndex: RagChunk[];
+  setRagIndex: (next: RagChunk[]) => void;
+  apiKey: string;
+  onRunRoutine: (cmd: string) => void;
+}) {
   const [minutes, setMinutes] = useState(60);
   const [secondsLeft, setSecondsLeft] = useState(60 * 60);
   const [running, setRunning] = useState(false);
   const [note, setNote] = useState('');
   const [savedNotes, setSavedNotes] = useState<string[]>([]);
+  const [routines, setRoutines] = useState<AgentRoutine[]>(DEFAULT_ROUTINES);
+  const [rtTitle, setRtTitle] = useState('');
+  const [rtCmd, setRtCmd] = useState('');
 
   useEffect(() => {
     AsyncStorage.getItem('pulseos.quick_notes.v1')
@@ -3390,6 +4326,14 @@ function WidgetsScreen() {
         if (raw) {
           const parsed = JSON.parse(raw);
           if (Array.isArray(parsed)) setSavedNotes(parsed);
+        }
+      })
+      .catch(() => undefined);
+    AsyncStorage.getItem(STORAGE_ROUTINES)
+      .then((raw) => {
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed) && parsed.length) setRoutines(parsed);
         }
       })
       .catch(() => undefined);
@@ -3415,13 +4359,30 @@ function WidgetsScreen() {
     setSecondsLeft(m * 60);
   };
 
-  const addNote = () => {
+  const addNote = async () => {
     const clean = note.trim();
     if (!clean) return;
-    const next = [clean, ...savedNotes].slice(0, 20);
+    const next = [clean, ...savedNotes].slice(0, 25);
     setSavedNotes(next);
     setNote('');
     AsyncStorage.setItem('pulseos.quick_notes.v1', JSON.stringify(next)).catch(() => undefined);
+    // Also index note into RAG automatically!
+    const updatedRag = await ingestDocumentIntoRag(`Quick Note: ${clean.slice(0, 32)}`, clean, 'note', {
+      apiKey: apiKey || undefined,
+    });
+    setRagIndex(updatedRag);
+  };
+
+  const addRoutine = () => {
+    if (!rtTitle.trim() || !rtCmd.trim()) return;
+    const next: AgentRoutine[] = [
+      { id: uid(), title: rtTitle.trim(), command: rtCmd.trim(), category: 'Custom' },
+      ...routines,
+    ];
+    setRoutines(next);
+    setRtTitle('');
+    setRtCmd('');
+    AsyncStorage.setItem(STORAGE_ROUTINES, JSON.stringify(next)).catch(() => undefined);
   };
 
   const mm = Math.floor(secondsLeft / 60);
@@ -3429,8 +4390,68 @@ function WidgetsScreen() {
 
   return (
     <ScrollView contentContainerStyle={{ padding: 14, gap: 12, paddingBottom: 36 }} keyboardShouldPersistTaps="handled">
+      {/* 1. Agentic RAG Routines */}
       <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>Timer</Text>
+        <Text style={styles.cardTitle}>1-Tap Agentic RAG Routines</Text>
+        <Text style={styles.mutedSmall}>
+          Tap any routine to execute it via the RAG + Accessibility Agent.
+        </Text>
+        {routines.map((rt) => (
+          <View key={rt.id} style={[styles.rowBetween, { paddingVertical: 8, borderTopWidth: 1, borderTopColor: C.border }]}>
+            <View style={{ flex: 1, marginRight: 8 }}>
+              <Text style={{ color: C.text, fontWeight: '700', fontSize: 13 }}>{rt.title}</Text>
+              <Text style={styles.mutedSmall} numberOfLines={1}>{rt.command}</Text>
+            </View>
+            <Pressable onPress={() => onRunRoutine(rt.command)} style={[styles.chip, { borderColor: C.accent }]}>
+              <Text style={styles.chipText}>▶ Run</Text>
+            </Pressable>
+          </View>
+        ))}
+        <Text style={styles.fieldLabel}>Create New Routine</Text>
+        <TextInput value={rtTitle} onChangeText={setRtTitle} placeholder="Routine Name (e.g. Order Evening Snacks)" placeholderTextColor={C.muted} style={styles.input} />
+        <TextInput value={rtCmd} onChangeText={setRtCmd} placeholder="Agent Command (e.g. open swiggy and order samosa)" placeholderTextColor={C.muted} style={styles.input} />
+        <Pressable onPress={addRoutine} style={styles.secondaryBtn}>
+          <Text style={styles.primaryBtnText}>+ Save Routine</Text>
+        </Pressable>
+      </View>
+
+      {/* 2. Quick Notes (Auto-Indexed into RAG) */}
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>RAG-Synced Quick Notes ({savedNotes.length})</Text>
+        <Text style={styles.mutedSmall}>
+          Every saved note is automatically indexed into your RAG Knowledge Vault for agentic tasks.
+        </Text>
+        <View style={{ flexDirection: 'row', gap: 8 }}>
+          <TextInput
+            value={note}
+            onChangeText={setNote}
+            placeholder="Add a note, grocery list, or reminder..."
+            placeholderTextColor={C.muted}
+            style={[styles.input, { flex: 1 }]}
+          />
+          <Pressable onPress={addNote} style={[styles.primaryBtn, { marginTop: 0, paddingHorizontal: 16, justifyContent: 'center' }]}>
+            <Text style={styles.primaryBtnText}>Save + RAG</Text>
+          </Pressable>
+        </View>
+        {savedNotes.map((n, idx) => (
+          <View key={idx} style={[styles.rowBetween, { paddingVertical: 6, borderTopWidth: 1, borderTopColor: C.border }]}>
+            <Text style={{ color: C.text, fontSize: 13, flex: 1 }}>{n}</Text>
+            <Pressable
+              onPress={() => {
+                const next = savedNotes.filter((_, i) => i !== idx);
+                setSavedNotes(next);
+                AsyncStorage.setItem('pulseos.quick_notes.v1', JSON.stringify(next)).catch(() => undefined);
+              }}
+            >
+              <Text style={{ color: C.danger, fontSize: 12, marginLeft: 8 }}>Delete</Text>
+            </Pressable>
+          </View>
+        ))}
+      </View>
+
+      {/* 3. Focus Timer */}
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>Focus Timer</Text>
         <Text style={{ color: C.text, fontSize: 28, fontWeight: '700', textAlign: 'center', marginVertical: 6 }}>
           {pad(mm)}:{pad(ss)}
         </Text>
@@ -3454,45 +4475,22 @@ function WidgetsScreen() {
           </Pressable>
         </View>
       </View>
-
-      <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>Notes</Text>
-        <View style={{ flexDirection: 'row', gap: 8 }}>
-          <TextInput
-            value={note}
-            onChangeText={setNote}
-            placeholder="Add a note..."
-            placeholderTextColor={C.muted}
-            style={[styles.input, { flex: 1 }]}
-          />
-          <Pressable onPress={addNote} style={[styles.primaryBtn, { marginTop: 0, paddingHorizontal: 16, justifyContent: 'center' }]}>
-            <Text style={styles.primaryBtnText}>Save</Text>
-          </Pressable>
-        </View>
-        {savedNotes.map((n, idx) => (
-          <View key={idx} style={[styles.rowBetween, { paddingVertical: 6, borderTopWidth: 1, borderTopColor: C.border }]}>
-            <Text style={{ color: C.text, fontSize: 13, flex: 1 }}>{n}</Text>
-            <Pressable
-              onPress={() => {
-                const next = savedNotes.filter((_, i) => i !== idx);
-                setSavedNotes(next);
-                AsyncStorage.setItem('pulseos.quick_notes.v1', JSON.stringify(next)).catch(() => undefined);
-              }}
-            >
-              <Text style={{ color: C.danger, fontSize: 12, marginLeft: 8 }}>Delete</Text>
-            </Pressable>
-          </View>
-        ))}
-      </View>
     </ScrollView>
   );
 }
 
 function WorkspaceScreen({
   homeUrl,
+  ragIndex,
+  setRagIndex,
+  apiKey,
+  onRunRoutine,
 }: {
   homeUrl: string;
-  confirmFirst: boolean;
+  ragIndex: RagChunk[];
+  setRagIndex: (next: RagChunk[]) => void;
+  apiKey: string;
+  onRunRoutine: (cmd: string) => void;
 }) {
   const home = normalizeUrl(homeUrl || HOME_URL);
   const webRef = useRef<WebView>(null);
@@ -3504,6 +4502,9 @@ function WorkspaceScreen({
   const [screenDump, setScreenDump] = useState('');
   const [osShot, setOsShot] = useState('');
   const [osStatus, setOsStatus] = useState<any>(null);
+  const [remoteClickTarget, setRemoteClickTarget] = useState('');
+  const [remoteInputText, setRemoteInputText] = useState('');
+  const [bridgeActionMsg, setBridgeActionMsg] = useState('');
   const loadingRef = useRef(false);
   const pending = useRef(new Map<string, (v: any) => void>());
   const agent = useAgentStatus();
@@ -3585,6 +4586,22 @@ function WorkspaceScreen({
     setField(u);
   };
 
+  const indexCurrentWebPageToRag = async () => {
+    const snap = await agentSnapshot();
+    if (!snap || !snap.text.trim()) {
+      Alert.alert('Browser Empty', 'Wait for the page to finish loading before indexing into RAG.');
+      return;
+    }
+    const updated = await ingestDocumentIntoRag(
+      `Browser Page: ${snap.title || hostOf(snap.url)}`,
+      `URL: ${snap.url}\nTitle: ${snap.title}\n\n${snap.text}`,
+      'web_clip',
+      { sourceUrl: snap.url, apiKey: apiKey || undefined },
+    );
+    setRagIndex(updated);
+    Alert.alert('Indexed into RAG', `Added "${snap.title || hostOf(snap.url)}" to your RAG Knowledge Vault.`);
+  };
+
   const onNav = (nav: WebViewNavigation) => {
     setCanBack(nav.canGoBack);
     setField(nav.url);
@@ -3594,12 +4611,12 @@ function WorkspaceScreen({
     <View style={{ flex: 1, backgroundColor: C.bg }}>
       <View style={{ paddingHorizontal: 12, paddingVertical: 8, backgroundColor: C.panel, borderBottomWidth: 1, borderBottomColor: C.border }}>
         <View style={styles.rowBetween}>
-          <Text style={{ color: C.text, fontWeight: '700', fontSize: 14 }}>Workspace</Text>
+          <Text style={{ color: C.text, fontWeight: '700', fontSize: 14 }}>Live Studio</Text>
           <View style={styles.segment}>
             {[
               { id: 'handoff', label: 'Browser' },
               { id: 'os_bridge', label: 'OS Bridge' },
-              { id: 'panels', label: 'Tools' },
+              { id: 'panels', label: 'Routines & Tools' },
             ].map((m) => (
               <Pressable
                 key={m.id}
@@ -3639,6 +4656,12 @@ function WorkspaceScreen({
             <Pressable onPress={() => go()} style={styles.navBtn}>
               <Text style={styles.navText}>Go</Text>
             </Pressable>
+            <Pressable
+              onPress={indexCurrentWebPageToRag}
+              style={[styles.navBtn, { borderColor: C.rag }]}
+            >
+              <Text style={[styles.navText, { color: '#5EEAD4', fontSize: 11 }]}>+ RAG</Text>
+            </Pressable>
           </View>
 
           {loading ? <View style={styles.progress} /> : null}
@@ -3677,10 +4700,10 @@ function WorkspaceScreen({
           </View>
         </View>
       ) : liveMode === 'os_bridge' ? (
-        <ScrollView contentContainerStyle={{ padding: 14, gap: 12, paddingBottom: 36 }}>
+        <ScrollView contentContainerStyle={{ padding: 14, gap: 12, paddingBottom: 36 }} keyboardShouldPersistTaps="handled">
           <View style={styles.settingsCard}>
             <View style={styles.rowBetween}>
-              <Text style={styles.cardTitle}>OS Assistive Bridge</Text>
+              <Text style={styles.cardTitle}>OS Assistive Bridge Inspector</Text>
               <Pressable onPress={refreshOsBridge} style={styles.chip}>
                 <Text style={styles.chipText}>Refresh</Text>
               </Pressable>
@@ -3688,7 +4711,15 @@ function WorkspaceScreen({
             <Text style={styles.mutedSmall}>
               Status: {osStatus?.status ? String(osStatus.status).toUpperCase() : 'IDLE'} · {osStatus?.message || 'Ready'}
             </Text>
-            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 6 }}>
+            {Array.isArray(osStatus?.stepLogs) && osStatus.stepLogs.length > 0 ? (
+              <View style={{ padding: 8, borderRadius: 6, backgroundColor: C.bg, borderWidth: 1, borderColor: C.border, gap: 2 }}>
+                <Text style={{ color: C.accent2, fontSize: 11, fontWeight: '700' }}>Recent Automation Steps:</Text>
+                {osStatus.stepLogs.map((l: string, idx: number) => (
+                  <Text key={idx} style={{ color: C.muted, fontSize: 11 }}>• {l}</Text>
+                ))}
+              </View>
+            ) : null}
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 4 }}>
               <Pressable
                 onPress={async () => {
                   if (HarkBridge?.captureScreenVerification) {
@@ -3698,12 +4729,83 @@ function WorkspaceScreen({
                 }}
                 style={styles.chip}
               >
-                <Text style={styles.chipText}>Capture Screenshot</Text>
+                <Text style={styles.chipText}>📸 Capture Screenshot</Text>
+              </Pressable>
+              <Pressable
+                onPress={async () => {
+                  if (screenDump.trim()) {
+                    const updated = await ingestDocumentIntoRag(
+                      `Screen Dump (${new Date().toLocaleTimeString()})`,
+                      screenDump,
+                      'screen_dump',
+                    );
+                    setRagIndex(updated);
+                    setBridgeActionMsg('Indexed window nodes into RAG Vault.');
+                  }
+                }}
+                style={[styles.chip, { borderColor: C.rag }]}
+              >
+                <Text style={[styles.chipText, { color: '#5EEAD4' }]}>🧠 Index Nodes to RAG</Text>
               </Pressable>
               <Pressable onPress={() => openAppWithStatus('accessibility')} style={styles.chip}>
-                <Text style={styles.chipText}>Accessibility Settings</Text>
+                <Text style={styles.chipText}>⚙️ Accessibility Settings</Text>
               </Pressable>
             </View>
+          </View>
+
+          {/* Interactive OS Remote Control */}
+          <View style={styles.settingsCard}>
+            <Text style={styles.cardTitle}>Interactive OS Action Tester</Text>
+            <View style={{ flexDirection: 'row', gap: 8 }}>
+              <TextInput
+                value={remoteClickTarget}
+                onChangeText={setRemoteClickTarget}
+                placeholder="Label/text to tap (e.g. Search, ADD)"
+                placeholderTextColor={C.muted}
+                style={[styles.input, { flex: 1 }]}
+              />
+              <Pressable
+                onPress={async () => {
+                  if (!remoteClickTarget.trim() || !HarkBridge?.clickByText) return;
+                  const ok = await HarkBridge.clickByText(remoteClickTarget.trim());
+                  setBridgeActionMsg(ok ? `Tapped "${remoteClickTarget.trim()}"` : `Could not find "${remoteClickTarget.trim()}"`);
+                }}
+                style={[styles.primaryBtn, { marginTop: 0, paddingHorizontal: 14, justifyContent: 'center' }]}
+              >
+                <Text style={styles.primaryBtnText}>Tap Text</Text>
+              </Pressable>
+            </View>
+            <View style={{ flexDirection: 'row', gap: 8 }}>
+              <TextInput
+                value={remoteInputText}
+                onChangeText={setRemoteInputText}
+                placeholder="Text to type into active input..."
+                placeholderTextColor={C.muted}
+                style={[styles.input, { flex: 1 }]}
+              />
+              <Pressable
+                onPress={async () => {
+                  if (!remoteInputText.trim() || !HarkBridge?.inputText) return;
+                  const ok = await HarkBridge.inputText(remoteClickTarget.trim() || null, remoteInputText.trim());
+                  setBridgeActionMsg(ok ? `Typed "${remoteInputText.trim()}"` : 'No editable input found.');
+                }}
+                style={[styles.primaryBtn, { marginTop: 0, paddingHorizontal: 14, justifyContent: 'center' }]}
+              >
+                <Text style={styles.primaryBtnText}>Type</Text>
+              </Pressable>
+            </View>
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
+              {(['down', 'up', 'left', 'right'] as const).map((dir) => (
+                <Pressable
+                  key={dir}
+                  onPress={() => HarkBridge?.scrollScreen?.(dir)}
+                  style={styles.chip}
+                >
+                  <Text style={styles.chipText}>Scroll {dir.toUpperCase()}</Text>
+                </Pressable>
+              ))}
+            </View>
+            {bridgeActionMsg ? <Text style={{ color: C.good, fontSize: 12 }}>{bridgeActionMsg}</Text> : null}
           </View>
 
           {osShot ? (
@@ -3714,15 +4816,20 @@ function WorkspaceScreen({
           ) : null}
 
           <View style={styles.settingsCard}>
-            <Text style={styles.cardTitle}>Window Nodes</Text>
+            <Text style={styles.cardTitle}>Live Window Nodes (Used by Agentic RAG)</Text>
             <Text style={{ color: C.text, fontFamily: Platform.OS === 'android' ? 'monospace' : 'Courier', fontSize: 11 }}>
-              {screenDump || 'No external window captured yet.'}
+              {screenDump || 'No external window captured yet. Open an app and tap Refresh.'}
             </Text>
           </View>
         </ScrollView>
       ) : (
         <View style={{ flex: 1 }}>
-          <WidgetsScreen />
+          <WidgetsScreen
+            ragIndex={ragIndex}
+            setRagIndex={setRagIndex}
+            apiKey={apiKey}
+            onRunRoutine={onRunRoutine}
+          />
         </View>
       )}
     </View>
@@ -3730,7 +4837,7 @@ function WorkspaceScreen({
 }
 
 /* ------------------------------------------------------------------ */
-/* SETTINGS                                                            */
+/* SETTINGS & SYSTEM SELF-TEST DIAGNOSTICS SCREEN                      */
 /* ------------------------------------------------------------------ */
 
 const REPLY_LENGTHS: Settings['replyLength'][] = ['short', 'balanced', 'detailed'];
@@ -3738,11 +4845,13 @@ const REPLY_LENGTHS: Settings['replyLength'][] = ['short', 'balanced', 'detailed
 function SettingsScreen({
   settings,
   patchSettings,
+  ragIndex,
   update,
   setUpdate,
 }: {
   settings: Settings;
   patchSettings: (p: Partial<Settings>) => void;
+  ragIndex: RagChunk[];
   update: UpdateInfo | null;
   setUpdate: (u: UpdateInfo | null) => void;
 }) {
@@ -3754,6 +4863,58 @@ function SettingsScreen({
   const [progress, setProgress] = useState(0);
   const [checkMsg, setCheckMsg] = useState('');
   const [checkState, setCheckState] = useState<'ok' | 'new' | 'error' | ''>('');
+  const [diagResults, setDiagResults] = useState<{ label: string; ok: boolean; detail: string }[]>([]);
+  const [runningDiag, setRunningDiag] = useState(false);
+
+  const runSystemDiagnostics = async () => {
+    setRunningDiag(true);
+    const items: { label: string; ok: boolean; detail: string }[] = [];
+    try {
+      const hasBridge = Platform.OS === 'android' && !!HarkBridge;
+      items.push({
+        label: 'Native HarkBridge Module',
+        ok: hasBridge,
+        detail: hasBridge ? 'Connected on standard React Native bridge' : 'Not available',
+      });
+
+      if (hasBridge && HarkBridge.isAccessibilityEnabled) {
+        const acc = await HarkBridge.isAccessibilityEnabled();
+        items.push({
+          label: 'Android Accessibility Service',
+          ok: !!acc,
+          detail: acc ? 'Active & ready for UI search/tap automation' : 'OFF — Tap "Open Accessibility Settings" below to enable',
+        });
+      }
+
+      if (hasBridge && HarkBridge.getInstalledApps) {
+        const apps = await HarkBridge.getInstalledApps().catch(() => []);
+        items.push({
+          label: 'Package Visibility (QUERY_ALL_PACKAGES)',
+          ok: Array.isArray(apps) && apps.length > 0,
+          detail: Array.isArray(apps) ? `${apps.length} launchable device apps detected` : '0 apps detected',
+        });
+      }
+
+      items.push({
+        label: 'Agentic RAG Knowledge Vault',
+        ok: ragIndex.length > 0,
+        detail: `${ragIndex.length} chunks indexed & ready for retrieval`,
+      });
+
+      items.push({
+        label: 'Gemini API Key Configuration',
+        ok: !!s.apiKey.trim() || (s.cloudMode && !!s.cloudUrl),
+        detail: s.apiKey.trim() ? 'API Key configured on device' : s.cloudMode ? 'Using Cloud Server' : 'Missing API Key',
+      });
+    } finally {
+      setDiagResults(items);
+      setRunningDiag(false);
+    }
+  };
+
+  useEffect(() => {
+    runSystemDiagnostics();
+  }, [ragIndex.length, s.apiKey]);
 
   const testCloud = async () => {
     const cu = normalizeCloudUrl(s.cloudUrl);
@@ -3811,21 +4972,53 @@ function SettingsScreen({
 
   return (
     <ScrollView contentContainerStyle={{ padding: 16, gap: 14, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
-      <Text style={styles.sectionTitle}>Settings</Text>
+      <Text style={styles.sectionTitle}>Setup & System Diagnostics</Text>
 
+      {/* 1. System Self-Test & Health Scorecard */}
       <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>OS Accessibility Bridge</Text>
-        <Text style={styles.mutedSmall}>
-          Enable "Pulse OS Assistive Bridge" in Android Accessibility Settings so Pulse can automate search bars, buttons, and app workflows.
-        </Text>
+        <View style={styles.rowBetween}>
+          <Text style={styles.cardTitle}>System Self-Test & Bridge Health</Text>
+          <Pressable onPress={runSystemDiagnostics} style={styles.chip}>
+            <Text style={styles.chipText}>{runningDiag ? 'Testing...' : 'Re-Test'}</Text>
+          </Pressable>
+        </View>
+        {diagResults.map((d, idx) => (
+          <View key={idx} style={[styles.rowBetween, { paddingVertical: 6, borderTopWidth: idx > 0 ? 1 : 0, borderTopColor: C.border }]}>
+            <View style={{ flex: 1, marginRight: 8 }}>
+              <Text style={{ color: C.text, fontSize: 13, fontWeight: '600' }}>{d.label}</Text>
+              <Text style={styles.mutedSmall}>{d.detail}</Text>
+            </View>
+            <Text style={{ color: d.ok ? C.good : C.warn, fontWeight: '700', fontSize: 12 }}>
+              {d.ok ? '✓ PASS' : '⚠️ ACTION'}
+            </Text>
+          </View>
+        ))}
         <Pressable onPress={() => openAppWithStatus('accessibility')} style={styles.primaryBtn}>
-          <Text style={styles.primaryBtnText}>Open Accessibility Settings</Text>
+          <Text style={styles.primaryBtnText}>Open Android Accessibility Settings</Text>
         </Pressable>
       </View>
 
+      {/* 2. Agentic RAG & Voice Settings */}
       <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>AI Assistant</Text>
-        <Text style={styles.mutedSmall}>Gemini API key (stored on device).</Text>
+        <Text style={styles.cardTitle}>Agentic RAG & Voice Preferences</Text>
+        <View style={styles.rowBetween}>
+          <Text style={{ color: C.text, fontSize: 14 }}>Enable Agentic RAG Grounding</Text>
+          <Switch value={s.ragEnabled} onValueChange={(v) => patchSettings({ ragEnabled: v })} trackColor={{ false: C.border, true: C.rag }} thumbColor="#fff" />
+        </View>
+        <View style={styles.rowBetween}>
+          <Text style={{ color: C.text, fontSize: 14 }}>Auto-Index Attached Files & Links into RAG</Text>
+          <Switch value={s.autoIndexAttachments} onValueChange={(v) => patchSettings({ autoIndexAttachments: v })} trackColor={{ false: C.border, true: C.rag }} thumbColor="#fff" />
+        </View>
+        <View style={styles.rowBetween}>
+          <Text style={{ color: C.text, fontSize: 14 }}>Speak AI Replies Aloud (TTS)</Text>
+          <Switch value={s.voiceOn} onValueChange={(v) => patchSettings({ voiceOn: v })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
+        </View>
+      </View>
+
+      {/* 3. Gemini API & Model Configuration */}
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>AI Assistant & Model Engine</Text>
+        <Text style={styles.mutedSmall}>Gemini API key (stored locally on device).</Text>
         <TextInput value={s.apiKey} onChangeText={(t) => patchSettings({ apiKey: t })} placeholder="AIza..." placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} style={styles.input} />
         <Text style={styles.fieldLabel}>Model</Text>
         {MODEL_CHOICES.map((m) => (
@@ -3834,6 +5027,14 @@ function SettingsScreen({
             <Text style={styles.mutedSmall}>{m.note}</Text>
           </Pressable>
         ))}
+        <Text style={styles.fieldLabel}>Speed Mode</Text>
+        <View style={styles.segment}>
+          {(['fast', 'balanced', 'smart'] as SpeedMode[]).map((sp) => (
+            <Pressable key={sp} onPress={() => patchSettings({ speed: sp })} style={[styles.segItem, s.speed === sp && styles.segItemOn]}>
+              <Text style={[styles.segText, s.speed === sp && styles.segTextOn]}>{sp.toUpperCase()}</Text>
+            </Pressable>
+          ))}
+        </View>
         <Text style={styles.fieldLabel}>Reply length</Text>
         <View style={styles.segment}>
           {REPLY_LENGTHS.map((r) => (
@@ -3844,6 +5045,7 @@ function SettingsScreen({
         </View>
       </View>
 
+      {/* 4. Cloud Server */}
       <View style={styles.settingsCard}>
         <View style={styles.rowBetween}>
           <Text style={styles.cardTitle}>Cloud Server</Text>
@@ -3853,7 +5055,7 @@ function SettingsScreen({
           {testing ? <ActivityIndicator color={C.text} /> : <Text style={styles.primaryBtnText}>Check Connection</Text>}
         </Pressable>
         <Pressable onPress={() => setCloudAdv((v) => !v)}>
-          <Text style={[styles.mutedSmall, { color: C.accent }]}>{cloudAdv ? 'Hide server details' : 'Edit server URL'}</Text>
+          <Text style={[styles.mutedSmall, { color: C.accent2 }]}>{cloudAdv ? 'Hide server details' : 'Edit server URL'}</Text>
         </Pressable>
         {cloudAdv ? (
           <>
@@ -3863,9 +5065,10 @@ function SettingsScreen({
         ) : null}
       </View>
 
+      {/* 5. In-App OTA Updates */}
       <View style={styles.settingsCard}>
         <Text style={styles.cardTitle}>App Updates</Text>
-        <Text style={styles.mutedSmall}>Version {Application.nativeApplicationVersion || '3.1.0'} (build {cur})</Text>
+        <Text style={styles.mutedSmall}>Version {Application.nativeApplicationVersion || '4.0.0'} (build {cur})</Text>
         <Pressable onPress={check} disabled={checking || installing} style={styles.primaryBtn}>
           {checking ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Check for Updates</Text>}
         </Pressable>
@@ -3892,7 +5095,7 @@ function SettingsScreen({
 }
 
 /* ------------------------------------------------------------------ */
-/* Plain, Clean Styles (No Flashy Rounded Pills or Neon Animations)    */
+/* Styles                                                              */
 /* ------------------------------------------------------------------ */
 
 const styles = StyleSheet.create({
@@ -3905,7 +5108,7 @@ const styles = StyleSheet.create({
   hidden: { display: 'none' },
   offscreen: { opacity: 0, zIndex: -1 },
   drawerWrap: { ...StyleSheet.absoluteFillObject, zIndex: 50 },
-  drawerBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.5)' },
+  drawerBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.6)' },
   drawer: {
     position: 'absolute', top: 0, bottom: 0, left: 0, width: 290, padding: 14,
     backgroundColor: C.panel, borderRightWidth: 1, borderRightColor: C.border,
@@ -3913,24 +5116,24 @@ const styles = StyleSheet.create({
   convoItem: { padding: 10, borderRadius: 6, backgroundColor: C.panel2, borderWidth: 1, borderColor: C.border, gap: 4 },
   convoItemOn: { borderColor: C.accent },
   convoTitle: { color: C.text, fontWeight: '600', fontSize: 14, flexShrink: 1, marginRight: 8 },
-  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.65)', justifyContent: 'center', padding: 16 },
-  modalCard: { backgroundColor: C.panel, borderRadius: 6, padding: 14, gap: 8, borderWidth: 1, borderColor: C.border },
+  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'center', padding: 16 },
+  modalCard: { backgroundColor: C.panel, borderRadius: 8, padding: 14, gap: 8, borderWidth: 1, borderColor: C.border },
   modelRow: { padding: 10, borderRadius: 6, backgroundColor: C.panel2, borderWidth: 1, borderColor: C.border, gap: 2 },
-  appGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 12 },
+  appGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 8 },
   appTile: {
     width: '31%', flexGrow: 0, alignItems: 'center', paddingVertical: 12, paddingHorizontal: 6, borderRadius: 6,
-    backgroundColor: C.panel, borderWidth: 1, borderColor: C.border, gap: 2,
+    backgroundColor: C.panel, borderWidth: 1, borderColor: C.border, gap: 3,
   },
-  appName: { color: C.text, fontSize: 13, fontWeight: '600' },
+  appName: { color: C.text, fontSize: 12, fontWeight: '600' },
   agentStrip: {
     flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 8, gap: 8,
     backgroundColor: C.panel, borderBottomWidth: 1, borderBottomColor: C.border,
   },
   liveTitle: { color: C.text, fontWeight: '600', fontSize: 13 },
-  stepsBox: { marginBottom: 6, paddingBottom: 6, borderBottomWidth: 1, borderBottomColor: C.border },
-  stepsHead: { color: C.muted, fontSize: 12, fontWeight: '600' },
+  stepsBox: { marginBottom: 8, paddingBottom: 6, borderBottomWidth: 1, borderBottomColor: C.border },
+  stepsHead: { color: C.accent2, fontSize: 12, fontWeight: '700' },
   stepRow: { flexDirection: 'row', alignItems: 'center', marginTop: 4 },
-  stepIcon: { width: 14, color: C.good, fontWeight: '700', textAlign: 'center' },
+  stepIcon: { width: 14, color: C.good, fontWeight: '700', textAlign: 'center', fontSize: 11 },
   stepText: { flex: 1, color: C.muted, fontSize: 12, marginLeft: 4 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: C.bg },
 
@@ -3938,14 +5141,14 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     paddingVertical: 10,
     backgroundColor: C.panel,
     borderBottomWidth: 1,
     borderBottomColor: C.border,
   },
-  brand: { color: C.text, fontSize: 17, fontWeight: '700' },
-  brandSub: { color: C.muted, fontSize: 12 },
+  brand: { color: C.text, fontSize: 16, fontWeight: '700' },
+  brandSub: { color: C.muted, fontSize: 11 },
 
   tabBar: {
     flexDirection: 'row',
@@ -3953,9 +5156,9 @@ const styles = StyleSheet.create({
     borderTopColor: C.border,
     backgroundColor: C.panel,
   },
-  tabItem: { flex: 1, alignItems: 'center', paddingVertical: 12 },
+  tabItem: { flex: 1, alignItems: 'center', paddingVertical: 11 },
   tabItemActive: { borderTopWidth: 2, borderTopColor: C.accent, backgroundColor: C.panel2 },
-  tabLabel: { color: C.muted, fontSize: 11, fontWeight: '600' },
+  tabLabel: { color: C.muted, fontSize: 10, fontWeight: '600' },
   tabLabelActive: { color: C.text, fontWeight: '700' },
 
   muted: { color: C.muted, fontSize: 13 },
@@ -3974,14 +5177,14 @@ const styles = StyleSheet.create({
     backgroundColor: C.panel,
   },
   chip: {
-    paddingHorizontal: 10,
+    paddingHorizontal: 9,
     paddingVertical: 6,
     borderRadius: 6,
     backgroundColor: C.panel2,
     borderWidth: 1,
     borderColor: C.border,
   },
-  chipText: { color: C.text, fontSize: 12, fontWeight: '600' },
+  chipText: { color: C.text, fontSize: 11, fontWeight: '600' },
 
   input: {
     color: C.text,
@@ -4012,7 +5215,7 @@ const styles = StyleSheet.create({
   },
   rowBetween: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   rowCenter: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  settingsCard: { backgroundColor: C.panel, borderRadius: 6, borderWidth: 1, borderColor: C.border, padding: 14, gap: 8 },
+  settingsCard: { backgroundColor: C.panel, borderRadius: 8, borderWidth: 1, borderColor: C.border, padding: 14, gap: 8 },
   cardTitle: { color: C.text, fontSize: 15, fontWeight: '700' },
   fieldLabel: { color: C.muted, fontSize: 12, fontWeight: '600', marginTop: 4 },
   segment: { flexDirection: 'row', backgroundColor: C.panel2, borderRadius: 6, padding: 2, borderWidth: 1, borderColor: C.border },
@@ -4020,18 +5223,18 @@ const styles = StyleSheet.create({
   segItemOn: { backgroundColor: C.accent },
   segText: { color: C.muted, fontWeight: '600', fontSize: 12 },
   segTextOn: { color: '#fff' },
-  updateBanner: { backgroundColor: C.panel2, borderBottomWidth: 1, borderBottomColor: C.good, paddingHorizontal: 14, paddingVertical: 8 },
-  updateBannerText: { color: C.text, fontSize: 13, fontWeight: '600' },
+  updateBanner: { backgroundColor: C.panel2, borderBottomWidth: 1, borderBottomColor: C.good, paddingHorizontal: 12, paddingVertical: 8 },
+  updateBannerText: { color: C.text, fontSize: 12, fontWeight: '600' },
   updateResult: { color: C.muted, fontSize: 13, fontWeight: '600', marginTop: 6, textAlign: 'center' },
   updateBox: { marginTop: 8, padding: 12, borderRadius: 6, backgroundColor: C.panel2, borderWidth: 1, borderColor: C.good },
   updateHead: { color: C.text, fontWeight: '700', fontSize: 14 },
   progressTrack: { height: 6, borderRadius: 3, backgroundColor: C.border, marginTop: 8, overflow: 'hidden' },
   progressFill: { height: 6, backgroundColor: C.good },
 
-  empty: { padding: 24, alignItems: 'center', gap: 10, marginTop: 32 },
+  empty: { padding: 24, alignItems: 'center', gap: 10, marginTop: 28 },
   emptyTitle: { color: C.text, fontSize: 16, fontWeight: '700' },
 
-  bubble: { maxWidth: '92%', borderRadius: 6, paddingHorizontal: 12, paddingVertical: 10, marginBottom: 4, borderWidth: 1 },
+  bubble: { maxWidth: '94%', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 10, marginBottom: 4, borderWidth: 1 },
   userBubble: { alignSelf: 'flex-end', backgroundColor: C.accent, borderColor: C.accent },
   botBubble: { alignSelf: 'flex-start', backgroundColor: C.panel, borderColor: C.border },
   errorBubble: { alignSelf: 'flex-start', backgroundColor: '#2A1215', borderColor: C.danger },
@@ -4047,7 +5250,7 @@ const styles = StyleSheet.create({
     borderRadius: 6,
     backgroundColor: C.panel,
     borderWidth: 1,
-    borderColor: C.border,
+    borderColor: C.rag,
   },
 
   composer: {
@@ -4061,7 +5264,7 @@ const styles = StyleSheet.create({
   },
   iconBtn: {
     height: 40,
-    paddingHorizontal: 12,
+    paddingHorizontal: 10,
     borderRadius: 6,
     backgroundColor: C.panel2,
     borderWidth: 1,
@@ -4113,6 +5316,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  navText: { color: C.text, fontSize: 13, fontWeight: '600' },
+  navText: { color: C.text, fontSize: 12, fontWeight: '600' },
   progress: { height: 2, backgroundColor: C.accent },
 });
