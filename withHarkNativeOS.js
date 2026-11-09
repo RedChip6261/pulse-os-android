@@ -1001,7 +1001,7 @@ class HarkAccessibilityService : AccessibilityService() {
                     }
                 }
             }
-            for (i in 0 until n.childCount) {
+            for (i in 0 until node.childCount) {
                 node.getChild(i)?.let { queue.add(it) }
             }
         }
@@ -1432,46 +1432,39 @@ class HarkBridgePackage : com.facebook.react.ReactPackage {
       if (fs.existsSync(wrapperPropsPath)) {
         let props = fs.readFileSync(wrapperPropsPath, "utf8");
         props = props.replace(/-all\.zip/g, "-bin.zip");
+        if (!props.includes("networkTimeout")) {
+          props = props.trimEnd() + "\nnetworkTimeout=60000\n";
+        }
         fs.writeFileSync(wrapperPropsPath, props, "utf8");
       }
 
-      // 2. Patch android/gradlew with 4-tier failover (services.gradle.org -> mirrors.cloud.tencent.com/gradle -> downloads.gradle.org -> local runner GRADLE_HOME zip -> system gradle)
+      // 2. Patch android/gradlew to pre-fetch the wrapper zip with curl retry before running exec "$JAVACMD" "$@" once
       const gradlewPath = path.join(androidRoot, "gradlew");
       if (fs.existsSync(gradlewPath)) {
         let gw = fs.readFileSync(gradlewPath, "utf8");
-        if (gw.includes('exec "$JAVACMD" "$@"') && !gw.includes("PULSE_GRADLE_RETRY")) {
-          const retryBlock = [
-            "# PULSE_GRADLE_RETRY",
-            '_PROPS="$APP_HOME/gradle/wrapper/gradle-wrapper.properties"',
-            'for _attempt in 1 2 3 4; do',
-            '  if [ "$_attempt" -eq 2 ]; then',
-            '    echo "[Pulse OS CI] Switching to Tencent Cloud Gradle CDN mirror (attempt 2/4)..."',
-            '    sed -i.bak "s|services.gradle.org/distributions|mirrors.cloud.tencent.com/gradle|g" "$_PROPS" 2>/dev/null || true',
-            '    rm -f "$_PROPS.bak"',
-            '  elif [ "$_attempt" -eq 3 ]; then',
-            '    echo "[Pulse OS CI] Switching to downloads.gradle.org mirror (attempt 3/4)..."',
-            '    sed -i.bak "s|mirrors.cloud.tencent.com/gradle|downloads.gradle.org/distributions|g" "$_PROPS" 2>/dev/null || true',
-            '    rm -f "$_PROPS.bak"',
-            '  elif [ "$_attempt" -eq 4 ] && [ -n "$GRADLE_HOME" ] && [ -d "$GRADLE_HOME" ]; then',
-            '    echo "[Pulse OS CI] Packaging pre-installed runner GRADLE_HOME ($GRADLE_HOME) for offline wrapper install (attempt 4/4)..."',
-            '    _LOCAL_ZIP="$APP_HOME/gradle/wrapper/gradle-local-bin.zip"',
-            '    (cd "$(dirname "$GRADLE_HOME")" && zip -qr "$_LOCAL_ZIP" "$(basename "$GRADLE_HOME")") 2>/dev/null || true',
-            '    if [ -s "$_LOCAL_ZIP" ]; then',
-            '      sed -i.bak "s|^distributionUrl=.*|distributionUrl=gradle-local-bin.zip|" "$_PROPS" 2>/dev/null || true',
+        if (gw.includes('exec "$JAVACMD" "$@"') && !gw.includes("PULSE_GRADLE_PREFETCH")) {
+          const prefetchBlock = [
+            "# PULSE_GRADLE_PREFETCH",
+            '_WRAPPER_DIR="$APP_HOME/gradle/wrapper"',
+            '_PROPS="$_WRAPPER_DIR/gradle-wrapper.properties"',
+            'if [ -f "$_PROPS" ] && command -v curl >/dev/null 2>&1; then',
+            '  _RAW_URL=$(grep "^distributionUrl=" "$_PROPS" | head -n 1 | cut -d= -f2- | sed "s|\\\\:|:|g" | tr -d "\\r\\n")',
+            '  _DIST_ZIP=$(basename "$_RAW_URL")',
+            '  _LOCAL_ZIP="$_WRAPPER_DIR/$_DIST_ZIP"',
+            '  if [ -n "$_RAW_URL" ] && [ -n "$_DIST_ZIP" ] && [ ! -s "$_LOCAL_ZIP" ]; then',
+            '    echo "[Pulse OS CI] Prefetching $_DIST_ZIP with curl retry..."',
+            '    if curl --ipv4 -fSL --retry 4 --retry-delay 3 --retry-all-errors --connect-timeout 15 --max-time 120 -o "$_LOCAL_ZIP.tmp" "$_RAW_URL" 2>/dev/null; then',
+            '      mv -f "$_LOCAL_ZIP.tmp" "$_LOCAL_ZIP"',
+            '      sed -i.bak "s|^distributionUrl=.*|distributionUrl=$_DIST_ZIP|" "$_PROPS" 2>/dev/null || true',
             '      rm -f "$_PROPS.bak"',
+            '    else',
+            '      rm -f "$_LOCAL_ZIP.tmp"',
             '    fi',
             '  fi',
-            '  "$JAVACMD" "$@" && exit 0',
-            '  echo "[Pulse OS CI] Gradle attempt $_attempt/4 failed, retrying in 5s..."',
-            '  sleep 5',
-            'done',
-            'if command -v gradle >/dev/null 2>&1; then',
-            '  echo "[Pulse OS CI] Falling back to pre-installed system gradle binary..."',
-            '  gradle "$@" && exit 0',
             'fi',
-            'exit 1',
+            'exec "$JAVACMD" "$@"',
           ].join("\n");
-          gw = gw.replace('exec "$JAVACMD" "$@"', retryBlock);
+          gw = gw.replace('exec "$JAVACMD" "$@"', prefetchBlock);
           fs.writeFileSync(gradlewPath, gw, "utf8");
         }
       }
