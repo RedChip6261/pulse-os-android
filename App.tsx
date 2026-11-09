@@ -350,7 +350,7 @@ function buildStreamPrompt(extraSystem: string, smartMemory: string[]): string {
     '- For documents/files: Extract key information and provide concise, practical summaries.',
     '- For video links/files: Summarize core content from transcripts/metadata and answer questions.',
     '- Automatically extract tasks, calendar events, and reminders into the metadata block at the end.',
-    '- Never write fake 'Executing now...' or 'UI Automation Sequence:' text when you are only chatting; real app actions are executed directly by the Pulse OS native engine.',
+    '- Never write fake "Executing now..." or "UI Automation Sequence:" text when you are only chatting; real app actions are executed directly by the Pulse OS native engine.',
     'Lead with the answer. Be structured, precise, and practical with no unnecessary filler.',
     'Reply in the same language the user writes in (English, Hindi, Telugu, Hinglish, etc).',
     'At the very end of your response, after your main answer, append "' +
