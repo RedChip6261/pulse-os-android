@@ -2,7 +2,7 @@
   "expo": {
     "name": "Pulse OS Max",
     "slug": "pulse-os",
-    "version": "2.2.0",
+    "version": "2.3.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "backgroundColor": "#0B0F17",
@@ -20,7 +20,7 @@
     },
     "android": {
       "package": "com.pulseos.app",
-      "versionCode": 4,
+      "versionCode": 5,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#0B0F17"

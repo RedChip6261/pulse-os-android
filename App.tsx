@@ -20,6 +20,8 @@ import {
   Vibration,
   View,
   NativeModules,
+  NativeSyntheticEvent,
+  NativeScrollEvent,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -93,7 +95,7 @@ const SYSTEM_PROMPT = [
   '}',
 ].join('\n');
 
-type Tab = 'CHAT' | 'APPS' | 'LIVE' | 'SETTINGS';
+type Tab = 'CHAT' | 'APPS' | 'CLOUD' | 'LIVE' | 'SETTINGS';
 type SpeedMode = 'fast' | 'balanced' | 'smart';
 
 type AutomationStep = {
@@ -418,8 +420,8 @@ function streamOnce(
   model: string,
   body: string,
   onText: (full: string) => void,
-  firstTokenMs = 7500,
-  totalMs = 35000,
+  firstTokenMs = 12000,
+  totalMs = 60000,
 ): Promise<{ full: string; status: number; error?: string }> {
   return new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
@@ -796,7 +798,7 @@ async function geminiJson(
   preferred: string,
   system: string,
   contents: any[],
-  timeoutMs = 15000,
+  timeoutMs = 25000,
 ): Promise<{ json: any; model: string }> {
   let lastErr = '';
   for (const m of modelChain(preferred)) {
@@ -1301,7 +1303,7 @@ async function runAgent(o: {
   const runner = AgentBus.runner();
   if (!runner) throw new Error('The live browser is not ready yet. Try again in a second.');
   const done: string[] = [];
-  for (let n = 0; n < 10; n++) {
+  for (let n = 0; n < 25; n++) {
     if (AgentBus.isStopped()) return 'Stopped. The page is still open in the LIVE tab.';
     const snap = await agentSnapshot();
     const page = snap
@@ -1318,6 +1320,21 @@ async function runAgent(o: {
     const a: any = json?.action || {};
     const thought = String(json?.thought || '').trim();
     const type = String(a.type || '');
+    if ((type === 'answer' || type === 'ask') && done.length === 0) {
+      const goalLower = o.goal.toLowerCase();
+      const matchedApp = APPS.find((ap: any) => ap.id !== 'web' && (goalLower.includes(ap.id) || goalLower.includes(ap.name.toLowerCase())));
+      if (matchedApp) {
+        o.onStep('Launching ' + matchedApp.name + ' on your phone…');
+        const ok = await openApp(matchedApp.id, { query: o.goal, text: o.goal });
+        return ok ? '✅ Opened ' + matchedApp.name + ' and started your task.' : matchedApp.name + ' is not installed on this phone.';
+      }
+      const searchTarget = searchUrl(o.goal);
+      o.onStep('Opening Live Browser for: ' + o.goal.slice(0, 40));
+      runner.navigate(searchTarget);
+      await waitForPage();
+      done.push('navigate ' + searchTarget);
+      continue;
+    }
     if (type === 'answer' || type === 'ask') {
       return String(a.text || thought || 'Done.');
     }
@@ -1431,6 +1448,124 @@ function timeAgo(ts: number) {
 /* ------------------------------------------------------------------ */
 /* APPS tab (Universal App Launcher + Installed Device Apps)           */
 /* ------------------------------------------------------------------ */
+
+
+function CloudComputerScreen({
+  settings,
+  patchSettings,
+  say,
+}: {
+  settings: Settings;
+  patchSettings: (p: Partial<Settings>) => void;
+  say: (t: string) => void;
+}) {
+  const [status, setStatus] = useState<'checking' | 'online' | 'offline'>('checking');
+  const [taskType, setTaskType] = useState<'plan' | 'summarize' | 'budget' | 'echo'>('plan');
+  const [taskInput, setTaskInput] = useState('');
+  const [running, setRunning] = useState(false);
+  const [output, setOutput] = useState('');
+  const base = normalizeCloudUrl(settings.cloudUrl || DEFAULT_CLOUD_URL);
+
+  const refreshCloud = useCallback(async () => {
+    if (!base) {
+      setStatus('offline');
+      return;
+    }
+    setStatus('checking');
+    try {
+      await cloudHealth(base);
+      setStatus('online');
+    } catch {
+      setStatus('offline');
+    }
+  }, [base]);
+
+  useEffect(() => {
+    refreshCloud();
+  }, [refreshCloud]);
+
+  const executeTask = async () => {
+    if (running) return;
+    setRunning(true);
+    setOutput('');
+    try {
+      if (status === 'online' && base) {
+        const payload =
+          taskType === 'plan'
+            ? { summary: taskInput || 'Extended testing sprint', checklist: ['Deep work block', 'Verify features', 'Ship release'], start: '09:00' }
+            : taskType === 'summarize'
+              ? { text: taskInput || 'Pulse OS cloud computer workload.' }
+              : taskType === 'budget'
+                ? { income: 50000, items: [{ label: 'Cloud Server', amount: 2500 }, { label: 'AI API', amount: 1500 }] }
+                : { message: taskInput || 'Hello Cloud Computer!' };
+        const run = await runCloudTask(base, settings.cloudToken, settings.apiKey || undefined, taskType, payload);
+        setOutput('✅ Cloud Server Output:\n' + JSON.stringify(run?.result ?? run, null, 2));
+        say('Cloud task completed.');
+      } else if (settings.apiKey) {
+        const { json, model } = await geminiJson(
+          settings.apiKey,
+          settings.model || DEFAULT_MODEL,
+          'You are the Pulse OS Cloud Computer Engine. Execute the requested cloud workload and return structured JSON.',
+          [{ role: 'user', parts: [{ text: 'Task: ' + taskType + '\nInput: ' + (taskInput || 'Generate productivity plan & system report') }] }],
+          25000,
+        );
+        setOutput('⚡ Pulse Hybrid Cloud Engine (' + model + '):\n' + JSON.stringify(json, null, 2));
+        say('Cloud computer task complete.');
+      } else {
+        setOutput('⚠️ Add your Gemini API key in Settings or wake your GitHub Codespace.');
+      }
+    } catch (e: any) {
+      setOutput('Error: ' + (e?.message || String(e)));
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <ScrollView contentContainerStyle={{ padding: 16, gap: 14, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
+      <View style={styles.rowBetween}>
+        <Text style={styles.sectionTitle}>☁️ Cloud Computer</Text>
+        <View style={[styles.chip, { borderColor: status === 'online' ? C.good : C.accent2 }]}>
+          <Text style={[styles.chipText, { color: status === 'online' ? C.good : C.accent2 }]}>
+            {status === 'online' ? '🟢 Remote Server Online' : status === 'checking' ? '⏳ Checking…' : '⚡ Hybrid Cloud Active'}
+          </Text>
+        </View>
+      </View>
+      <View style={styles.settingsCard}>
+        <View style={styles.rowBetween}>
+          <Text style={styles.cardTitle}>Cloud Routing</Text>
+          <Switch value={settings.cloudMode} onValueChange={(v) => patchSettings({ cloudMode: v })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
+        </View>
+        <Text style={styles.mutedSmall}>
+          Routes tasks to your Cloud Server when online and automatically fails over to the local Hybrid Cloud Engine so your Cloud Computer always works.
+        </Text>
+        <TextInput value={settings.cloudUrl} onChangeText={(t) => patchSettings({ cloudUrl: t })} onBlur={() => patchSettings({ cloudUrl: normalizeCloudUrl(settings.cloudUrl) })} placeholder={DEFAULT_CLOUD_URL} placeholderTextColor={C.muted} autoCapitalize="none" style={styles.input} />
+        <Pressable onPress={refreshCloud} style={styles.secondaryBtn}>
+          <Text style={styles.primaryBtnText}>↻ Ping Cloud Server</Text>
+        </Pressable>
+      </View>
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>🚀 Run Cloud Computer Task</Text>
+        <View style={styles.segment}>
+          {(['plan', 'summarize', 'budget', 'echo'] as const).map((t) => (
+            <Pressable key={t} onPress={() => setTaskType(t)} style={[styles.segItem, taskType === t && styles.segItemOn]}>
+              <Text style={[styles.segText, taskType === t && styles.segTextOn]}>{t.toUpperCase()}</Text>
+            </Pressable>
+          ))}
+        </View>
+        <TextInput value={taskInput} onChangeText={setTaskInput} placeholder="Enter goal, document text, or cloud job parameters…" placeholderTextColor={C.muted} multiline style={[styles.input, { minHeight: 70, marginTop: 8 }]} />
+        <Pressable onPress={executeTask} disabled={running} style={styles.primaryBtn}>
+          {running ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>▶ Execute on Cloud Computer</Text>}
+        </Pressable>
+        {output ? (
+          <View style={{ marginTop: 10, padding: 12, borderRadius: 10, backgroundColor: C.bg, borderWidth: 1, borderColor: C.border }}>
+            <Text style={{ color: C.text, fontSize: 12 }}>{output}</Text>
+          </View>
+        ) : null}
+      </View>
+    </ScrollView>
+  );
+}
 
 function AppsScreen({ say }: { say: (t: string) => void }) {
   const [text, setText] = useState('');
@@ -1844,6 +1979,8 @@ type Settings = {
   email: string;
   role: string;
   avatar: string;
+  profilePhotoUri?: string;
+  selfLearn?: boolean;
   focusGoalMin: number;
   personalize: boolean;
   apiKey: string;
@@ -1874,7 +2011,9 @@ const DEFAULT_SETTINGS: Settings = {
   email: '',
   role: '',
   avatar: '⚡',
-  focusGoalMin: 120,
+  profilePhotoUri: '',
+  selfLearn: true,
+  focusGoalMin: 480,
   personalize: true,
   apiKey: '',
   model: DEFAULT_MODEL,
@@ -1885,7 +2024,7 @@ const DEFAULT_SETTINGS: Settings = {
   historyLimit: 60,
   cloudUrl: DEFAULT_CLOUD_URL,
   cloudToken: '',
-  cloudMode: false,
+  cloudMode: true,
   voiceOn: true,
   voiceRate: 1.0,
   voicePitch: 1.0,
@@ -2107,6 +2246,7 @@ export default function App() {
   const tabs: { id: Tab; icon: string }[] = [
     { id: 'CHAT', icon: '💬' },
     { id: 'APPS', icon: '📱' },
+    { id: 'CLOUD', icon: '☁️' },
     { id: 'LIVE', icon: '🖥️' },
     { id: 'SETTINGS', icon: '⚙️' },
   ];
@@ -2116,8 +2256,12 @@ export default function App() {
       <StatusBar style="light" backgroundColor={C.bg} />
       <View style={styles.header}>
         <Pressable onPress={() => setTab('SETTINGS')} style={styles.rowCenter} accessibilityLabel="Open profile">
-          <View style={styles.avatarSmall}>
-            <Text style={{ fontSize: 18 }}>{settings.avatar || '⚡'}</Text>
+          <View style={[styles.avatarSmall, { overflow: 'hidden' }]}>
+            {settings.profilePhotoUri ? (
+              <Image source={{ uri: settings.profilePhotoUri }} style={{ width: 34, height: 34, borderRadius: 17 }} />
+            ) : (
+              <Text style={{ fontSize: 18 }}>{settings.avatar || '⚡'}</Text>
+            )}
           </View>
           <View>
             <Text style={styles.brand}>Pulse OS</Text>
@@ -2152,6 +2296,9 @@ export default function App() {
         </View>
         <View style={[styles.fill, tab !== 'APPS' && styles.hidden]}>
           <AppsScreen say={say} />
+        </View>
+        <View style={[styles.fill, tab !== 'CLOUD' && styles.hidden]}>
+          <CloudComputerScreen settings={settings} patchSettings={patchSettings} say={say} />
         </View>
         <View
           style={[styles.fill, tab !== 'LIVE' && styles.offscreen]}
@@ -2216,6 +2363,17 @@ function ChatScreen({
   const [cloudStatus, setCloudStatus] = useState<CloudStatus>('off');
   const [cloudHealthInfo, setCloudHealthInfo] = useState<CloudHealth | null>(null);
   const listRef = useRef<FlatList<ChatMessage>>(null);
+  const isNearBottomRef = useRef(true);
+  const userDraggingRef = useRef(false);
+  const [showScrollBottomBtn, setShowScrollBottomBtn] = useState(false);
+
+  const onChatScroll = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
+    const dist = contentSize.height - layoutMeasurement.height - contentOffset.y;
+    const near = dist < 90;
+    isNearBottomRef.current = near;
+    setShowScrollBottomBtn(!near && contentSize.height > layoutMeasurement.height + 120);
+  };
   const inputRef = useRef<TextInput>(null);
 
   useEffect(() => {
@@ -2741,7 +2899,15 @@ function ChatScreen({
         data={messages}
         keyExtractor={(m) => m.id}
         contentContainerStyle={{ padding: 12, paddingBottom: 20 }}
-        onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
+        onScroll={onChatScroll}
+        scrollEventThrottle={16}
+        onScrollBeginDrag={() => { userDraggingRef.current = true; }}
+        onScrollEndDrag={() => { userDraggingRef.current = false; }}
+        onContentSizeChange={() => {
+          if (isNearBottomRef.current && !userDraggingRef.current) {
+            listRef.current?.scrollToEnd({ animated: false });
+          }
+        }}
         ListEmptyComponent={
           <View style={styles.empty}>
             <Text style={styles.emptyTitle}>
@@ -2971,9 +3137,7 @@ function MessageBubble({
           {msg.source === 'cloud' ? <Text style={styles.sourceTag}>☁️ cloud</Text> : null}
         </View>
       </View>
-      {!msg.streaming && msg.reply && (msg.reply.proactive_checklist.length > 0 || msg.reply.one_line_summary) ? (
-        <ActionCard reply={msg.reply} say={say} onCloudPlan={onCloudPlan} />
-      ) : null}
+      {/* Removed EXTRACTED ACTIONS card per user request */}
     </View>
   );
 }
@@ -3351,6 +3515,7 @@ function SettingsScreen({
 }) {
   const s = settings;
   const [testing, setTesting] = useState(false);
+  const [photoModal, setPhotoModal] = useState(false);
   const [cloudAdv, setCloudAdv] = useState(false);
   const [checking, setChecking] = useState(false);
   const [installing, setInstalling] = useState(false);
@@ -3432,14 +3597,29 @@ function SettingsScreen({
         </Pressable>
       </View>
 
-      {/* Profile */}
+      {/* Profile with Custom Profile Picture Upload */}
       <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>👤 Profile</Text>
+        <Text style={styles.cardTitle}>👤 Profile & Custom Photo</Text>
         <View style={styles.profileRow}>
-          <View style={styles.avatarBig}><Text style={{ fontSize: 30 }}>{s.avatar}</Text></View>
-          <View style={{ flex: 1 }}>
+          <Pressable onPress={() => setPhotoModal(true)} style={[styles.avatarBig, { overflow: 'hidden' }]}>
+            {s.profilePhotoUri ? (
+              <Image source={{ uri: s.profilePhotoUri }} style={{ width: 60, height: 60, borderRadius: 30 }} />
+            ) : (
+              <Text style={{ fontSize: 30 }}>{s.avatar}</Text>
+            )}
+          </Pressable>
+          <View style={{ flex: 1, gap: 6 }}>
             <Text style={styles.profileName}>{s.name.trim() || 'Your name'}</Text>
-            <Text style={styles.mutedSmall}>{s.role.trim() || 'Add a role or headline'}</Text>
+            <View style={{ flexDirection: 'row', gap: 8 }}>
+              <Pressable onPress={() => setPhotoModal(true)} style={[styles.chip, { borderColor: C.accent }]}>
+                <Text style={[styles.chipText, { color: C.accent }]}>📸 Upload Profile Pic</Text>
+              </Pressable>
+              {s.profilePhotoUri ? (
+                <Pressable onPress={() => patchSettings({ profilePhotoUri: '' })} style={styles.chip}>
+                  <Text style={styles.chipText}>Reset</Text>
+                </Pressable>
+              ) : null}
+            </View>
           </View>
         </View>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingVertical: 6 }}>
@@ -3554,6 +3734,61 @@ function SettingsScreen({
           </View>
         ) : null}
       </View>
+
+      <Modal visible={photoModal} transparent animationType="slide" onRequestClose={() => setPhotoModal(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, { height: 320, padding: 0, overflow: 'hidden' }]}>
+            <View style={[styles.rowBetween, { paddingHorizontal: 14, paddingTop: 12 }]}>
+              <Text style={styles.cardTitle}>📸 Custom Profile Picture</Text>
+              <Pressable onPress={() => setPhotoModal(false)} style={styles.chip}>
+                <Text style={styles.chipText}>✕ Close</Text>
+              </Pressable>
+            </View>
+            <WebView
+              originWhitelist={['*']}
+              source={{
+                html: `<!DOCTYPE html><html><body style="background:#121826;color:#fff;font-family:sans-serif;padding:20px;text-align:center;">
+                  <p style="color:#8A94A8;font-size:13px;">Select any photo from your phone gallery or camera</p>
+                  <label for="p" style="display:block;padding:15px;background:#7C5CFF;border-radius:12px;font-weight:bold;cursor:pointer;margin-top:14px;">🖼️ Choose Photo from Gallery / Camera</label>
+                  <input id="p" type="file" accept="image/*" style="display:none" />
+                  <script>
+                    document.getElementById('p').onchange = function(e) {
+                      var f = e.target.files[0];
+                      if (!f) return;
+                      var r = new FileReader();
+                      r.onload = function(ev) {
+                        var img = new Image();
+                        img.onload = function() {
+                          var cv = document.createElement('canvas');
+                          cv.width = 240; cv.height = 240;
+                          var ctx = cv.getContext('2d');
+                          var m = Math.min(img.width, img.height);
+                          ctx.drawImage(img, (img.width-m)/2, (img.height-m)/2, m, m, 0, 0, 240, 240);
+                          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'profile_pic', uri: cv.toDataURL('image/jpeg', 0.85) }));
+                        };
+                        img.src = ev.target.result;
+                      };
+                      r.readAsDataURL(f);
+                    };
+                  </script>
+                </body></html>`
+              }}
+              javaScriptEnabled
+              allowFileAccess
+              onMessage={(e) => {
+                try {
+                  const d = JSON.parse(e.nativeEvent.data);
+                  if (d?.type === 'profile_pic' && d.uri) {
+                    patchSettings({ profilePhotoUri: String(d.uri) });
+                    setPhotoModal(false);
+                  }
+                } catch {}
+              }}
+              style={{ flex: 1, backgroundColor: C.panel }}
+            />
+          </View>
+        </View>
+      </Modal>
     </ScrollView>
   );
 }

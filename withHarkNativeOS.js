@@ -6,7 +6,7 @@ const SERVICE_NAME = '.HarkAccessibilityService';
 const SERVICE_LABEL = 'Pulse OS Assistive Bridge';
 const SERVICE_DESC_KEY = 'hark_accessibility_service_description';
 const SERVICE_DESC_VALUE =
-  'Pulse OS Assistive Screen Reader, Voice Navigation, and OS-Level App Automation (Blinkit, Uber, Meesho, WhatsApp, Instagram, Telegram, Free Fire, and all installed apps).';
+  'Pulse OS Assistive Screen Reader, Voice Navigation, and Real-Time Cross-App UI Automation (Blinkit, Uber, Meesho, WhatsApp, Instagram, Telegram, Free Fire, and all installed apps).';
 
 function withHarkAccessibilityManifest(config) {
   return withAndroidManifest(config, (config) => {
@@ -152,12 +152,12 @@ function withHarkKotlinFiles(config) {
         `<?xml version="1.0" encoding="utf-8"?>
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/${SERVICE_DESC_KEY}"
-    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewClicked|typeViewFocused|typeViewScrolled"
+    android:accessibilityEventTypes="typeAllMask"
     android:accessibilityFeedbackType="feedbackGeneric|feedbackSpoken"
     android:accessibilityFlags="flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews|flagRequestEnhancedWebAccessibility"
     android:canPerformGestures="true"
     android:canRetrieveWindowContent="true"
-    android:notificationTimeout="80" />
+    android:notificationTimeout="50" />
 `,
         'utf8',
       );
@@ -165,7 +165,7 @@ function withHarkKotlinFiles(config) {
       const kotlinDir = path.join(androidRoot, 'app/src/main/java', packagePath);
       fs.mkdirSync(kotlinDir, { recursive: true });
 
-      // 1. Write HarkAccessibilityService.kt
+      // 1. Write HarkAccessibilityService.kt with full Window Traversal, Coordinate Taps, Swipes, Text Input & Global Actions
       fs.writeFileSync(
         path.join(kotlinDir, 'HarkAccessibilityService.kt'),
         `package ${packageName}
@@ -182,6 +182,8 @@ import android.os.Handler
 import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
+import java.util.ArrayDeque
 
 class HarkAccessibilityService : AccessibilityService() {
     companion object {
@@ -231,7 +233,54 @@ class HarkAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
-    fun tapCoordinate(x: Float, y: Float, durationMs: Long = 80L): Boolean {
+    private fun getActiveRoot(): AccessibilityNodeInfo? {
+        rootInActiveWindow?.let { return it }
+        try {
+            for (w in windows) {
+                if (w.isActive || w.type == AccessibilityWindowInfo.TYPE_APPLICATION) {
+                    w.root?.let { return it }
+                }
+            }
+        } catch (_: Exception) {}
+        return null
+    }
+
+    fun dumpScreenSummary(maxNodes: Int = 90): String {
+        val root = getActiveRoot() ?: return ""
+        val pkg = root.packageName?.toString() ?: "unknown"
+        val sb = StringBuilder("ActiveAppPackage: \$pkg\\nElements:\\n")
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var count = 0
+        while (queue.isNotEmpty() && count < maxNodes) {
+            val node = queue.removeFirst()
+            if (node.isVisibleToUser) {
+                val t = node.text?.toString()?.trim()?.replace("\\n", " ").orEmpty()
+                val d = node.contentDescription?.toString()?.trim()?.replace("\\n", " ").orEmpty()
+                val id = node.viewIdResourceName?.substringAfterLast("/").orEmpty()
+                val rect = Rect()
+                node.getBoundsInScreen(rect)
+                if ((t.isNotEmpty() || d.isNotEmpty() || node.isClickable || node.isEditable) && rect.width() > 0 && rect.height() > 0) {
+                    val tag = when {
+                        node.isEditable -> "INPUT"
+                        node.isClickable -> "BTN"
+                        else -> "TXT"
+                    }
+                    val label = listOf(t, d, id).filter { it.isNotEmpty() }.joinToString(" | ").take(75)
+                    if (label.isNotEmpty() || node.isEditable) {
+                        sb.append("[\$count] \$tag (\$label) @(\${rect.centerX()},\${rect.centerY()})\\n")
+                        count++
+                    }
+                }
+            }
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { queue.add(it) }
+            }
+        }
+        return sb.toString()
+    }
+
+    fun tapCoordinate(x: Float, y: Float, durationMs: Long = 90L): Boolean {
         if (x < 0f || y < 0f) return false
         val path = Path().apply { moveTo(x, y) }
         val gesture = GestureDescription.Builder()
@@ -240,47 +289,127 @@ class HarkAccessibilityService : AccessibilityService() {
         return dispatchGesture(gesture, null, mainHandler)
     }
 
+    fun swipe(startX: Float, startY: Float, endX: Float, endY: Float, durationMs: Long = 320L): Boolean {
+        val path = Path().apply {
+            moveTo(startX, startY)
+            lineTo(endX, endY)
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, durationMs.coerceIn(100L, 1000L)))
+            .build()
+        return dispatchGesture(gesture, null, mainHandler)
+    }
+
     fun clickNodeByText(targetText: String): Boolean {
-        val root = rootInActiveWindow ?: return false
-        val nodes = root.findAccessibilityNodeInfosByText(targetText) ?: emptyList()
-        for (node in nodes) {
-            var cur: AccessibilityNodeInfo? = node
-            var depth = 0
-            while (cur != null && depth < 6) {
-                if (cur.isClickable && cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
-                cur = cur.parent
-                depth++
+        val query = targetText.trim()
+        if (query.isEmpty()) return false
+        val root = getActiveRoot() ?: return false
+
+        val fast = root.findAccessibilityNodeInfosByText(query) ?: emptyList()
+        for (node in fast) {
+            if (!node.isVisibleToUser) continue
+            if (performClickOrTap(node)) return true
+        }
+
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            if (node.isVisibleToUser) {
+                val t = node.text?.toString()?.trim().orEmpty()
+                val d = node.contentDescription?.toString()?.trim().orEmpty()
+                val id = node.viewIdResourceName?.substringAfterLast("/").orEmpty()
+                if (t.contains(query, ignoreCase = true) || d.contains(query, ignoreCase = true) || id.contains(query, ignoreCase = true)) {
+                    if (performClickOrTap(node)) return true
+                }
             }
-            val rect = Rect()
-            node.getBoundsInScreen(rect)
-            if (!rect.isEmpty && rect.centerX() > 0 && rect.centerY() > 0) {
-                return tapCoordinate(rect.centerX().toFloat(), rect.centerY().toFloat())
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { queue.add(it) }
             }
         }
         return false
     }
 
-    fun inputTextIntoNode(targetLabel: String?, textToEnter: String): Boolean {
-        val root = rootInActiveWindow ?: return false
-        val targetNode = if (!targetLabel.isNullOrBlank()) {
-            root.findAccessibilityNodeInfosByText(targetLabel)?.firstOrNull { it.isEditable }
-                ?: root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-        } else {
-            root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-        } ?: return false
+    private fun performClickOrTap(node: AccessibilityNodeInfo): Boolean {
+        var cur: AccessibilityNodeInfo? = node
+        var depth = 0
+        while (cur != null && depth < 6) {
+            if (cur.isClickable && cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+            cur = cur.parent
+            depth++
+        }
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        if (!rect.isEmpty && rect.centerX() > 0 && rect.centerY() > 0) {
+            return tapCoordinate(rect.centerX().toFloat(), rect.centerY().toFloat())
+        }
+        return false
+    }
 
+    fun inputTextIntoNode(targetLabel: String?, textToEnter: String): Boolean {
+        val root = getActiveRoot() ?: return false
+        var targetNode: AccessibilityNodeInfo? = null
+        if (!targetLabel.isNullOrBlank()) {
+            val q = targetLabel.trim()
+            val queue = ArrayDeque<AccessibilityNodeInfo>()
+            queue.add(root)
+            while (queue.isNotEmpty()) {
+                val n = queue.removeFirst()
+                if (n.isVisibleToUser && n.isEditable) {
+                    val t = n.text?.toString().orEmpty()
+                    val d = n.contentDescription?.toString().orEmpty()
+                    val h = if (Build.VERSION.SDK_INT >= 26) n.hintText?.toString().orEmpty() else ""
+                    if (t.contains(q, true) || d.contains(q, true) || h.contains(q, true)) {
+                        targetNode = n
+                        break
+                    }
+                }
+                for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+            }
+        }
+        if (targetNode == null) {
+            targetNode = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        }
+        if (targetNode == null) {
+            val queue = ArrayDeque<AccessibilityNodeInfo>()
+            queue.add(root)
+            while (queue.isNotEmpty()) {
+                val n = queue.removeFirst()
+                if (n.isVisibleToUser && n.isEditable) {
+                    targetNode = n
+                    break
+                }
+                for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+            }
+        }
+        val node = targetNode ?: return false
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        if (!rect.isEmpty) {
+            node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        }
+        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, textToEnter)
         }
-        targetNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        return targetNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+    }
+
+    fun runGlobal(action: String): Boolean {
+        return when (action.lowercase().trim()) {
+            "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
+            "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
+            "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
+            "notifications" -> performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+            else -> false
+        }
     }
 }
 `,
         'utf8',
       );
 
-      // 2. Write HarkBridgeModule.kt & HarkBridgePackage.kt for JS <-> Native OS Bridge (Voice Recognizer, All Installed Apps, Root Shell, Accessibility Taps)
+      // 2. Write HarkBridgeModule.kt & HarkBridgePackage.kt with Accessibility Status Check, Screen Dump, Swipe, Tap, Text Input & App Launching
       fs.writeFileSync(
         path.join(kotlinDir, 'HarkBridgeModule.kt'),
         `package ${packageName}
@@ -289,6 +418,7 @@ import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.provider.Settings
 import android.speech.RecognizerIntent
 import com.facebook.react.bridge.*
 import java.io.BufferedReader
@@ -305,6 +435,34 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     }
 
     override fun getName(): String = "HarkBridge"
+
+    @ReactMethod
+    fun isAccessibilityEnabled(promise: Promise) {
+        try {
+            if (HarkAccessibilityService.instance != null) {
+                promise.resolve(true)
+                return
+            }
+            val enabledServices = Settings.Secure.getString(
+                reactContext.contentResolver,
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            ) ?: ""
+            val myPkg = reactContext.packageName
+            promise.resolve(enabledServices.contains(myPkg, ignoreCase = true))
+        } catch (e: Exception) {
+            promise.resolve(HarkAccessibilityService.instance != null)
+        }
+    }
+
+    @ReactMethod
+    fun dumpScreenNodes(promise: Promise) {
+        try {
+            val dump = HarkAccessibilityService.instance?.dumpScreenSummary(90) ?: ""
+            promise.resolve(dump)
+        } catch (e: Exception) {
+            promise.resolve("")
+        }
+    }
 
     @ReactMethod
     fun startVoiceRecognition(lang: String?, promise: Promise) {
@@ -396,7 +554,6 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                 }
             }
 
-            // Search all installed launcher apps on the phone by label
             val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
                 addCategory(Intent.CATEGORY_LAUNCHER)
             }
@@ -408,7 +565,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
             }
             val matched = apps.firstOrNull { info ->
                 val label = info.loadLabel(pm)?.toString()?.lowercase() ?: ""
-                label == lower || label.contains(lower) || lower.contains(label)
+                label == lower || label.contains(lower) || (label.length > 2 && lower.contains(label))
             }
             val matchedPkg = matched?.activityInfo?.packageName
             if (!matchedPkg.isNullOrEmpty()) {
@@ -439,7 +596,6 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
             promise.resolve(true)
             return
         }
-        // Fallback to root/shell input tap if device has su
         try {
             val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", "input tap \${x.toInt()} \${y.toInt()}"))
             val code = proc.waitFor()
@@ -450,8 +606,25 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun swipeScreen(startX: Double, startY: Double, endX: Double, endY: Double, promise: Promise) {
+        val svcOk = HarkAccessibilityService.instance?.swipe(
+            startX.toFloat(),
+            startY.toFloat(),
+            endX.toFloat(),
+            endY.toFloat()
+        ) ?: false
+        promise.resolve(svcOk)
+    }
+
+    @ReactMethod
     fun inputText(targetLabel: String?, text: String, promise: Promise) {
         val ok = HarkAccessibilityService.instance?.inputTextIntoNode(targetLabel, text) ?: false
+        promise.resolve(ok)
+    }
+
+    @ReactMethod
+    fun globalAction(action: String, promise: Promise) {
+        val ok = HarkAccessibilityService.instance?.runGlobal(action) ?: false
         promise.resolve(ok)
     }
 
