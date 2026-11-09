@@ -2637,30 +2637,37 @@ ${statusLine}`,
       });
   };
 
+  const [voiceModal, setVoiceModal] = useState(false);
+  const [handsFree, setHandsFree] = useState(false);
+  const handsFreeRef = useRef(false);
+  const pendingVoiceAutoSendRef = useRef<string>('');
+
   /**
-   * Starts Native Android Voice Input (RecognizerIntent via HarkBridge, or focuses keyboard voice mic).
+   * Starts Native Android Voice Input (RecognizerIntent via HarkBridge) with Web Speech fallback & Hands-Free loop.
    */
-  const startVoiceInput = async () => {
+  const startVoiceInput = async (autoContinue: any = false) => {
+    const isAuto = autoContinue === true;
     if (busy) return;
     if (settings.haptics) Vibration.vibrate(15);
+    Speech.stop();
     if (Platform.OS === 'android' && HarkBridge?.startVoiceRecognition) {
       try {
         setListening(true);
         const spoken: string = await HarkBridge.startVoiceRecognition(settings.voiceLang || 'en-IN');
         setListening(false);
-        if (spoken && spoken.trim()) {
-          setInput((prev) => (prev ? prev + ' ' + spoken.trim() : spoken.trim()));
+        const cleanSpoken = (spoken || '').trim();
+        if (cleanSpoken) {
+          setInput(cleanSpoken);
+          pendingVoiceAutoSendRef.current = cleanSpoken;
         }
         return;
       } catch {
         setListening(false);
       }
     }
-    inputRef.current?.focus();
-    Alert.alert(
-      '🎙️ Voice Talk Ready',
-      'Speak using the microphone on your Android keyboard, or enable the Pulse OS native voice recognizer.',
-    );
+    if (!isAuto) {
+      setVoiceModal(true);
+    }
   };
 
   const onPickerMessage = async (e: WebViewMessageEvent) => {
@@ -3115,7 +3122,7 @@ ${statusLine}`,
         </Pressable>
 
         <Pressable
-          onPress={startVoiceInput}
+          onPress={() => startVoiceInput(false)}
           disabled={busy}
           style={[styles.iconBtn, listening && { borderColor: C.danger, backgroundColor: '#3B1418' }]}
           accessibilityLabel="Voice talk input"
@@ -3144,6 +3151,70 @@ ${statusLine}`,
           {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.sendText}>➤</Text>}
         </Pressable>
       </View>
+
+      {/* In-App Voice Recognizer Fallback Modal */}
+      <Modal visible={voiceModal} transparent animationType="fade" onRequestClose={() => setVoiceModal(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, { height: 300, padding: 0, overflow: 'hidden' }]}>
+            <View style={[styles.rowBetween, { paddingHorizontal: 14, paddingTop: 12 }]}>
+              <Text style={styles.cardTitle}>🎙️ Pulse OS Voice Talk</Text>
+              <Pressable onPress={() => setVoiceModal(false)} style={styles.chip}>
+                <Text style={styles.chipText}>✕ Close</Text>
+              </Pressable>
+            </View>
+            <WebView
+              originWhitelist={['*']}
+              source={{
+                html: `<!DOCTYPE html><html><body style="background:#0F1523;color:#F3F6FC;font-family:sans-serif;text-align:center;padding:24px;">
+                  <div id="st" style="font-size:15px;font-weight:700;color:#06B6D4;margin-bottom:14px;">Tap mic and speak your command</div>
+                  <button id="btn" style="width:78px;height:78px;border-radius:39px;border:none;background:#6366F1;color:#fff;font-size:32px;cursor:pointer;box-shadow:0 0 20px rgba(99,102,241,0.6);">🎙️</button>
+                  <p id="out" style="font-size:14px;color:#94A3B8;margin-top:16px;">Say "Order apples on Blinkit" or "Open Uber"</p>
+                  <script>
+                    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+                    var btn = document.getElementById("btn");
+                    var st = document.getElementById("st");
+                    var out = document.getElementById("out");
+                    if (SR) {
+                      var rec = new SR();
+                      rec.lang = "${settings.voiceLang || 'en-IN'}";
+                      rec.interimResults = true;
+                      rec.onstart = function(){ st.textContent = "🔴 Listening now... Speak clearly"; btn.style.background = "#F43F5E"; };
+                      rec.onresult = function(e){
+                        var t = "";
+                        for (var i=0; i<e.results.length; i++) t += e.results[i][0].transcript;
+                        out.textContent = t;
+                        if (e.results[e.results.length-1].isFinal) {
+                          window.ReactNativeWebView.postMessage(JSON.stringify({ type: "voice_result", text: t }));
+                        }
+                      };
+                      rec.onerror = function(e){ st.textContent = "Tap mic to try again (" + e.error + ")"; btn.style.background = "#6366F1"; };
+                      btn.onclick = function(){ try { rec.start(); } catch(err){} };
+                      setTimeout(function(){ try { rec.start(); } catch(err){} }, 300);
+                    } else {
+                      st.textContent = "Type or use keyboard microphone below:";
+                      out.innerHTML = "<input id=\"inp\" style=\"width:90%;padding:10px;border-radius:8px;border:1px solid #283552;background:#172034;color:#fff;font-size:15px;\" placeholder=\"Speak with keyboard mic...\" /><br/><button onclick=\"window.ReactNativeWebView.postMessage(JSON.stringify({type:'voice_result',text:document.getElementById('inp').value}))\" style=\"margin-top:10px;padding:10px 20px;background:#6366F1;color:#fff;border:none;border-radius:8px;font-weight:bold;\">Send Command</button>";
+                    }
+                  </script>
+                </body></html>`
+              }}
+              javaScriptEnabled
+              mediaPlaybackRequiresUserAction={false}
+              onMessage={(e) => {
+                try {
+                  const d = JSON.parse(e.nativeEvent.data);
+                  if (d?.type === 'voice_result' && d.text?.trim()) {
+                    setVoiceModal(false);
+                    const clean = String(d.text).trim();
+                    setInput(clean);
+                    pendingVoiceAutoSendRef.current = clean;
+                  }
+                } catch {}
+              }}
+              style={{ flex: 1, backgroundColor: C.panel }}
+            />
+          </View>
+        </View>
+      </Modal>
 
       {/* Multimodal Attachment Modal (Photos, Camera, Documents, Videos, YouTube Links) */}
       <Modal visible={attachModal} transparent animationType="slide" onRequestClose={() => setAttachModal(false)}>
@@ -3409,6 +3480,118 @@ function normalizeUrl(raw: string): string {
   if (/^https?:\/\//i.test(s)) return s;
   if (/^[\w-]+(\.[\w-]+)+(\/.*)?$/.test(s)) return 'https://' + s;
   return searchUrl(s);
+}
+
+function WidgetsScreen({ say }: { say: (t: string) => void }) {
+  const [minutes, setMinutes] = useState(120);
+  const [secondsLeft, setSecondsLeft] = useState(120 * 60);
+  const [running, setRunning] = useState(false);
+  const [note, setNote] = useState('');
+  const [savedNotes, setSavedNotes] = useState<string[]>([]);
+
+  useEffect(() => {
+    AsyncStorage.getItem('pulseos.quick_notes.v1')
+      .then((raw) => {
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) setSavedNotes(parsed);
+        }
+      })
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (!running) return;
+    const id = setInterval(() => {
+      setSecondsLeft((s) => {
+        if (s <= 1) {
+          setRunning(false);
+          say('Focus session complete.');
+          return 0;
+        }
+        return s - 1;
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, [running, say]);
+
+  const setPreset = (m: number) => {
+    setRunning(false);
+    setMinutes(m);
+    setSecondsLeft(m * 60);
+  };
+
+  const addNote = () => {
+    const clean = note.trim();
+    if (!clean) return;
+    const next = [clean, ...savedNotes].slice(0, 20);
+    setSavedNotes(next);
+    setNote('');
+    AsyncStorage.setItem('pulseos.quick_notes.v1', JSON.stringify(next)).catch(() => undefined);
+  };
+
+  const mm = Math.floor(secondsLeft / 60);
+  const ss = secondsLeft % 60;
+
+  return (
+    <ScrollView contentContainerStyle={{ padding: 14, gap: 12, paddingBottom: 36 }} keyboardShouldPersistTaps="handled">
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>⏱️ Extended Testing & Productivity Timer</Text>
+        <Text style={{ color: C.text, fontSize: 32, fontWeight: '800', textAlign: 'center', marginVertical: 6 }}>
+          {pad(mm)}:{pad(ss)}
+        </Text>
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, justifyContent: 'center' }}>
+          {[25, 60, 120, 240, 480, 1440].map((m) => (
+            <Pressable
+              key={m}
+              onPress={() => setPreset(m)}
+              style={[styles.chip, minutes === m && { borderColor: C.accent, backgroundColor: '#2A1F5C' }]}
+            >
+              <Text style={styles.chipText}>{m >= 60 ? `${m / 60}h` : `${m}m`}</Text>
+            </Pressable>
+          ))}
+        </View>
+        <View style={{ flexDirection: 'row', gap: 8, marginTop: 8 }}>
+          <Pressable onPress={() => setRunning((r) => !r)} style={[styles.primaryBtn, { flex: 1, marginTop: 0 }]}>
+            <Text style={styles.primaryBtnText}>{running ? '⏸ Pause' : '▶ Start Session'}</Text>
+          </Pressable>
+          <Pressable onPress={() => setPreset(minutes)} style={[styles.secondaryBtn, { flex: 0.5 }]}>
+            <Text style={styles.primaryBtnText}>Reset</Text>
+          </Pressable>
+        </View>
+      </View>
+
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>📝 Quick Scratchpad & Agent Notes</Text>
+        <View style={{ flexDirection: 'row', gap: 8 }}>
+          <TextInput
+            value={note}
+            onChangeText={setNote}
+            placeholder="Write a quick testing note or task…"
+            placeholderTextColor={C.muted}
+            style={[styles.input, { flex: 1 }]}
+          />
+          <Pressable onPress={addNote} style={[styles.primaryBtn, { marginTop: 0, paddingHorizontal: 16, justifyContent: 'center' }]}>
+            <Text style={styles.primaryBtnText}>Save</Text>
+          </Pressable>
+        </View>
+        {savedNotes.map((n, idx) => (
+          <View key={idx} style={[styles.rowBetween, { paddingVertical: 6, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: C.border }]}>
+            <Text style={{ color: C.text, fontSize: 13, flex: 1 }}>{n}</Text>
+            <Pressable
+              onPress={() => {
+                const next = savedNotes.filter((_, i) => i !== idx);
+                setSavedNotes(next);
+                AsyncStorage.setItem('pulseos.quick_notes.v1', JSON.stringify(next)).catch(() => undefined);
+              }}
+            >
+              <Text style={{ color: C.danger, fontSize: 12, marginLeft: 8 }}>✕</Text>
+            </Pressable>
+          </View>
+        ))}
+      </View>
+    </ScrollView>
+  );
 }
 
 function WorkspaceScreen({
