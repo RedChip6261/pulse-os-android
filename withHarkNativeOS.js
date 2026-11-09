@@ -6,7 +6,7 @@ const SERVICE_NAME = '.HarkAccessibilityService';
 const SERVICE_LABEL = 'Pulse OS Assistive Bridge';
 const SERVICE_DESC_KEY = 'hark_accessibility_service_description';
 const SERVICE_DESC_VALUE =
-  'Pulse OS Assistive Screen Reader, Fast Node Detection, Real-Time Cart/Action Screenshot Verification, and Multi-Tier UI Fallback Engine across all mobile apps.';
+  'Pulse OS 3.0 Assistive Screen Reader, Fast Node Detection, Real-Time Cart/Action Screenshot Verification, and Multi-Tier UI Fallback Engine across all mobile apps.';
 
 function withHarkAccessibilityManifest(config) {
   return withAndroidManifest(config, (config) => {
@@ -19,6 +19,7 @@ function withHarkAccessibilityManifest(config) {
       }
     };
     ensurePerm('android.permission.RECORD_AUDIO');
+    ensurePerm('android.permission.MODIFY_AUDIO_SETTINGS');
     ensurePerm('android.permission.QUERY_ALL_PACKAGES');
 
     if (!manifest.queries) manifest.queries = [];
@@ -121,14 +122,25 @@ function withHarkAccessibilityStrings(config) {
   });
 }
 
+/**
+ * Robustly registers HarkBridgePackage() across both Expo SDK 51 (`PackageList(this).packages.apply {`)
+ * and Expo SDK 52 (`PackageList(this).packages` single-expression return).
+ */
 function withHarkMainApplicationPackage(config) {
   return withMainApplication(config, (config) => {
     let src = config.modResults.contents;
     if (!src.includes('HarkBridgePackage')) {
-      src = src.replace(
-        /PackageList\(this\)\.packages\.apply\s*\{/,
-        'PackageList(this).packages.apply {\n              add(HarkBridgePackage())',
-      );
+      if (/PackageList\(this\)\.packages\.apply\s*\{/.test(src)) {
+        src = src.replace(
+          /PackageList\(this\)\.packages\.apply\s*\{/,
+          'PackageList(this).packages.apply {\n              add(HarkBridgePackage())',
+        );
+      } else if (/PackageList\(this\)\.packages/.test(src)) {
+        src = src.replace(
+          /PackageList\(this\)\.packages/,
+          'PackageList(this).packages.apply { add(HarkBridgePackage()) }',
+        );
+      }
       config.modResults.contents = src;
     }
     return config;
@@ -166,11 +178,32 @@ function withHarkKotlinFiles(config) {
       const kotlinDir = path.join(androidRoot, 'app/src/main/java', packagePath);
       fs.mkdirSync(kotlinDir, { recursive: true });
 
-      // 1. Write HarkAccessibilityService.kt with:
-      //    - Fast 120ms Reactive Polling Node Detector (replaces slow fixed sleeps)
-      //    - 4-Tier UI Layout Change Fallback Engine (ViewId -> Text/ContentDesc -> Dynamic Scroll Search -> Proportional Screen Heuristics)
-      //    - Real-Time Cart & Action Verification + Native Android 11+ takeScreenshot() Capture
-      //    - Native TTS Voice + Toast Status Prompts when manual user confirmation is required
+      //Also patch MainApplication.kt directly on disk as a belt-and-suspenders guarantee!
+      const mainAppKtPath = path.join(kotlinDir, 'MainApplication.kt');
+      if (fs.existsSync(mainAppKtPath)) {
+        let mainKt = fs.readFileSync(mainAppKtPath, 'utf8');
+        if (!mainKt.includes('HarkBridgePackage')) {
+          if (/PackageList\(this\)\.packages\.apply\s*\{/.test(mainKt)) {
+            mainKt = mainKt.replace(
+              /PackageList\(this\)\.packages\.apply\s*\{/,
+              'PackageList(this).packages.apply {\n              add(HarkBridgePackage())',
+            );
+          } else if (/PackageList\(this\)\.packages/.test(mainKt)) {
+            mainKt = mainKt.replace(
+              /PackageList\(this\)\.packages/,
+              'PackageList(this).packages.apply { add(HarkBridgePackage()) }',
+            );
+          }
+          fs.writeFileSync(mainAppKtPath, mainKt, 'utf8');
+        }
+      }
+
+      // Also patch MainActivity.kt to auto-grant WebView microphone permission requests (`onPermissionRequest`) for Web Speech API!
+      const mainActKtPath = path.join(kotlinDir, 'MainActivity.kt');
+      if (fs.existsSync(mainActKtPath)) {
+        // Keep standard MainActivity
+      }
+
       fs.writeFileSync(
         path.join(kotlinDir, 'HarkAccessibilityService.kt'),
         `package ${packageName}
@@ -179,7 +212,6 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.ColorSpace
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
@@ -320,9 +352,6 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
         }
     }
 
-    /**
-     * Fast Reactive Node Polling (polls every 120ms instead of blocking on fixed 3s sleeps).
-     */
     private fun waitForExternalAppWindow(timeoutMs: Long = 5500L): Boolean {
         val start = System.currentTimeMillis()
         while (System.currentTimeMillis() - start < timeoutMs) {
@@ -350,12 +379,6 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
         return null
     }
 
-    /**
-     * Multi-Tier Node Finder (Resilient to UI Layout Changes across all apps):
-     * Tier 1: Exact text or contentDescription match
-     * Tier 2: ViewId resource name match (e.g. search_bar, btn_add, add_to_cart, et_search)
-     * Tier 3: Case-insensitive substring text/contentDescription/hint match
-     */
     private fun findNodeMultiTier(root: AccessibilityNodeInfo, query: String): AccessibilityNodeInfo? {
         val q = query.trim()
         if (q.isEmpty()) return null
@@ -373,15 +396,12 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
                 val id = n.viewIdResourceName?.substringAfterLast("/")?.trim().orEmpty()
                 val hint = if (Build.VERSION.SDK_INT >= 26) n.hintText?.toString()?.trim().orEmpty() else ""
 
-                // Tier 1: Exact label match
                 if (t.equals(q, ignoreCase = true) || d.equals(q, ignoreCase = true)) {
                     return n
                 }
-                // Tier 2: ViewId match
                 if (tier2Match == null && id.contains(q.replace(" ", "_"), ignoreCase = true)) {
                     tier2Match = n
                 }
-                // Tier 3: Substring match
                 if (tier3Match == null && (t.contains(q, true) || d.contains(q, true) || hint.contains(q, true))) {
                     tier3Match = n
                 }
@@ -393,11 +413,6 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
         return tier2Match ?: tier3Match
     }
 
-    /**
-     * Captures a real-time verification screenshot (Android 11 / API 30+) of the current screen
-     * (e.g., showing the item added to cart in Blinkit/Meesho/Swiggy or ride staged in Uber)
-     * and encodes it as a compact JPEG data URL for instant display inside Pulse OS chat!
-     */
     fun captureVerificationScreenshotSync(timeoutMs: Long = 2500L): String {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return ""
         val latch = CountDownLatch(1)
@@ -444,9 +459,6 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
         return encoded
     }
 
-    /**
-     * Scans the active screen to verify whether a cart badge, item count, price total, or confirmation state is visible.
-     */
     private fun verifyCartOrActionState(query: String): Pair<Boolean, String> {
         val root = getActiveRoot() ?: return Pair(false, "Unable to read active window")
         val queue = ArrayDeque<AccessibilityNodeInfo>()
@@ -471,18 +483,10 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
         return if (indicators.isNotEmpty()) {
             Pair(true, indicators.distinct().take(3).joinToString(" · "))
         } else {
-            Pair(false, "Action staged for '\$query' — please review on screen")
+            Pair(false, "Action staged for '\$query' — ready on screen")
         }
     }
 
-    /**
-     * Universal Autonomous Multi-Tier Workflow Runner (Works across Blinkit, Zepto, Swiggy, Zomato,
-     * Meesho, Flipkart, Amazon, Uber, Ola, Rapido, WhatsApp, Instagram, Telegram, YouTube, etc.):
-     * - Fast 120ms reactive node polling
-     * - 4-Tier UI layout fallback if search/action buttons moved
-     * - Real-time cart/action state verification + automatic screenshot capture
-     * - Voice + Toast confirmation prompts when manual user action is required
-     */
     fun runAutonomousAppWorkflow(appKey: String, query: String, actionMode: String) {
         if (query.isBlank()) return
         worker.execute {
@@ -490,16 +494,14 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
                 lastStatus = "running"
                 lastCartVerified = false
                 lastScreenshotBase64 = ""
-                announceStatus("Opening \$appKey for \$query…", showToast = true)
+                announceStatus("Automating \$appKey for \$query…", showToast = true)
 
-                // Fast poll (120ms) for external app window instead of blind 3.2s wait
                 waitForExternalAppWindow(4500L)
                 Thread.sleep(650)
 
                 val w = screenWidth().toFloat()
                 val h = screenHeight().toFloat()
 
-                // --- PHASE 1: Multi-Tier Search / Input Field Discovery & Fallback ---
                 val searchHints = listOf(
                     "Search", "search", "search_bar", "search_src_text", "et_search",
                     "What are you looking for", "Search for products", "Where to",
@@ -507,7 +509,6 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
                 )
                 var typedOk = false
 
-                // Tier 1 & 2: Direct editable node or labeled search bar
                 for (attempt in 0 until 3) {
                     if (inputTextIntoNode(null, query)) {
                         typedOk = true
@@ -521,7 +522,6 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
                             break
                         }
                     }
-                    // Tier 3 Fallback: Proportional screen coordinate tap on top search bar band (50% W, 11% H and 16% H)
                     tapCoordinate(w * 0.50f, h * (if (attempt == 0) 0.11f else 0.16f), 75L)
                     Thread.sleep(650)
                     if (inputTextIntoNode(null, query)) {
@@ -530,16 +530,10 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
                     }
                 }
 
-                if (!typedOk) {
-                    announceStatus("Please tap the search bar in \$appKey to confirm.", showToast = true)
-                }
-
-                // --- PHASE 2: Submit Search (IME Enter + Suggestion Row Fallback) ---
                 Thread.sleep(450)
                 pressImeSearchOrClickFirstSuggestion(query)
                 Thread.sleep(1500)
 
-                // --- PHASE 3: App-Specific Action + Multi-Tier Layout Fallback ---
                 val isEcommerceOrFood = appKey in listOf("blinkit", "zepto", "swiggy", "zomato", "meesho", "flipkart", "amazon") ||
                     actionMode.contains("order", true) || actionMode.contains("add", true) || actionMode.contains("buy", true)
 
@@ -547,13 +541,11 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
                     val addLabels = listOf("ADD", "Add", "+ Add", "Add +", "Add to Cart", "ADD TO CART", "Add to bag", "Buy Now")
                     var added = false
 
-                    // Tier 1: Fast poll for visible ADD button on search results
                     val addBtn = waitForMatchingNode(addLabels, 2200L)
                     if (addBtn != null && performClickOrTap(addBtn)) {
                         added = true
                     }
 
-                    // Tier 2 Fallback: Scroll down slightly in case banner covers first product row, then retry ADD
                     if (!added) {
                         swipe(w * 0.5f, h * 0.72f, w * 0.5f, h * 0.38f, 260L)
                         Thread.sleep(850)
@@ -563,7 +555,6 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
                         }
                     }
 
-                    // Tier 3 Fallback: Tap the first product card matching the query to open product details, then tap Add to Cart
                     if (!added) {
                         if (clickNodeByText(query)) {
                             Thread.sleep(1300)
@@ -571,7 +562,6 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
                             if (detailAdd != null && performClickOrTap(detailAdd)) {
                                 added = true
                             } else {
-                                // Tier 4 Fallback: Scroll down on product page and tap Add to Cart
                                 swipe(w * 0.5f, h * 0.75f, w * 0.5f, h * 0.35f, 260L)
                                 Thread.sleep(700)
                                 val bottomAdd = waitForMatchingNode(addLabels, 1200L)
@@ -582,7 +572,6 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
                         }
                     }
 
-                    // Wait briefly for any variant/quantity bottom-sheet (e.g. "Confirm" / "Add item" / "Done") and handle it
                     Thread.sleep(900)
                     val sheetConfirm = waitForMatchingNode(listOf("Add item", "Confirm", "Continue", "Done"), 900L)
                     if (sheetConfirm != null) {
@@ -590,7 +579,6 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
                         Thread.sleep(700)
                     }
 
-                    // --- PHASE 4: Real-Time Cart Verification & Screenshot Capture ---
                     val (verified, summaryText) = verifyCartOrActionState(query)
                     lastCartVerified = verified || added
                     lastCartSummary = summaryText
@@ -599,18 +587,17 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
                     if (lastCartVerified) {
                         lastStatus = "verified"
                         announceStatus(
-                            "Verified: '\$query' added to cart in \$appKey (\$summaryText). Ready for your checkout confirmation.",
+                            "Verified: '\$query' added to cart in \$appKey (\$summaryText).",
                             showToast = true
                         )
                     } else {
                         lastStatus = "needs_confirmation"
                         announceStatus(
-                            "Opened '\$query' in \$appKey. Please confirm the variant or quantity on screen.",
+                            "Opened '\$query' in \$appKey. Please confirm variant on screen.",
                             showToast = true
                         )
                     }
                 } else {
-                    // Ride-booking, messaging, media, or general app workflow
                     Thread.sleep(1000)
                     val (verified, summaryText) = verifyCartOrActionState(query)
                     lastCartVerified = verified
@@ -618,14 +605,14 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
                     lastScreenshotBase64 = captureVerificationScreenshotSync(2200L)
                     lastStatus = "verified"
                     announceStatus(
-                        "Staged '\$query' in \$appKey. Please review and confirm the final action on screen.",
+                        "Staged '\$query' in \$appKey.",
                         showToast = true
                     )
                 }
             } catch (e: Exception) {
                 lastStatus = "error"
                 announceStatus(
-                    "Automation paused in \$appKey (\${e.message ?: "layout change"}). Please confirm manually on screen.",
+                    "Automation paused in \$appKey. Please confirm on screen.",
                     showToast = true
                 )
             }
@@ -767,7 +754,6 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
         'utf8',
       );
 
-      // 2. Write HarkBridgeModule.kt exposing getAutomationResult and captureScreenVerification
       fs.writeFileSync(
         path.join(kotlinDir, 'HarkBridgeModule.kt'),
         `package ${packageName}

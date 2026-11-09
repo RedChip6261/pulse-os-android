@@ -40,17 +40,17 @@ const { HarkBridge } = NativeModules;
 /* ------------------------------------------------------------------ */
 
 const C = {
-  bg: '#0B0F17',
-  panel: '#121826',
-  panel2: '#1A2233',
-  border: '#263047',
-  text: '#E6EAF2',
-  muted: '#8A94A8',
-  accent: '#7C5CFF',
-  accent2: '#22D3EE',
-  good: '#22C55E',
+  bg: '#060911',
+  panel: '#0F1523',
+  panel2: '#172034',
+  border: '#283552',
+  text: '#F3F6FC',
+  muted: '#94A3B8',
+  accent: '#6366F1',
+  accent2: '#06B6D4',
+  good: '#10B981',
   warn: '#F59E0B',
-  danger: '#EF4444',
+  danger: '#F43F5E',
 };
 
 /* ------------------------------------------------------------------ */
@@ -2078,7 +2078,7 @@ const DEFAULT_SETTINGS: Settings = {
   speed: 'fast',
   fastModel: FAST_MODEL,
   replyLength: 'balanced',
-  historyLimit: 60,
+  historyLimit: 200,
   cloudUrl: DEFAULT_CLOUD_URL,
   cloudToken: '',
   cloudMode: true,
@@ -2321,7 +2321,7 @@ export default function App() {
             )}
           </View>
           <View>
-            <Text style={styles.brand}>Pulse OS</Text>
+            <Text style={styles.brand}>Pulse OS 3.0</Text>
             <Text style={styles.brandSub}>
               {settings.name.trim() ? 'Hi, ' + settings.name.trim().split(' ')[0] : tab.charAt(0) + tab.slice(1).toLowerCase()}
             </Text>
