@@ -1016,12 +1016,19 @@ async function openAppWithStatus(
   // 1. Try Native HarkBridge (launches ANY installed mobile app on the phone by label or package name, + root/accessibility fallback)
   if (Platform.OS === 'android' && HarkBridge?.launchApp) {
     try {
-      const launched = await HarkBridge.launchApp(catalogMatch ? catalogMatch.id : clean, a.query || a.text || '');
+      const qText = (a.query || a.text || '').trim();
+      const targetKey = catalogMatch ? catalogMatch.id : clean;
+      const launched = await HarkBridge.launchApp(targetKey, qText);
+      if (launched && qText && HarkBridge?.runAutonomousWorkflow) {
+        await HarkBridge.runAutonomousWorkflow(targetKey, qText, 'order').catch(() => false);
+      }
       if (launched) {
         return {
           ok: true,
           appName: displayName,
-          statusMessage: `Launched ${displayName} via Pulse OS Native Bridge.`,
+          statusMessage: qText
+            ? `⚡ Hark Handoff launched ${displayName} and is autonomously executing "${qText}" on screen.`
+            : `⚡ Opened ${displayName}.`,
         };
       }
     } catch {
@@ -1055,10 +1062,16 @@ async function openAppWithStatus(
             category: 'android.intent.category.LAUNCHER',
             flags: 0x10000000,
           });
+          const qText = (a.query || a.text || '').trim();
+          if (qText && HarkBridge?.runAutonomousWorkflow) {
+            await HarkBridge.runAutonomousWorkflow(catalogMatch.id, qText, 'order').catch(() => false);
+          }
           return {
             ok: true,
             appName: displayName,
-            statusMessage: `Launched ${displayName} (${pkg}).`,
+            statusMessage: qText
+              ? `⚡ Hark Handoff opened ${displayName} and is executing "${qText}" automatically.`
+              : `⚡ Opened ${displayName}.`,
           };
         } catch {
           /* try next package */
@@ -1324,20 +1337,24 @@ async function runAgent(o: {
 
     o.onStep(`Launching ${mentionedApp.name}${cleanQuery ? ' for "' + cleanQuery + '"' : ''}…`);
 
-    if (Platform.OS === 'android' && HarkBridge?.launchApp) {
-      const launched = await HarkBridge.launchApp(mentionedApp.id, cleanQuery).catch(() => false);
-      if (launched && cleanQuery && HarkBridge?.runAutonomousWorkflow) {
-        await HarkBridge.runAutonomousWorkflow(mentionedApp.id, cleanQuery, 'order').catch(() => false);
-      }
-      if (launched) {
-        return cleanQuery
-          ? `✅ Launched ${mentionedApp.name} and started the native background Accessibility worker (120ms fast node polling + 4-tier layout fallback) to search for "${cleanQuery}", tap ADD to cart, and capture a real-time verification screenshot.`
-          : `✅ Opened ${mentionedApp.name}.`;
-      }
+    const webUrlMap: Record<string, string> = {
+      blinkit: cleanQuery ? 'https://blinkit.com/s/?q=' + encodeURIComponent(cleanQuery) : 'https://blinkit.com',
+      zepto: cleanQuery ? 'https://www.zeptonow.com/search?query=' + encodeURIComponent(cleanQuery) : 'https://www.zeptonow.com',
+      swiggy: cleanQuery ? 'https://www.swiggy.com/search?query=' + encodeURIComponent(cleanQuery) : 'https://www.swiggy.com',
+      zomato: cleanQuery ? 'https://www.zomato.com/search?q=' + encodeURIComponent(cleanQuery) : 'https://www.zomato.com',
+      meesho: cleanQuery ? 'https://www.meesho.com/search?q=' + encodeURIComponent(cleanQuery) : 'https://www.meesho.com',
+      flipkart: cleanQuery ? 'https://www.flipkart.com/search?q=' + encodeURIComponent(cleanQuery) : 'https://www.flipkart.com',
+      amazon: cleanQuery ? 'https://www.amazon.in/s?k=' + encodeURIComponent(cleanQuery) : 'https://www.amazon.in',
+      uber: 'https://m.uber.com',
+      youtube: cleanQuery ? 'https://m.youtube.com/results?search_query=' + encodeURIComponent(cleanQuery) : 'https://m.youtube.com',
+    };
+    if (webUrlMap[mentionedApp.id]) {
+      LiveBus.open(webUrlMap[mentionedApp.id]);
+      LiveBus.set({}, `⚡ Hark Handoff synced ${mentionedApp.name} (${cleanQuery || 'home'})`);
     }
 
-    const launchRes = await openApp(mentionedApp.id, { query: cleanQuery, text: cleanQuery });
-    return launchRes ? `✅ Opened ${mentionedApp.name}.` : `⚠️ ${mentionedApp.name} is not installed on this device.`;
+    const launchRes = await openAppWithStatus(mentionedApp.id, { query: cleanQuery, text: cleanQuery });
+    return `✅ ${launchRes.statusMessage}`;
   }
 
   const runner = AgentBus.runner();
@@ -2677,6 +2694,13 @@ ${statusLine}`,
     }
   };
 
+  useEffect(() => {
+    if (pendingVoiceAutoSendRef.current && input === pendingVoiceAutoSendRef.current && !busy) {
+      pendingVoiceAutoSendRef.current = '';
+      send();
+    }
+  });
+
   const send = async () => {
     const rawInput = input.trim();
     const attached = pendingAttachment;
@@ -2701,7 +2725,8 @@ ${statusLine}`,
     // Instant OS-level app launch fast-path for simple voice/text commands like "open Blinkit", "open Uber", "open Free Fire", "open Instagram"
     const quickOpenMatch =
       !attached &&
-      rawInput.match(/^(?:please\s+|can you\s+|hey pulse\s+)?(?:open|launch|start|run)\s+([a-z0-9\s._@-]+)$/i);
+      !/\b(and|to|for|order|buy|search|find|add|cart|book|send|message|play|watch)\b/i.test(rawInput) &&
+      rawInput.match(/^(?:please\s+|can you\s+|hey pulse\s+|hey hark\s+)?(?:open|launch|start|run)\s+([a-z0-9._@-]+(?:\s+max|\s+store|\s+pay|\s+maps|\s+fire)?)$/i);
     if (quickOpenMatch) {
       const targetApp = quickOpenMatch[1].trim();
       setInput('');
@@ -2814,6 +2839,9 @@ ${statusLine}`,
         setMessages((prev) => prev.map((m) => (m.id === botId ? final : m)));
         refreshSummary(convoId, [...next, final]);
         say(answer);
+        if (handsFreeRef.current) {
+          setTimeout(() => startVoiceInput(true), 4200);
+        }
       } catch (e: any) {
         setMessages((prev) => [
           ...prev.filter((m) => m.id !== botId),
@@ -2887,6 +2915,9 @@ ${statusLine}`,
       setMessages((prev) => (prev.some((m) => m.id === botId) ? prev.map((m) => (m.id === botId ? botMsg : m)) : [...prev, botMsg]));
       refreshSummary(convoId, [...next, botMsg]);
       say(reply.direct_response.slice(0, 400));
+      if (handsFreeRef.current) {
+        setTimeout(() => startVoiceInput(true), 4200);
+      }
     } catch (e: any) {
       setMessages((prev) => [
         ...prev.filter((m) => m.id !== botId),
@@ -2983,6 +3014,25 @@ ${statusLine}`,
           </Pressable>
         ) : null}
         <View style={{ flex: 1 }} />
+        <Pressable
+          onPress={() => {
+            const nextHf = !handsFree;
+            setHandsFree(nextHf);
+            handsFreeRef.current = nextHf;
+            if (nextHf) {
+              patchSettings({ voiceOn: true });
+              startVoiceInput(true);
+            } else {
+              Speech.stop();
+            }
+          }}
+          style={[styles.chip, handsFree && { borderColor: C.good, backgroundColor: '#064E3B' }]}
+          accessibilityLabel="Hands-Free Voice Mode"
+        >
+          <Text style={[styles.chipText, handsFree && { color: '#fff' }]}>
+            {handsFree ? '🟢 Hands-Free' : '🎙️ Hands-Free'}
+          </Text>
+        </Pressable>
         <Pressable
           onPress={() => setMode((m) => (m === 'auto' ? 'agent' : m === 'agent' ? 'chat' : 'auto'))}
           style={[styles.chip, mode === 'agent' && { borderColor: C.accent }]}
@@ -3377,12 +3427,17 @@ function WorkspaceScreen({
   const [canBack, setCanBack] = useState(false);
   const [loading, setLoading] = useState(false);
   const [title, setTitle] = useState('');
+  const [liveMode, setLiveMode] = useState<'handoff' | 'os_bridge' | 'panels'>('handoff');
+  const [screenDump, setScreenDump] = useState('');
+  const [osShot, setOsShot] = useState('');
+  const [osStatus, setOsStatus] = useState<any>(null);
   const [completed, setCompleted] = useState<{ title: string; url: string; ts: number }[]>([]);
   const shotRef = useRef<View>(null);
   const loadStart = useRef(0);
   const loadingRef = useRef(false);
   const pending = useRef(new Map<string, (v: any) => void>());
   const agent = useAgentStatus();
+  const live = useLive();
 
   useEffect(
     () =>
@@ -3413,6 +3468,28 @@ function WorkspaceScreen({
     [],
   );
 
+  const refreshOsBridge = useCallback(async () => {
+    if (Platform.OS !== 'android' || !HarkBridge) return;
+    try {
+      const [res, nodes] = await Promise.all([
+        HarkBridge.getAutomationResult ? HarkBridge.getAutomationResult() : Promise.resolve(null),
+        HarkBridge.dumpScreenNodes ? HarkBridge.dumpScreenNodes() : Promise.resolve(''),
+      ]);
+      if (res) {
+        setOsStatus(res);
+        if (res.screenshot) setOsShot(res.screenshot);
+      }
+      if (nodes) setScreenDump(String(nodes));
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    if (liveMode !== 'os_bridge') return;
+    refreshOsBridge();
+    const id = setInterval(refreshOsBridge, 2000);
+    return () => clearInterval(id);
+  }, [liveMode, refreshOsBridge]);
+
   const onMessage = (e: WebViewMessageEvent) => {
     try {
       const d = JSON.parse(e.nativeEvent.data);
@@ -3423,9 +3500,7 @@ function WorkspaceScreen({
           f(d.r);
         }
       }
-    } catch {
-      /* ignore */
-    }
+    } catch {}
   };
 
   useEffect(
@@ -3442,22 +3517,21 @@ function WorkspaceScreen({
     try {
       const uri = await captureRef(shotRef, { format: 'jpg', quality: 0.5, width: 360, result: 'tmpfile' });
       LiveBus.set({ thumb: uri + '?t=' + Date.now() });
-    } catch {
-      /* ignore */
-    }
+    } catch {}
   }, []);
 
   useEffect(() => {
     const id = setInterval(() => {
       const l = LiveBus.get();
-      if (l.active && Date.now() - l.startedAt < 5 * 60 * 1000) snap();
+      if (l.active && Date.now() - l.startedAt < 15 * 60 * 1000) snap();
     }, 2000);
     return () => clearInterval(id);
   }, [snap]);
 
-  const go = () => {
-    const u = normalizeUrl(field);
+  const go = (targetUrl?: string) => {
+    const u = normalizeUrl(targetUrl || field);
     setUrl(u);
+    setField(u);
     if (LiveBus.get().active) LiveBus.set({ url: u }, 'Opening ' + hostOf(u));
   };
 
@@ -3485,107 +3559,216 @@ function WorkspaceScreen({
     ]);
   };
 
-  const close = () => {
-    setUrl(home);
-    setField(home);
-    setTitle('');
-    LiveBus.reset();
-  };
+  const QUICK_HANDOFF_SITES = [
+    { label: '⚡ Blinkit', url: 'https://blinkit.com' },
+    { label: '🛒 Zepto', url: 'https://www.zeptonow.com' },
+    { label: '🍔 Swiggy', url: 'https://www.swiggy.com' },
+    { label: '🛍️ Meesho', url: 'https://www.meesho.com' },
+    { label: '📦 Flipkart', url: 'https://www.flipkart.com' },
+    { label: '🚖 Uber', url: 'https://m.uber.com' },
+    { label: '▶️ YouTube', url: 'https://m.youtube.com' },
+  ];
 
   return (
-    <View style={{ flex: 1 }}>
-      <View style={styles.urlBar}>
-        <Pressable
-          onPress={() => webRef.current?.goBack()}
-          disabled={!canBack}
-          style={[styles.navBtn, !canBack && { opacity: 0.35 }]}
-        >
-          <Text style={styles.navText}>‹</Text>
-        </Pressable>
-        <TextInput
-          value={field}
-          onChangeText={setField}
-          onSubmitEditing={go}
-          placeholder="Search or enter URL"
-          placeholderTextColor={C.muted}
-          autoCapitalize="none"
-          autoCorrect={false}
-          keyboardType="url"
-          returnKeyType="go"
-          selectTextOnFocus
-          style={styles.urlInput}
-        />
-        <Pressable onPress={go} style={styles.navBtn}>
-          <Text style={styles.navText}>Go</Text>
-        </Pressable>
-        <Pressable onPress={() => webRef.current?.reload()} style={styles.navBtn}>
-          <Text style={styles.navText}>↻</Text>
-        </Pressable>
-      </View>
-      {loading ? <View style={styles.progress} /> : null}
-      {agent.running ? (
-        <View style={styles.agentStrip}>
-          <ActivityIndicator size="small" color={C.accent} />
-          <View style={{ flex: 1 }}>
-            <Text style={styles.liveTitle} numberOfLines={1}>🤖 {agent.step || 'Working…'}</Text>
-            <Text style={styles.mutedSmall} numberOfLines={1}>{agent.goal}</Text>
+    <View style={{ flex: 1, backgroundColor: C.bg }}>
+      <View style={{ paddingHorizontal: 12, paddingTop: 8, paddingBottom: 6, backgroundColor: C.panel, borderBottomWidth: 1, borderBottomColor: C.border, gap: 8 }}>
+        <View style={styles.rowBetween}>
+          <View style={styles.rowCenter}>
+            <View style={[styles.liveDot, { backgroundColor: agent.running ? C.accent2 : C.good, width: 8, height: 8, borderRadius: 4 }]} />
+            <Text style={{ color: C.text, fontWeight: '800', fontSize: 15 }}>
+              Hark Handoff Live Studio
+            </Text>
           </View>
-          <Pressable onPress={() => AgentBus.stop()} style={[styles.chip, { borderColor: C.danger }]}>
-            <Text style={[styles.chipText, { color: C.danger }]}>■ Stop</Text>
-          </Pressable>
+          <View style={styles.segment}>
+            {[
+              { id: 'handoff', label: '🌐 Web Handoff' },
+              { id: 'os_bridge', label: '📱 OS Bridge' },
+              { id: 'panels', label: '⚡ Panels' },
+            ].map((m) => (
+              <Pressable
+                key={m.id}
+                onPress={() => setLiveMode(m.id as any)}
+                style={[styles.segItem, { paddingHorizontal: 10, paddingVertical: 5 }, liveMode === m.id && styles.segItemOn]}
+              >
+                <Text style={[styles.segText, { fontSize: 11 }, liveMode === m.id && styles.segTextOn]}>{m.label}</Text>
+              </Pressable>
+            ))}
+          </View>
         </View>
-      ) : null}
-
-      <View ref={shotRef} collapsable={false} style={{ flex: 1, backgroundColor: '#fff' }}>
-        <WebView
-          ref={webRef}
-          source={{ uri: url }}
-          onNavigationStateChange={onNav}
-          onMessage={onMessage}
-          onLoadStart={(e) => {
-            loadingRef.current = true;
-            setLoading(true);
-            loadStart.current = Date.now();
-            if (LiveBus.get().active) LiveBus.set({ loading: true, progress: 0.05 }, 'Loading ' + hostOf(e.nativeEvent.url));
-          }}
-          onLoadProgress={(e) => {
-            if (LiveBus.get().active) LiveBus.set({ progress: e.nativeEvent.progress });
-          }}
-          onLoadEnd={(e) => {
-            loadingRef.current = false;
-            setLoading(false);
-            if (LiveBus.get().active) {
-              const secs = ((Date.now() - loadStart.current) / 1000).toFixed(1);
-              LiveBus.set(
-                { loading: false, progress: 1, title: e.nativeEvent.title || '' },
-                'Loaded "' + (e.nativeEvent.title || hostOf(e.nativeEvent.url)) + '" in ' + secs + 's',
-              );
-              setTimeout(snap, 400);
-            }
-          }}
-          javaScriptEnabled
-          domStorageEnabled
-          setSupportMultipleWindows={false}
-          style={{ flex: 1, backgroundColor: '#fff' }}
-        />
       </View>
 
-      {completed.length ? (
-        <View style={styles.completedStrip}>
-          <Text style={styles.mutedSmall} numberOfLines={1}>
-            ✅ {completed.length} done · last: {completed[0].title}
-          </Text>
-        </View>
-      ) : null}
+      {liveMode === 'handoff' ? (
+        <View style={{ flex: 1 }}>
+          <View style={{ backgroundColor: C.panel, paddingVertical: 6, paddingHorizontal: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: C.border }}>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 6 }}>
+              {QUICK_HANDOFF_SITES.map((s) => (
+                <Pressable key={s.label} onPress={() => go(s.url)} style={styles.chip}>
+                  <Text style={styles.chipText}>{s.label}</Text>
+                </Pressable>
+              ))}
+            </ScrollView>
+          </View>
 
-      <View style={styles.confirmBar}>
-        <Pressable onPress={confirmComplete} style={[styles.confirmBtn, { backgroundColor: C.good }]}>
-          <Text style={styles.confirmText}>Confirm Task Complete</Text>
-        </Pressable>
-        <Pressable onPress={close} style={[styles.confirmBtn, { backgroundColor: C.panel2, flex: 0.6 }]}>
-          <Text style={styles.confirmText}>Close</Text>
-        </Pressable>
-      </View>
+          <View style={styles.urlBar}>
+            <Pressable
+              onPress={() => webRef.current?.goBack()}
+              disabled={!canBack}
+              style={[styles.navBtn, !canBack && { opacity: 0.35 }]}
+            >
+              <Text style={styles.navText}>‹</Text>
+            </Pressable>
+            <TextInput
+              value={field}
+              onChangeText={setField}
+              onSubmitEditing={() => go()}
+              placeholder="Search or enter URL for Handoff Agent…"
+              placeholderTextColor={C.muted}
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="url"
+              returnKeyType="go"
+              selectTextOnFocus
+              style={styles.urlInput}
+            />
+            <Pressable onPress={() => go()} style={styles.navBtn}>
+              <Text style={styles.navText}>Go</Text>
+            </Pressable>
+            <Pressable onPress={() => webRef.current?.reload()} style={styles.navBtn}>
+              <Text style={styles.navText}>↻</Text>
+            </Pressable>
+          </View>
+
+          {loading ? <View style={styles.progress} /> : null}
+
+          {agent.running ? (
+            <View style={styles.agentStrip}>
+              <ActivityIndicator size="small" color={C.accent2} />
+              <View style={{ flex: 1 }}>
+                <Text style={styles.liveTitle} numberOfLines={1}>🤖 {agent.step || 'Executing Handoff…'}</Text>
+                <Text style={styles.mutedSmall} numberOfLines={1}>{agent.goal}</Text>
+              </View>
+              <Pressable onPress={() => AgentBus.stop()} style={[styles.chip, { borderColor: C.danger }]}>
+                <Text style={[styles.chipText, { color: C.danger }]}>■ Stop</Text>
+              </Pressable>
+            </View>
+          ) : null}
+
+          <View ref={shotRef} collapsable={false} style={{ flex: 1, backgroundColor: '#fff' }}>
+            <WebView
+              ref={webRef}
+              source={{ uri: url }}
+              onNavigationStateChange={onNav}
+              onMessage={onMessage}
+              onLoadStart={(e) => {
+                loadingRef.current = true;
+                setLoading(true);
+                loadStart.current = Date.now();
+                if (LiveBus.get().active) LiveBus.set({ loading: true, progress: 0.05 }, 'Loading ' + hostOf(e.nativeEvent.url));
+              }}
+              onLoadProgress={(e) => {
+                if (LiveBus.get().active) LiveBus.set({ progress: e.nativeEvent.progress });
+              }}
+              onLoadEnd={(e) => {
+                loadingRef.current = false;
+                setLoading(false);
+                if (LiveBus.get().active) {
+                  const secs = ((Date.now() - loadStart.current) / 1000).toFixed(1);
+                  LiveBus.set(
+                    { loading: false, progress: 1, title: e.nativeEvent.title || '' },
+                    'Loaded "' + (e.nativeEvent.title || hostOf(e.nativeEvent.url)) + '" in ' + secs + 's',
+                  );
+                  setTimeout(snap, 400);
+                }
+              }}
+              javaScriptEnabled
+              domStorageEnabled
+              setSupportMultipleWindows={false}
+              style={{ flex: 1, backgroundColor: '#fff' }}
+            />
+          </View>
+
+          {live.log.length > 0 ? (
+            <View style={{ maxHeight: 74, backgroundColor: C.panel, paddingHorizontal: 12, paddingVertical: 6, borderTopWidth: 1, borderTopColor: C.border }}>
+              <Text style={{ color: C.accent2, fontSize: 10, fontWeight: '800', letterSpacing: 0.8 }}>LIVE HANDOFF STEP LOG</Text>
+              <ScrollView>
+                {live.log.slice(-3).map((entry, idx) => (
+                  <Text key={idx} style={styles.mutedSmall} numberOfLines={1}>• {entry.text}</Text>
+                ))}
+              </ScrollView>
+            </View>
+          ) : null}
+
+          <View style={styles.confirmBar}>
+            <Pressable onPress={confirmComplete} style={[styles.confirmBtn, { backgroundColor: C.good }]}>
+              <Text style={styles.confirmText}>✓ Approve & Complete Handoff</Text>
+            </Pressable>
+            <Pressable
+              onPress={() => {
+                setUrl(home);
+                setField(home);
+                setTitle('');
+                LiveBus.reset();
+              }}
+              style={[styles.confirmBtn, { backgroundColor: C.panel2, flex: 0.45 }]}
+            >
+              <Text style={styles.confirmText}>Reset</Text>
+            </Pressable>
+          </View>
+        </View>
+      ) : liveMode === 'os_bridge' ? (
+        <ScrollView contentContainerStyle={{ padding: 14, gap: 12, paddingBottom: 36 }}>
+          <View style={styles.settingsCard}>
+            <View style={styles.rowBetween}>
+              <Text style={styles.cardTitle}>📱 Native OS Assistive Bridge Monitor</Text>
+              <Pressable onPress={refreshOsBridge} style={styles.chip}>
+                <Text style={styles.chipText}>↻ Refresh</Text>
+              </Pressable>
+            </View>
+            <Text style={styles.mutedSmall}>
+              Status: {osStatus?.status ? String(osStatus.status).toUpperCase() : 'IDLE'} · {osStatus?.message || 'Waiting for cross-app command'}
+            </Text>
+            {osStatus?.cartSummary ? (
+              <Text style={{ color: C.good, fontWeight: '700', fontSize: 13 }}>
+                🛒 Cart Verification: {osStatus.cartSummary}
+              </Text>
+            ) : null}
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 6 }}>
+              <Pressable
+                onPress={async () => {
+                  if (HarkBridge?.captureScreenVerification) {
+                    const s = await HarkBridge.captureScreenVerification();
+                    if (s) setOsShot(s);
+                  }
+                }}
+                style={styles.chip}
+              >
+                <Text style={styles.chipText}>📸 Capture Verification Shot</Text>
+              </Pressable>
+              <Pressable onPress={() => openAppWithStatus('accessibility')} style={styles.chip}>
+                <Text style={styles.chipText}>⚙️ Accessibility Settings</Text>
+              </Pressable>
+            </View>
+          </View>
+
+          {osShot ? (
+            <View style={styles.settingsCard}>
+              <Text style={styles.cardTitle}>📸 Latest Cart / Action Screenshot</Text>
+              <Image source={{ uri: osShot }} style={{ width: '100%', height: 360, borderRadius: 12 }} resizeMode="contain" />
+            </View>
+          ) : null}
+
+          <View style={styles.settingsCard}>
+            <Text style={styles.cardTitle}>🔍 Live Active Window Accessibility Tree</Text>
+            <Text style={{ color: C.text, fontFamily: Platform.OS === 'android' ? 'monospace' : 'Courier', fontSize: 11 }}>
+              {screenDump || 'No external app window captured yet. Launch Blinkit, Uber, or Meesho from Chat or Apps tab!'}
+            </Text>
+          </View>
+        </ScrollView>
+      ) : (
+        <View style={{ flex: 1 }}>
+          <WidgetsScreen say={say} />
+        </View>
+      )}
     </View>
   );
 }
