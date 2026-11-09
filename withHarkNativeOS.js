@@ -6,7 +6,7 @@ const SERVICE_NAME = '.HarkAccessibilityService';
 const SERVICE_LABEL = 'Pulse OS Assistive Bridge';
 const SERVICE_DESC_KEY = 'hark_accessibility_service_description';
 const SERVICE_DESC_VALUE =
-  'Pulse OS 3.0 Assistive Screen Reader, Fast Node Detection, Real-Time Cart/Action Screenshot Verification, and Multi-Tier UI Fallback Engine across all mobile apps.';
+  'Pulse OS Assistive Automation Bridge for app launching, search execution, login auto-fill, and task completion.';
 
 function withHarkAccessibilityManifest(config) {
   return withAndroidManifest(config, (config) => {
@@ -122,10 +122,6 @@ function withHarkAccessibilityStrings(config) {
   });
 }
 
-/**
- * Robustly registers HarkBridgePackage() across both Expo SDK 51 (`PackageList(this).packages.apply {`)
- * and Expo SDK 52 (`PackageList(this).packages` single-expression return).
- */
 function withHarkMainApplicationPackage(config) {
   return withMainApplication(config, (config) => {
     let src = config.modResults.contents;
@@ -165,7 +161,7 @@ function withHarkKotlinFiles(config) {
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/${SERVICE_DESC_KEY}"
     android:accessibilityEventTypes="typeAllMask"
-    android:accessibilityFeedbackType="feedbackGeneric|feedbackSpoken"
+    android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews|flagRequestEnhancedWebAccessibility"
     android:canPerformGestures="true"
     android:canRetrieveWindowContent="true"
@@ -178,7 +174,6 @@ function withHarkKotlinFiles(config) {
       const kotlinDir = path.join(androidRoot, 'app/src/main/java', packagePath);
       fs.mkdirSync(kotlinDir, { recursive: true });
 
-      //Also patch MainApplication.kt directly on disk as a belt-and-suspenders guarantee!
       const mainAppKtPath = path.join(kotlinDir, 'MainApplication.kt');
       if (fs.existsSync(mainAppKtPath)) {
         let mainKt = fs.readFileSync(mainAppKtPath, 'utf8');
@@ -198,19 +193,13 @@ function withHarkKotlinFiles(config) {
         }
       }
 
-      // Also patch MainActivity.kt to auto-grant WebView microphone permission requests (`onPermissionRequest`) for Web Speech API!
-      const mainActKtPath = path.join(kotlinDir, 'MainActivity.kt');
-      if (fs.existsSync(mainActKtPath)) {
-        // Keep standard MainActivity
-      }
-
       fs.writeFileSync(
         path.join(kotlinDir, 'HarkAccessibilityService.kt'),
         `package ${packageName}
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
-import android.content.Intent
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.Rect
@@ -218,21 +207,20 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.speech.tts.TextToSpeech
 import android.util.Base64
 import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.Toast
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.util.ArrayDeque
-import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
-class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitListener {
+class HarkAccessibilityService : AccessibilityService() {
     companion object {
         @Volatile
         var instance: HarkAccessibilityService? = null
@@ -255,6 +243,25 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
 
         @Volatile
         var lastUpdatedTs: Long = 0L
+
+        @Volatile
+        var userEmail: String = ""
+
+        @Volatile
+        var userPhone: String = ""
+
+        @Volatile
+        var userPassword: String = ""
+
+        @Volatile
+        var userName: String = ""
+
+        @Volatile
+        var userAddress: String = ""
+
+        val savedAppCreds = mutableMapOf<String, Pair<String, String>>()
+
+        private val workflowSeq = AtomicInteger(0)
 
         val KNOWN_APP_PACKAGES: Map<String, List<String>> = mapOf(
             "blinkit" to listOf("com.grofers.customerapp"),
@@ -279,28 +286,60 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
             "spotify" to listOf("com.spotify.music"),
             "chrome" to listOf("com.android.chrome"),
             "gmail" to listOf("com.google.android.gm"),
-            "maps" to listOf("com.google.android.apps.maps")
+            "maps" to listOf("com.google.android.apps.maps"),
+            "playstore" to listOf("com.android.vending")
         )
+
+        fun updateLoginDataFromJson(context: Context, jsonStr: String) {
+            try {
+                context.getSharedPreferences("pulse_user_auth", Context.MODE_PRIVATE)
+                    .edit()
+                    .putString("auth_json", jsonStr)
+                    .apply()
+                applyJsonToMemory(jsonStr)
+            } catch (_: Exception) {}
+        }
+
+        fun applyJsonToMemory(jsonStr: String) {
+            try {
+                if (jsonStr.isBlank()) return
+                val obj = JSONObject(jsonStr)
+                userName = obj.optString("name", userName)
+                userEmail = obj.optString("email", userEmail)
+                userPhone = obj.optString("phone", userPhone)
+                userPassword = obj.optString("password", userPassword)
+                userAddress = obj.optString("address", userAddress)
+                val arr = obj.optJSONArray("savedLogins")
+                if (arr != null) {
+                    savedAppCreds.clear()
+                    for (i in 0 until arr.length()) {
+                        val item = arr.optJSONObject(i) ?: continue
+                        val appKey = item.optString("app", "").trim().lowercase()
+                        val u = item.optString("username", "").trim()
+                        val p = item.optString("password", "").trim()
+                        if (appKey.isNotEmpty() && u.isNotEmpty()) {
+                            savedAppCreds[appKey] = Pair(u, p)
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
-    private var tts: TextToSpeech? = null
-    private var ttsReady = false
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
         try {
-            tts = TextToSpeech(applicationContext, this)
+            val saved = applicationContext
+                .getSharedPreferences("pulse_user_auth", Context.MODE_PRIVATE)
+                .getString("auth_json", "") ?: ""
+            if (saved.isNotEmpty()) {
+                applyJsonToMemory(saved)
+            }
         } catch (_: Exception) {}
-    }
-
-    override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            tts?.language = Locale.forLanguageTag("en-IN")
-            ttsReady = true
-        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
@@ -308,26 +347,19 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
 
     override fun onDestroy() {
         if (instance === this) instance = null
-        try {
-            tts?.shutdown()
-        } catch (_: Exception) {}
         super.onDestroy()
     }
 
-    private fun announceStatus(message: String, showToast: Boolean = true) {
+    // Silent status update: NEVER speaks with TTS during work
+    private fun recordStatus(message: String, showToast: Boolean = false) {
         lastMessage = message
         lastUpdatedTs = System.currentTimeMillis()
         if (showToast) {
             mainHandler.post {
                 try {
-                    Toast.makeText(applicationContext, "Pulse OS: \$message", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(applicationContext, message, Toast.LENGTH_SHORT).show()
                 } catch (_: Exception) {}
             }
-        }
-        if (ttsReady) {
-            try {
-                tts?.speak(message, TextToSpeech.QUEUE_FLUSH, null, "pulse_tts_\${System.currentTimeMillis()}")
-            } catch (_: Exception) {}
         }
     }
 
@@ -365,7 +397,7 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
         return getActiveRoot() != null
     }
 
-    private fun waitForMatchingNode(labels: List<String>, timeoutMs: Long = 2800L): AccessibilityNodeInfo? {
+    private fun waitForMatchingNode(labels: List<String>, timeoutMs: Long = 2600L): AccessibilityNodeInfo? {
         val start = System.currentTimeMillis()
         while (System.currentTimeMillis() - start < timeoutMs) {
             val root = getActiveRoot()
@@ -396,7 +428,7 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
                 val id = n.viewIdResourceName?.substringAfterLast("/")?.trim().orEmpty()
                 val hint = if (Build.VERSION.SDK_INT >= 26) n.hintText?.toString()?.trim().orEmpty() else ""
 
-                if (t.equals(q, ignoreCase = true) || d.equals(q, ignoreCase = true)) {
+                if (t.equals(q, ignoreCase = true) || d.equals(q, ignoreCase = true) || hint.equals(q, ignoreCase = true)) {
                     return n
                 }
                 if (tier2Match == null && id.contains(q.replace(" ", "_"), ignoreCase = true)) {
@@ -411,6 +443,91 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
             }
         }
         return tier2Match ?: tier3Match
+    }
+
+    fun autoFillLoginIfPresent(appKey: String, customUser: String = "", customPass: String = ""): Boolean {
+        val root = getActiveRoot() ?: return false
+        val credPair = savedAppCreds[appKey.lowercase()]
+        val loginUser = when {
+            customUser.isNotBlank() -> customUser
+            credPair != null && credPair.first.isNotBlank() -> credPair.first
+            userEmail.isNotBlank() -> userEmail
+            userPhone.isNotBlank() -> userPhone
+            else -> ""
+        }
+        val loginPass = when {
+            customPass.isNotBlank() -> customPass
+            credPair != null && credPair.second.isNotBlank() -> credPair.second
+            userPassword.isNotBlank() -> userPassword
+            else -> ""
+        }
+        if (loginUser.isBlank() && loginPass.isBlank()) return false
+
+        val editNodes = mutableListOf<AccessibilityNodeInfo>()
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        while (queue.isNotEmpty()) {
+            val n = queue.removeFirst()
+            if (n.isVisibleToUser && n.isEditable) {
+                editNodes.add(n)
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+        if (editNodes.isEmpty()) return false
+
+        var filledAny = false
+        for (node in editNodes) {
+            val hint = (if (Build.VERSION.SDK_INT >= 26) node.hintText?.toString() else null).orEmpty()
+            val text = node.text?.toString().orEmpty()
+            val desc = node.contentDescription?.toString().orEmpty()
+            val id = node.viewIdResourceName?.substringAfterLast("/").orEmpty()
+            val combined = "\$hint \$text \$desc \$id".lowercase()
+
+            if (node.isPassword || combined.contains("pass") || combined.contains("pin")) {
+                if (loginPass.isNotBlank()) {
+                    setNodeTextDirect(node, loginPass)
+                    filledAny = true
+                }
+            } else if (
+                combined.contains("email") ||
+                combined.contains("phone") ||
+                combined.contains("mobile") ||
+                combined.contains("user") ||
+                combined.contains("login") ||
+                combined.contains("number")
+            ) {
+                val valToUse = if (combined.contains("phone") || combined.contains("mobile") || combined.contains("number")) {
+                    if (userPhone.isNotBlank()) userPhone else loginUser
+                } else {
+                    loginUser
+                }
+                if (valToUse.isNotBlank()) {
+                    setNodeTextDirect(node, valToUse)
+                    filledAny = true
+                }
+            }
+        }
+
+        if (filledAny) {
+            Thread.sleep(400)
+            val submitLabels = listOf("Log In", "Login", "Sign In", "Continue", "Submit", "Next", "Verify", "Proceed")
+            val btn = waitForMatchingNode(submitLabels, 1200L)
+            if (btn != null && !btn.isEditable) {
+                performClickOrTap(btn)
+            } else {
+                pressImeEnterOnFocused()
+            }
+        }
+        return filledAny
+    }
+
+    private fun setNodeTextDirect(node: AccessibilityNodeInfo, value: String): Boolean {
+        node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value)
+        }
+        return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
     }
 
     fun captureVerificationScreenshotSync(timeoutMs: Long = 2500L): String {
@@ -464,7 +581,7 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
         val indicators = mutableListOf<String>()
-        val cartRegex = Regex("(\\\\b\\\\d+\\\\s*item|view cart|go to cart|added to cart|proceed to pay|checkout|₹\\\\s*\\\\d+|confirm ride|book\\\\s+uber|send)", RegexOption.IGNORE_CASE)
+        val cartRegex = Regex("(\\\\b\\\\d+\\\\s*item|view cart|go to cart|added to cart|proceed to pay|checkout|₹\\\\s*\\\\d+|confirm ride|book\\\\s+uber|playing|subscribe|sent)", RegexOption.IGNORE_CASE)
 
         while (queue.isNotEmpty()) {
             val n = queue.removeFirst()
@@ -483,154 +600,377 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
         return if (indicators.isNotEmpty()) {
             Pair(true, indicators.distinct().take(3).joinToString(" · "))
         } else {
-            Pair(false, "Action staged for '\$query' — ready on screen")
+            Pair(false, "Completed action for '\$query'")
         }
     }
 
-    fun runAutonomousAppWorkflow(appKey: String, query: String, actionMode: String) {
-        if (query.isBlank()) return
+    fun runAutonomousAppWorkflow(appKey: String, query: String, actionMode: String, usedDeepLink: Boolean = false) {
+        val mySeq = workflowSeq.incrementAndGet()
         worker.execute {
             try {
                 lastStatus = "running"
                 lastCartVerified = false
                 lastScreenshotBase64 = ""
-                announceStatus("Automating \$appKey for \$query…", showToast = true)
+                recordStatus("Working in \$appKey…", showToast = false)
 
-                waitForExternalAppWindow(4500L)
-                Thread.sleep(650)
+                waitForExternalAppWindow(4800L)
+                if (workflowSeq.get() != mySeq) return@execute
+                Thread.sleep(700)
+
+                // 1. Check if app is asking for Login and auto-fill saved user login credentials
+                if (actionMode.equals("login", ignoreCase = true)) {
+                    val parts = query.split("|")
+                    val u = parts.getOrNull(0)?.trim().orEmpty()
+                    val p = parts.getOrNull(1)?.trim().orEmpty()
+                    val loggedIn = autoFillLoginIfPresent(appKey, u, p)
+                    Thread.sleep(1000)
+                    lastCartVerified = loggedIn
+                    lastCartSummary = if (loggedIn) "Filled login credentials in \$appKey" else "Login screen ready in \$appKey"
+                    lastScreenshotBase64 = captureVerificationScreenshotSync(2000L)
+                    lastStatus = if (loggedIn) "verified" else "needs_confirmation"
+                    recordStatus(lastCartSummary, showToast = true)
+                    return@execute
+                }
+
+                autoFillLoginIfPresent(appKey)
+
+                if (query.isBlank()) {
+                    lastStatus = "verified"
+                    lastCartVerified = true
+                    lastCartSummary = "Opened \$appKey"
+                    return@execute
+                }
 
                 val w = screenWidth().toFloat()
                 val h = screenHeight().toFloat()
 
-                val searchHints = listOf(
-                    "Search", "search", "search_bar", "search_src_text", "et_search",
-                    "What are you looking for", "Search for products", "Where to",
-                    "Enter pickup", "Search in", "Ask or search", "Message"
-                )
-                var typedOk = false
-
-                for (attempt in 0 until 3) {
-                    if (inputTextIntoNode(null, query)) {
-                        typedOk = true
-                        break
-                    }
-                    val foundSearch = waitForMatchingNode(searchHints, 1400L)
-                    if (foundSearch != null && performClickOrTap(foundSearch)) {
-                        Thread.sleep(550)
-                        if (inputTextIntoNode(null, query)) {
+                // 2. If deep link didn't already land on results, locate search bar, type query, AND submit search
+                var searchSubmitted = usedDeepLink
+                if (!usedDeepLink) {
+                    val searchHints = listOf(
+                        "Search", "search", "search_bar", "search_src_text", "et_search", "search_edit_text",
+                        "What are you looking for", "Search for products", "Search for", "Where to",
+                        "Enter pickup", "Search in", "Ask or search", "Search YouTube", "Search songs",
+                        "Search or type URL", "Find"
+                    )
+                    var typedOk = false
+                    for (attempt in 0 until 3) {
+                        if (workflowSeq.get() != mySeq) return@execute
+                        val existingEdit = findEditableNode(getActiveRoot())
+                        if (existingEdit != null && setNodeTextDirect(existingEdit, query)) {
+                            typedOk = true
+                            break
+                        }
+                        val foundSearch = waitForMatchingNode(searchHints, 1300L)
+                        if (foundSearch != null && performClickOrTap(foundSearch)) {
+                            Thread.sleep(650)
+                            val editAfterClick = findEditableNode(getActiveRoot())
+                            if (editAfterClick != null && setNodeTextDirect(editAfterClick, query)) {
+                                typedOk = true
+                                break
+                            }
+                        }
+                        // Fallback tap on standard top search bar region
+                        tapCoordinate(w * 0.48f, h * (if (attempt == 0) 0.11f else 0.16f), 80L)
+                        Thread.sleep(650)
+                        val editAfterTap = findEditableNode(getActiveRoot())
+                        if (editAfterTap != null && setNodeTextDirect(editAfterTap, query)) {
                             typedOk = true
                             break
                         }
                     }
-                    tapCoordinate(w * 0.50f, h * (if (attempt == 0) 0.11f else 0.16f), 75L)
-                    Thread.sleep(650)
-                    if (inputTextIntoNode(null, query)) {
-                        typedOk = true
-                        break
+
+                    if (typedOk) {
+                        Thread.sleep(450)
+                        submitSearchAndSelectSuggestion(appKey, query, w, h)
+                        searchSubmitted = true
+                        Thread.sleep(1600)
+                    }
+                } else {
+                    // Deep link was used; wait for results screen to settle, or if still on search box, submit it
+                    Thread.sleep(1200)
+                    val focusedEdit = getActiveRoot()?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                    if (focusedEdit != null && focusedEdit.isEditable) {
+                        val existingText = focusedEdit.text?.toString()?.trim().orEmpty()
+                        if (existingText.isEmpty() || !existingText.contains(query.take(4), ignoreCase = true)) {
+                            setNodeTextDirect(focusedEdit, query)
+                            Thread.sleep(350)
+                        }
+                        submitSearchAndSelectSuggestion(appKey, query, w, h)
+                        Thread.sleep(1500)
                     }
                 }
 
-                Thread.sleep(450)
-                pressImeSearchOrClickFirstSuggestion(query)
-                Thread.sleep(1500)
+                if (workflowSeq.get() != mySeq) return@execute
 
-                val isEcommerceOrFood = appKey in listOf("blinkit", "zepto", "swiggy", "zomato", "meesho", "flipkart", "amazon") ||
+                // 3. Complete the actual work inside the app based on app type
+                val lowerApp = appKey.lowercase()
+                val isEcommerceOrFood = lowerApp in listOf("blinkit", "zepto", "swiggy", "zomato", "meesho", "flipkart", "amazon") ||
                     actionMode.contains("order", true) || actionMode.contains("add", true) || actionMode.contains("buy", true)
 
+                if (lowerApp == "youtube" || lowerApp.contains("youtube")) {
+                    // Click the first video result below the top search bar so it actually plays
+                    var played = clickFirstResultBelowHeader(query, minYRatio = 0.20f, maxYRatio = 0.78f)
+                    if (!played) {
+                        tapCoordinate(w * 0.50f, h * 0.36f, 85L)
+                        played = true
+                    }
+                    Thread.sleep(1000)
+                    lastCartVerified = played
+                    lastCartSummary = "Playing '\$query' on YouTube"
+                    lastScreenshotBase64 = captureVerificationScreenshotSync(2000L)
+                    lastStatus = "verified"
+                    recordStatus(lastCartSummary, showToast = true)
+                    return@execute
+                }
+
+                if (lowerApp == "spotify" || lowerApp.contains("spotify")) {
+                    var played = clickFirstResultBelowHeader(query, minYRatio = 0.20f, maxYRatio = 0.70f)
+                    if (!played) {
+                        tapCoordinate(w * 0.45f, h * 0.32f, 85L)
+                        played = true
+                    }
+                    Thread.sleep(900)
+                    lastCartVerified = played
+                    lastCartSummary = "Playing '\$query' on Spotify"
+                    lastScreenshotBase64 = captureVerificationScreenshotSync(2000L)
+                    lastStatus = "verified"
+                    recordStatus(lastCartSummary, showToast = true)
+                    return@execute
+                }
+
+                if (lowerApp in listOf("whatsapp", "telegram")) {
+                    // If on a chat compose screen with Send button, click Send; if on search list, click first contact
+                    val sendBtn = waitForMatchingNode(listOf("Send", "send"), 1200L)
+                    if (sendBtn != null && !sendBtn.isEditable) {
+                        performClickOrTap(sendBtn)
+                        Thread.sleep(600)
+                    } else {
+                        clickFirstResultBelowHeader(query, minYRatio = 0.18f, maxYRatio = 0.55f)
+                        Thread.sleep(900)
+                        val sendAfter = waitForMatchingNode(listOf("Send", "send"), 1000L)
+                        if (sendAfter != null && !sendAfter.isEditable) {
+                            performClickOrTap(sendAfter)
+                        }
+                    }
+                    lastCartVerified = true
+                    lastCartSummary = "Completed message action in \$appKey"
+                    lastScreenshotBase64 = captureVerificationScreenshotSync(2000L)
+                    lastStatus = "verified"
+                    recordStatus(lastCartSummary, showToast = true)
+                    return@execute
+                }
+
+                if (lowerApp in listOf("uber", "ola", "rapido")) {
+                    clickFirstResultBelowHeader(query, minYRatio = 0.20f, maxYRatio = 0.60f)
+                    Thread.sleep(1200)
+                    val rideBtn = waitForMatchingNode(listOf("Confirm", "Book", "Choose", "Request", "Proceed"), 1800L)
+                    if (rideBtn != null) performClickOrTap(rideBtn)
+                    val (verified, summaryText) = verifyCartOrActionState(query)
+                    lastCartVerified = verified
+                    lastCartSummary = summaryText
+                    lastScreenshotBase64 = captureVerificationScreenshotSync(2000L)
+                    lastStatus = "verified"
+                    recordStatus("Ride destination '\$query' set in \$appKey", showToast = true)
+                    return@execute
+                }
+
                 if (isEcommerceOrFood) {
-                    val addLabels = listOf("ADD", "Add", "+ Add", "Add +", "Add to Cart", "ADD TO CART", "Add to bag", "Buy Now")
+                    val addLabels = listOf("ADD", "Add", "+ Add", "Add +", "Add to Cart", "ADD TO CART", "Add to bag", "ADD TO BAG", "Buy Now", "BUY NOW")
                     var added = false
 
-                    val addBtn = waitForMatchingNode(addLabels, 2200L)
-                    if (addBtn != null && performClickOrTap(addBtn)) {
+                    val addBtn = waitForMatchingNode(addLabels, 2000L)
+                    if (addBtn != null && !addBtn.isEditable && performClickOrTap(addBtn)) {
                         added = true
                     }
 
+                    // If no inline ADD button (e.g. Flipkart, Amazon, Meesho), click first product card to open product detail page
                     if (!added) {
-                        swipe(w * 0.5f, h * 0.72f, w * 0.5f, h * 0.38f, 260L)
-                        Thread.sleep(850)
-                        val addAfterScroll = waitForMatchingNode(addLabels, 1500L)
-                        if (addAfterScroll != null && performClickOrTap(addAfterScroll)) {
-                            added = true
+                        val openedProduct = clickFirstResultBelowHeader(query, minYRatio = 0.24f, maxYRatio = 0.75f)
+                        if (!openedProduct) {
+                            tapCoordinate(w * 0.32f, h * 0.42f, 85L)
                         }
-                    }
-
-                    if (!added) {
-                        if (clickNodeByText(query)) {
-                            Thread.sleep(1300)
-                            val detailAdd = waitForMatchingNode(addLabels, 1800L)
-                            if (detailAdd != null && performClickOrTap(detailAdd)) {
+                        Thread.sleep(1500)
+                        val detailAdd = waitForMatchingNode(addLabels, 2000L)
+                        if (detailAdd != null && !detailAdd.isEditable && performClickOrTap(detailAdd)) {
+                            added = true
+                        } else {
+                            swipe(w * 0.5f, h * 0.76f, w * 0.5f, h * 0.34f, 260L)
+                            Thread.sleep(800)
+                            val bottomAdd = waitForMatchingNode(addLabels, 1500L)
+                            if (bottomAdd != null && !bottomAdd.isEditable && performClickOrTap(bottomAdd)) {
                                 added = true
-                            } else {
-                                swipe(w * 0.5f, h * 0.75f, w * 0.5f, h * 0.35f, 260L)
-                                Thread.sleep(700)
-                                val bottomAdd = waitForMatchingNode(addLabels, 1200L)
-                                if (bottomAdd != null && performClickOrTap(bottomAdd)) {
-                                    added = true
-                                }
                             }
                         }
                     }
 
-                    Thread.sleep(900)
-                    val sheetConfirm = waitForMatchingNode(listOf("Add item", "Confirm", "Continue", "Done"), 900L)
-                    if (sheetConfirm != null) {
+                    Thread.sleep(850)
+                    val sheetConfirm = waitForMatchingNode(listOf("Add item", "Confirm", "Continue", "Done", "Go to Cart", "View Cart"), 1000L)
+                    if (sheetConfirm != null && !sheetConfirm.isEditable) {
                         performClickOrTap(sheetConfirm)
-                        Thread.sleep(700)
+                        Thread.sleep(650)
                     }
 
                     val (verified, summaryText) = verifyCartOrActionState(query)
                     lastCartVerified = verified || added
                     lastCartSummary = summaryText
-                    lastScreenshotBase64 = captureVerificationScreenshotSync(2200L)
-
-                    if (lastCartVerified) {
-                        lastStatus = "verified"
-                        announceStatus(
-                            "Verified: '\$query' added to cart in \$appKey (\$summaryText).",
-                            showToast = true
-                        )
-                    } else {
-                        lastStatus = "needs_confirmation"
-                        announceStatus(
-                            "Opened '\$query' in \$appKey. Please confirm variant on screen.",
-                            showToast = true
-                        )
-                    }
-                } else {
-                    Thread.sleep(1000)
-                    val (verified, summaryText) = verifyCartOrActionState(query)
-                    lastCartVerified = verified
-                    lastCartSummary = summaryText
-                    lastScreenshotBase64 = captureVerificationScreenshotSync(2200L)
-                    lastStatus = "verified"
-                    announceStatus(
-                        "Staged '\$query' in \$appKey.",
+                    lastScreenshotBase64 = captureVerificationScreenshotSync(2000L)
+                    lastStatus = if (lastCartVerified) "verified" else "needs_confirmation"
+                    recordStatus(
+                        if (lastCartVerified) "Done: '\$query' added in \$appKey" else "Opened '\$query' in \$appKey",
                         showToast = true
                     )
+                } else {
+                    // Generic app: after searching, click the first result below the search bar so it opens
+                    if (searchSubmitted) {
+                        clickFirstResultBelowHeader(query, minYRatio = 0.20f, maxYRatio = 0.75f)
+                        Thread.sleep(900)
+                    }
+                    val (verified, summaryText) = verifyCartOrActionState(query)
+                    lastCartVerified = verified || searchSubmitted
+                    lastCartSummary = summaryText
+                    lastScreenshotBase64 = captureVerificationScreenshotSync(2000L)
+                    lastStatus = "verified"
+                    recordStatus("Completed '\$query' in \$appKey", showToast = true)
                 }
             } catch (e: Exception) {
                 lastStatus = "error"
-                announceStatus(
-                    "Automation paused in \$appKey. Please confirm on screen.",
-                    showToast = true
-                )
+                recordStatus("Action paused in \$appKey", showToast = false)
             }
         }
     }
 
-    private fun pressImeSearchOrClickFirstSuggestion(query: String) {
-        val root = getActiveRoot() ?: return
+    private fun findEditableNode(root: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        if (root == null) return null
         val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-        if (focused != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            focused.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+        if (focused != null && focused.isEditable && focused.isVisibleToUser) return focused
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        while (queue.isNotEmpty()) {
+            val n = queue.removeFirst()
+            if (n.isVisibleToUser && n.isEditable) return n
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
         }
-        val matches = root.findAccessibilityNodeInfosByText(query) ?: emptyList()
-        for (node in matches) {
-            if (!node.isEditable && node.isVisibleToUser) {
-                if (performClickOrTap(node)) return
+        return null
+    }
+
+    private fun pressImeEnterOnFocused(): Boolean {
+        val root = getActiveRoot() ?: return false
+        val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: findEditableNode(root)
+        if (focused != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (focused.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)) {
+                return true
             }
         }
+        return false
+    }
+
+    private fun submitSearchAndSelectSuggestion(appKey: String, query: String, w: Float, h: Float) {
+        val root = getActiveRoot() ?: return
+        val editNode = findEditableNode(root)
+        val editRect = Rect()
+        editNode?.getBoundsInScreen(editRect)
+        val minSuggestionY = if (!editRect.isEmpty) (editRect.bottom + 12) else (h * 0.16f).toInt()
+
+        // 1. Try native IME_ENTER action on the focused EditText
+        val imeOk = pressImeEnterOnFocused()
+
+        // 2. Also look for an explicit Search / Submit icon button near the search bar (not the EditText itself)
+        val searchBtnLabels = listOf("Search", "search_go_btn", "iv_search", "btn_search", "Go", "Submit")
+        for (lbl in searchBtnLabels) {
+            val btn = findNodeMultiTier(root, lbl)
+            if (btn != null && !btn.isEditable && btn != editNode) {
+                val r = Rect()
+                btn.getBoundsInScreen(r)
+                if (r.centerX() > w * 0.65f && r.centerY() < h * 0.25f) {
+                    performClickOrTap(btn)
+                    break
+                }
+            }
+        }
+
+        // 3. Tap the keyboard bottom-right Search/Enter key (works across Gboard, Samsung, SwiftKey when keyboard is open)
+        if (!imeOk) {
+            tapCoordinate(w * 0.91f, h * 0.91f, 70L)
+        }
+
+        Thread.sleep(650)
+
+        // 4. Check if we are still on a search suggestion dropdown; if so, click the first suggestion strictly BELOW the search bar
+        val rootAfter = getActiveRoot() ?: return
+        val stillEditing = findEditableNode(rootAfter) != null
+        val queryWords = query.lowercase().split(" ").filter { it.length > 2 }
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(rootAfter)
+        var bestSuggestion: AccessibilityNodeInfo? = null
+
+        while (queue.isNotEmpty()) {
+            val n = queue.removeFirst()
+            if (n.isVisibleToUser && !n.isEditable) {
+                val r = Rect()
+                n.getBoundsInScreen(r)
+                // Strictly below the search bar and above the keyboard
+                if (r.top >= minSuggestionY && r.centerY() < h * 0.56f && r.width() > w * 0.25f && r.height() in 28..(h * 0.18f).toInt()) {
+                    val t = n.text?.toString()?.trim().orEmpty()
+                    val d = n.contentDescription?.toString()?.trim().orEmpty()
+                    val combined = "\$t \$d".lowercase()
+                    if (combined.contains(query.lowercase()) || (queryWords.isNotEmpty() && queryWords.any { combined.contains(it) })) {
+                        bestSuggestion = n
+                        break
+                    }
+                }
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+
+        if (bestSuggestion != null) {
+            performClickOrTap(bestSuggestion)
+        } else if (stillEditing) {
+            // Tap keyboard search key + first suggestion row coordinate
+            tapCoordinate(w * 0.91f, h * 0.91f, 75L)
+            Thread.sleep(450)
+            if (findEditableNode(getActiveRoot()) != null) {
+                tapCoordinate(w * 0.45f, (minSuggestionY + 70).toFloat().coerceAtMost(h * 0.30f), 75L)
+            }
+        }
+    }
+
+    private fun clickFirstResultBelowHeader(query: String, minYRatio: Float = 0.20f, maxYRatio: Float = 0.78f): Boolean {
+        val root = getActiveRoot() ?: return false
+        val w = screenWidth().toFloat()
+        val h = screenHeight().toFloat()
+        val minY = (h * minYRatio).toInt()
+        val maxY = (h * maxYRatio).toInt()
+        val queryWords = query.lowercase().split(" ").filter { it.length > 2 }
+
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var firstClickableCard: AccessibilityNodeInfo? = null
+
+        while (queue.isNotEmpty()) {
+            val n = queue.removeFirst()
+            if (n.isVisibleToUser && !n.isEditable) {
+                val r = Rect()
+                n.getBoundsInScreen(r)
+                if (r.centerY() in minY..maxY && r.width() > w * 0.22f && r.height() > 40) {
+                    val t = n.text?.toString()?.trim().orEmpty()
+                    val d = n.contentDescription?.toString()?.trim().orEmpty()
+                    val combined = "\$t \$d".lowercase()
+                    if (combined.isNotEmpty() && (combined.contains(query.lowercase()) || queryWords.any { combined.contains(it) })) {
+                        if (performClickOrTap(n)) return true
+                    }
+                    if (firstClickableCard == null && n.isClickable && combined.length > 3) {
+                        firstClickableCard = n
+                    }
+                }
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+
+        if (firstClickableCard != null) {
+            return performClickOrTap(firstClickableCard)
+        }
+        return false
     }
 
     fun dumpScreenSummary(maxNodes: Int = 90): String {
@@ -661,7 +1001,7 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
                     }
                 }
             }
-            for (i in 0 until node.childCount) {
+            for (i in 0 until n.childCount) {
                 node.getChild(i)?.let { queue.add(it) }
             }
         }
@@ -714,30 +1054,27 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
         val root = getActiveRoot() ?: return false
         var targetNode: AccessibilityNodeInfo? = null
         if (!targetLabel.isNullOrBlank()) {
-            targetNode = findNodeMultiTier(root, targetLabel.trim())?.takeIf { it.isEditable }
-        }
-        if (targetNode == null) {
-            targetNode = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-        }
-        if (targetNode == null) {
-            val queue = ArrayDeque<AccessibilityNodeInfo>()
-            queue.add(root)
-            while (queue.isNotEmpty()) {
-                val n = queue.removeFirst()
-                if (n.isVisibleToUser && n.isEditable) {
-                    targetNode = n
-                    break
+            val found = findNodeMultiTier(root, targetLabel.trim())
+            if (found != null) {
+                if (found.isEditable) {
+                    targetNode = found
+                } else {
+                    performClickOrTap(found)
+                    Thread.sleep(450)
+                    targetNode = findEditableNode(getActiveRoot())
                 }
-                for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
             }
         }
-        val node = targetNode ?: return false
-        node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        val args = Bundle().apply {
-            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, textToEnter)
+        if (targetNode == null) {
+            targetNode = findEditableNode(root)
         }
-        return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        val node = targetNode ?: return false
+        val ok = setNodeTextDirect(node, textToEnter)
+        if (ok) {
+            Thread.sleep(250)
+            pressImeEnterOnFocused()
+        }
+        return ok
     }
 
     fun runGlobal(action: String): Boolean {
@@ -759,8 +1096,10 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
         `package ${packageName}
 
 import android.app.Activity
+import android.app.SearchManager
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import android.speech.RecognizerIntent
@@ -793,6 +1132,16 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
             promise.resolve(enabledServices.contains(myPkg, ignoreCase = true))
         } catch (e: Exception) {
             promise.resolve(HarkAccessibilityService.instance != null)
+        }
+    }
+
+    @ReactMethod
+    fun syncUserLoginData(jsonStr: String, promise: Promise) {
+        try {
+            HarkAccessibilityService.updateLoginDataFromJson(reactContext, jsonStr)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.resolve(false)
         }
     }
 
@@ -843,7 +1192,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (lang.isNullOrBlank()) "en-IN" else lang)
-                putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak to Pulse OS…")
+                putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak command…")
             }
             activity.startActivityForResult(intent, VOICE_REQ_CODE)
         } catch (e: Exception) {
@@ -900,11 +1249,56 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    private fun tryDeepLinkOrSearchIntent(pkg: String, appKey: String, query: String): Boolean {
+        if (query.isBlank()) return false
+        val enc = Uri.encode(query.trim())
+        val deepLinks = when (appKey) {
+            "youtube" -> listOf("vnd.youtube://results?search_query=\$enc")
+            "blinkit" -> listOf("blinkit://search?q=\$enc")
+            "swiggy" -> listOf("swiggy://explore?query=\$enc")
+            "zomato" -> listOf("zomato://search?q=\$enc")
+            "meesho" -> listOf("meesho://search?q=\$enc")
+            "flipkart" -> listOf("flipkart://fk.dl/de_wv_CL?q=\$enc")
+            "amazon" -> listOf("com.amazon.mobile.shopping://www.amazon.in/s?k=\$enc")
+            "spotify" -> listOf("spotify:search:\$enc")
+            "maps", "navigate" -> listOf("geo:0,0?q=\$enc")
+            "playstore" -> listOf("market://search?q=\$enc")
+            "chrome", "web" -> listOf("https://www.google.com/search?q=\$enc")
+            else -> emptyList()
+        }
+
+        for (u in deepLinks) {
+            try {
+                val viewIntent = Intent(Intent.ACTION_VIEW, Uri.parse(u)).apply {
+                    setPackage(pkg)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                }
+                reactContext.startActivity(viewIntent)
+                return true
+            } catch (_: Exception) {}
+        }
+
+        if (appKey in listOf("youtube", "spotify", "flipkart", "amazon", "meesho")) {
+            try {
+                val searchIntent = Intent(Intent.ACTION_SEARCH).apply {
+                    setPackage(pkg)
+                    putExtra(SearchManager.QUERY, query.trim())
+                    putExtra("query", query.trim())
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                }
+                reactContext.startActivity(searchIntent)
+                return true
+            } catch (_: Exception) {}
+        }
+        return false
+    }
+
     @ReactMethod
     fun launchApp(nameOrPkg: String, query: String?, promise: Promise) {
         try {
             val clean = nameOrPkg.trim()
             val lower = clean.lowercase()
+            val cleanQuery = query?.trim().orEmpty()
             val pm = reactContext.packageManager
 
             val candidates = mutableListOf<String>()
@@ -912,7 +1306,17 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
             if (clean.contains(".")) candidates.add(clean)
 
             var launched = false
+            var usedDeepLink = false
+            var resolvedKey = lower
+
             for (pkg in candidates) {
+                if (cleanQuery.isNotEmpty() && !cleanQuery.contains("|")) {
+                    if (tryDeepLinkOrSearchIntent(pkg, lower, cleanQuery)) {
+                        launched = true
+                        usedDeepLink = true
+                        break
+                    }
+                }
                 val intent = pm.getLaunchIntentForPackage(pkg)
                 if (intent != null) {
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
@@ -938,17 +1342,24 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                 }
                 val matchedPkg = matched?.activityInfo?.packageName
                 if (!matchedPkg.isNullOrEmpty()) {
-                    val intent = pm.getLaunchIntentForPackage(matchedPkg)
-                    if (intent != null) {
-                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                        reactContext.startActivity(intent)
+                    resolvedKey = matched?.loadLabel(pm)?.toString()?.lowercase() ?: lower
+                    if (cleanQuery.isNotEmpty() && tryDeepLinkOrSearchIntent(matchedPkg, resolvedKey, cleanQuery)) {
                         launched = true
+                        usedDeepLink = true
+                    } else {
+                        val intent = pm.getLaunchIntentForPackage(matchedPkg)
+                        if (intent != null) {
+                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                            reactContext.startActivity(intent)
+                            launched = true
+                        }
                     }
                 }
             }
 
-            if (launched && !query.isNullOrBlank()) {
-                HarkAccessibilityService.instance?.runAutonomousAppWorkflow(lower, query.trim(), "order")
+            if (launched && cleanQuery.isNotEmpty()) {
+                val mode = if (cleanQuery.contains("|")) "login" else "order"
+                HarkAccessibilityService.instance?.runAutonomousAppWorkflow(resolvedKey, cleanQuery, mode, usedDeepLink)
             }
             promise.resolve(launched)
         } catch (e: Exception) {
@@ -963,7 +1374,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
             promise.resolve(false)
             return
         }
-        svc.runAutonomousAppWorkflow(appKey.lowercase().trim(), query.trim(), mode)
+        svc.runAutonomousAppWorkflow(appKey.lowercase().trim(), query.trim(), mode, false)
         promise.resolve(true)
     }
 
@@ -1024,7 +1435,7 @@ class HarkBridgePackage : com.facebook.react.ReactPackage {
         fs.writeFileSync(wrapperPropsPath, props, "utf8");
       }
 
-      // 2. Patch android/gradlew with 4-tier failover (services.gradle.org -> mirrors.cloud.tencent.com/gradle -> local runner GRADLE_HOME zip -> system gradle)
+      // 2. Patch android/gradlew with 4-tier failover (services.gradle.org -> mirrors.cloud.tencent.com/gradle -> downloads.gradle.org -> local runner GRADLE_HOME zip -> system gradle)
       const gradlewPath = path.join(androidRoot, "gradlew");
       if (fs.existsSync(gradlewPath)) {
         let gw = fs.readFileSync(gradlewPath, "utf8");

@@ -5,7 +5,6 @@ import {
   FlatList,
   KeyboardAvoidingView,
   Linking,
-  Animated,
   Modal,
   Platform,
   Pressable,
@@ -17,7 +16,6 @@ import {
   Switch,
   Text,
   TextInput,
-  Vibration,
   View,
   NativeModules,
   AppState,
@@ -31,26 +29,25 @@ import * as Speech from 'expo-speech';
 import * as Application from 'expo-application';
 import * as FileSystem from 'expo-file-system';
 import * as IntentLauncher from 'expo-intent-launcher';
-import { captureRef } from 'react-native-view-shot';
 
 const { HarkBridge } = NativeModules;
 
 /* ------------------------------------------------------------------ */
-/* Theme                                                               */
+/* Plain Utilitarian Theme (No Flashy Styles or Animations)           */
 /* ------------------------------------------------------------------ */
 
 const C = {
-  bg: '#060911',
-  panel: '#0F1523',
-  panel2: '#172034',
-  border: '#283552',
-  text: '#F3F6FC',
-  muted: '#94A3B8',
-  accent: '#6366F1',
-  accent2: '#06B6D4',
-  good: '#10B981',
-  warn: '#F59E0B',
-  danger: '#F43F5E',
+  bg: '#121212',
+  panel: '#1C1C1C',
+  panel2: '#252525',
+  border: '#383838',
+  text: '#F0F0F0',
+  muted: '#9E9E9E',
+  accent: '#2563EB',
+  accent2: '#3B82F6',
+  good: '#16A34A',
+  warn: '#D97706',
+  danger: '#DC2626',
 };
 
 /* ------------------------------------------------------------------ */
@@ -65,6 +62,7 @@ const STORAGE_CLOUD_URL = 'pulseos.cloud_url';
 const STORAGE_CLOUD_TOKEN = 'pulseos.cloud_token';
 const STORAGE_CLOUD_MODE = 'pulseos.cloud_mode';
 const STORAGE_SMART_MEMORY = 'pulseos.smart_memory.v1';
+const STORAGE_USER_AUTH = 'pulseos.user_auth.v1';
 
 const CLOUD_PORT = 3000;
 const CLOUD_DOMAIN = 'app.github.dev';
@@ -75,29 +73,35 @@ const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
 const DEFAULT_UPDATE_REPO = 'RedChip6261/pulse-os-android';
 const DEFAULT_CLOUD_URL = 'https://scaling-space-telegram-jjg94w99g6pj255vv-3000.app.github.dev';
 
-const SYSTEM_PROMPT = [
-  'You are Pulse, an OS-level AI agent with Accessibility Service & root/shell capabilities and an advanced multimodal AI assistant inside the Pulse OS mobile app.',
-  '1. OS-LEVEL DEVICE AUTOMATION AGENT: You control UI elements, tap screen coordinates, input user-specified data, and launch ANY installed mobile app (including Blinkit, Uber, Ola, Rapido, Zepto, Swiggy, Zomato, Meesho, Flipkart, Amazon, WhatsApp, Instagram, Telegram, Free Fire, PhonePe, GPay, Paytm, YouTube, Spotify, Maps, etc.). Parse the user voice/text command, identify the target app and action, and generate a sequence of UI automation steps to execute the task on the device screen. Handle missing-app or load exceptions gracefully with a clear status update.',
-  '2. MULTIMODAL AI ASSISTANT:',
-  '   - For images & photos: Describe the contents, extract text (OCR), detect objects, and answer specific user questions about the visual details.',
-  '   - For documents & files: Read the uploaded files, extract key information, and provide concise summaries tailored to the user needs.',
-  '   - For video files & video links: Extract transcripts/context, summarize the core content, and answer questions based on the video details.',
-  '3. SMART CONTEXT MEMORY & ACTION EXTRACTION: Personalize all text, image, and video responses across sessions. Automatically pull tasks, calendar events, and reminders directly from uploaded files, images, or videos.',
-  '4. QUICK-VERIFY SOURCE CHECKING: Cross-check extracted data from links and documents to ensure high accuracy.',
-  'Always provide structured, precise, and practical answers without unnecessary filler.',
-  'You MUST reply with ONLY a single strict JSON object, no markdown, no code fences, no extra text:',
-  '{',
-  '  "direct_response": "Clear, structured answer without filler",',
-  '  "proactive_checklist": ["2 to 5 short actionable follow-ups, extracted tasks, calendar events, or reminders"],',
-  '  "one_line_summary": "Single short sentence summary",',
-  '  "automation_script": [{"step": 1, "action": "launch_app|tap_text|tap_xy|input_text|swipe|wait|root_exec", "target": "app or node label or x,y", "value": "optional text"}],',
-  '  "memory_facts": ["optional new user preference or fact to remember across sessions"],',
-  '  "source_verified": "Verified | Needs Review"',
-  '}',
-].join('\n');
-
-type Tab = 'CHAT' | 'APPS' | 'CLOUD' | 'LIVE' | 'SETTINGS';
+type Tab = 'CHAT' | 'APPS' | 'LOGIN' | 'CLOUD' | 'LIVE' | 'SETTINGS';
 type SpeedMode = 'fast' | 'balanced' | 'smart';
+
+type SavedAppLogin = {
+  id: string;
+  app: string;
+  username: string;
+  password: string;
+};
+
+type UserAuthData = {
+  isLoggedIn: boolean;
+  name: string;
+  email: string;
+  phone: string;
+  password: string;
+  address: string;
+  savedLogins: SavedAppLogin[];
+};
+
+const DEFAULT_USER_AUTH: UserAuthData = {
+  isLoggedIn: false,
+  name: '',
+  email: '',
+  phone: '',
+  password: '',
+  address: '',
+  savedLogins: [],
+};
 
 type AutomationStep = {
   step?: number;
@@ -150,10 +154,37 @@ type CloudHealth = {
 };
 
 /* ------------------------------------------------------------------ */
-/* Helpers & Smart Cross-Session Memory                                */
+/* Helpers, Login Persistence & Smart Cross-Session Memory             */
 /* ------------------------------------------------------------------ */
 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+async function loadUserAuth(): Promise<UserAuthData> {
+  try {
+    const raw = await AsyncStorage.getItem(STORAGE_USER_AUTH);
+    if (!raw) return DEFAULT_USER_AUTH;
+    const parsed = JSON.parse(raw);
+    const data: UserAuthData = {
+      ...DEFAULT_USER_AUTH,
+      ...parsed,
+      savedLogins: Array.isArray(parsed?.savedLogins) ? parsed.savedLogins : [],
+    };
+    if (Platform.OS === 'android' && HarkBridge?.syncUserLoginData) {
+      HarkBridge.syncUserLoginData(JSON.stringify(data)).catch(() => undefined);
+    }
+    return data;
+  } catch {
+    return DEFAULT_USER_AUTH;
+  }
+}
+
+async function saveUserAuth(data: UserAuthData): Promise<void> {
+  const json = JSON.stringify(data);
+  await AsyncStorage.setItem(STORAGE_USER_AUTH, json);
+  if (Platform.OS === 'android' && HarkBridge?.syncUserLoginData) {
+    HarkBridge.syncUserLoginData(json).catch(() => undefined);
+  }
+}
 
 async function loadSmartMemory(): Promise<string[]> {
   try {
@@ -343,20 +374,17 @@ function buildStreamPrompt(extraSystem: string, smartMemory: string[]): string {
     }
   })();
   return [
-    'You are Pulse, an OS-level AI agent with Accessibility Service & root permissions and an advanced multimodal AI assistant inside Pulse OS.',
+    'You are Pulse, an OS-level Android automation agent and multimodal AI assistant.',
     'Current local time: ' + now.toString() + (tz ? ' (' + tz + ')' : '') + '.',
-    'Capabilities:',
-    '- For images/photos: Describe contents, extract visible text (OCR), detect objects, and answer specific user questions.',
-    '- For documents/files: Extract key information and provide concise, practical summaries.',
-    '- For video links/files: Summarize core content from transcripts/metadata and answer questions.',
-    '- Automatically extract tasks, calendar events, and reminders into the metadata block at the end.',
-    '- Never write fake "Executing now..." or "UI Automation Sequence:" text when you are only chatting; real app actions are executed directly by the Pulse OS native engine.',
-    'Lead with the answer. Be structured, precise, and practical with no unnecessary filler.',
-    'Reply in the same language the user writes in (English, Hindi, Telugu, Hinglish, etc).',
-    'At the very end of your response, after your main answer, append "' +
+    'STRICT EXECUTION RULES:',
+    '- NEVER claim or pretend you opened an app, searched for an item, or completed a device action in plain text unless an actual automation_script is included in the metadata block.',
+    '- When the user asks to open an app, search in an app, order/buy an item, play a video/song, send a message, or log in, always include the exact steps in "automation_script" inside the metadata JSON at the end.',
+    '- Keep answers short, plain, direct, and factual with zero filler.',
+    'Reply in the same language the user writes in.',
+    'At the very end of your response, append "' +
       META_MARK +
-      '" followed by a compact JSON object: {"proactive_checklist":["extracted task/event/reminder 1","step 2"],"one_line_summary":"short summary","memory_facts":["new user preference if any"],"source_verified":"Verified"}.',
-    smartMemory.length ? 'User Smart Context Memory Across Sessions:\n- ' + smartMemory.join('\n- ') : '',
+      '" followed by a single-line JSON object: {"proactive_checklist":[],"one_line_summary":"short summary","automation_script":[{"step":1,"action":"launch_app|tap_text|tap_xy|input_text|wait","target":"app_or_label","value":"query_or_text"}],"memory_facts":[],"source_verified":"Verified"}.',
+    smartMemory.length ? 'User Context Memory:\n- ' + smartMemory.join('\n- ') : '',
     extraSystem,
   ]
     .filter(Boolean)
@@ -378,6 +406,7 @@ function finishStreamReply(full: string): PulseReply {
   let checklist: string[] = [];
   let summary = '';
   let memory_facts: string[] = [];
+  let automation_script: AutomationStep[] | undefined;
   let source_verified = 'Verified';
   if (meta) {
     const m = stripCodeFences(meta);
@@ -392,6 +421,14 @@ function finishStreamReply(full: string): PulseReply {
         if (Array.isArray(o.memory_facts)) {
           memory_facts = o.memory_facts.map((x: unknown) => String(x).trim()).filter(Boolean);
         }
+        if (Array.isArray(o.automation_script) && o.automation_script.length > 0) {
+          automation_script = o.automation_script.map((s: any, idx: number) => ({
+            step: Number(s?.step) || idx + 1,
+            action: String(s?.action || 'launch_app'),
+            target: String(s?.target || ''),
+            value: s?.value ? String(s.value) : undefined,
+          }));
+        }
         if (o.source_verified) source_verified = String(o.source_verified);
         summary = String(o.one_line_summary ?? '').trim();
       } catch {
@@ -401,9 +438,10 @@ function finishStreamReply(full: string): PulseReply {
   }
   if (!meta && /^\s*[{`]/.test(visible)) return parsePulseReply(visible);
   return {
-    direct_response: visible || 'No response received.',
+    direct_response: visible || 'Done.',
     proactive_checklist: checklist,
     one_line_summary: summary,
+    automation_script,
     memory_facts,
     source_verified,
   };
@@ -577,15 +615,15 @@ async function streamGemini(
     lastErr = r.error || 'HTTP ' + r.status;
     if (r.error === 'Network error') sawNetwork = true;
     if (r.status === 401 || (r.status === 400 && /api key/i.test(lastErr))) {
-      throw new Error('Your Gemini API key was rejected. Check it in Settings → Assistant.');
+      throw new Error('Your Gemini API key was rejected. Check it in Settings.');
     }
     coolDown(m, r.status === 429 ? 60000 : r.status === 404 ? 3600000 : 30000);
   }
   if (sawNetwork) throw new Error('No internet connection.');
   if (/quota|429|exhausted/i.test(lastErr)) {
-    throw new Error('Your free Gemini quota is used up for now. Try again in a minute, or pick another model.');
+    throw new Error('Gemini quota reached. Try again in a minute or switch models.');
   }
-  throw new Error("Google's models are busy right now. Tap send again in a few seconds.");
+  throw new Error('Model busy. Tap send again.');
 }
 
 const FALLBACK_MODELS = [
@@ -621,7 +659,7 @@ function modelChain(preferred: string): string[] {
 }
 
 /* ------------------------------------------------------------------ */
-/* Live bus: chat ⇄ workspace ("show what the app is doing")          */
+/* Live bus: Manual workspace browser state only (no unsolicited popups) */
 /* ------------------------------------------------------------------ */
 
 type LiveState = {
@@ -641,7 +679,6 @@ const LiveBus = (() => {
   let state: LiveState = EMPTY_LIVE;
   const stateSubs = new Set<(s: LiveState) => void>();
   const navSubs = new Set<(url: string) => void>();
-  const focusSubs = new Set<() => void>();
   return {
     get: () => state,
     set(patch: Partial<LiveState>, logLine?: string) {
@@ -660,7 +697,7 @@ const LiveBus = (() => {
       };
     },
     open(url: string) {
-      state = { ...EMPTY_LIVE, active: true, url, loading: true, startedAt: Date.now(), log: [{ t: Date.now(), text: 'Opening ' + hostOf(url) }] };
+      state = { ...EMPTY_LIVE, active: false, url, loading: true, startedAt: Date.now(), log: [{ t: Date.now(), text: 'Opening ' + hostOf(url) }] };
       stateSubs.forEach((f) => f(state));
       navSubs.forEach((f) => f(url));
     },
@@ -668,15 +705,6 @@ const LiveBus = (() => {
       navSubs.add(f);
       return () => {
         navSubs.delete(f);
-      };
-    },
-    focus() {
-      focusSubs.forEach((f) => f());
-    },
-    onFocus(f: () => void) {
-      focusSubs.add(f);
-      return () => {
-        focusSubs.delete(f);
       };
     },
   };
@@ -693,86 +721,30 @@ function useLive(): LiveState {
   return s;
 }
 
-function LiveCard() {
-  const live = useLive();
-  const [, tick] = useState(0);
-  useEffect(() => {
-    if (!live.active) return;
-    const id = setInterval(() => tick((n) => n + 1), 1000);
-    return () => clearInterval(id);
-  }, [live.active]);
-  if (!live.active) return null;
-  const secs = Math.max(0, Math.round((Date.now() - live.startedAt) / 1000));
-  const last = live.log[live.log.length - 1];
-  return (
-    <Pressable onPress={() => LiveBus.focus()} style={styles.liveCard} accessibilityLabel="Open the live Workspace view">
-      <View style={styles.liveThumbWrap}>
-        {live.thumb ? (
-          <Image source={{ uri: live.thumb }} style={styles.liveThumb} resizeMode="cover" />
-        ) : (
-          <View style={[styles.liveThumb, styles.center]}>
-            <ActivityIndicator color={C.accent} />
-          </View>
-        )}
-        <View style={styles.liveBadge}>
-          <View style={[styles.liveDot, !live.loading && { backgroundColor: C.good }]} />
-          <Text style={styles.liveBadgeText}>{live.loading ? 'LIVE' : 'READY'}</Text>
-        </View>
-      </View>
-      <View style={{ flex: 1, paddingLeft: 10 }}>
-        <Text style={styles.liveTitle} numberOfLines={1}>{live.title || hostOf(live.url)}</Text>
-        <Text style={styles.mutedSmall} numberOfLines={1}>{hostOf(live.url)} · {secs}s</Text>
-        {last ? <Text style={[styles.mutedSmall, { color: C.text, marginTop: 4 }]} numberOfLines={2}>{last.text}</Text> : null}
-        {live.loading ? (
-          <View style={styles.liveTrack}><View style={[styles.liveFill, { width: (Math.round(Math.max(0.08, live.progress) * 100) + '%') as any }]} /></View>
-        ) : null}
-        <Text style={[styles.mutedSmall, { color: C.accent, marginTop: 4 }]}>Tap to watch full screen ›</Text>
-      </View>
-      <Pressable onPress={() => LiveBus.reset()} hitSlop={10} style={{ paddingLeft: 6 }} accessibilityLabel="Hide live view">
-        <Text style={styles.mutedSmall}>✕</Text>
-      </Pressable>
-    </Pressable>
-  );
-}
-
 /* ---- Reply steps ("what Pulse is doing") ---- */
 
 type Step = { label: string; status: 'active' | 'done' | 'error'; startedAt: number; ms?: number };
 
 function StepsView({ steps, streaming }: { steps: Step[]; streaming?: boolean }) {
   const [open, setOpen] = useState(true);
-  const [, tick] = useState(0);
-  useEffect(() => {
-    if (!streaming) {
-      setOpen(false);
-      return;
-    }
-    const id = setInterval(() => tick((n) => n + 1), 250);
-    return () => clearInterval(id);
-  }, [streaming]);
   if (!steps.length) return null;
   const total = steps.reduce((a, s) => a + (s.ms ?? (s.status === 'active' ? Date.now() - s.startedAt : 0)), 0);
   return (
     <View style={styles.stepsBox}>
       <Pressable onPress={() => setOpen((o) => !o)} style={styles.rowBetween}>
         <Text style={styles.stepsHead}>
-          {streaming ? '⚙️ Working… ' : '✓ Worked for '}
+          {streaming ? 'Working... ' : 'Completed in '}
           {(total / 1000).toFixed(1)}s
         </Text>
-        <Text style={styles.mutedSmall}>{open ? 'Hide steps ▴' : 'Show steps ▾'}</Text>
+        <Text style={styles.mutedSmall}>{open ? 'Hide' : 'Steps'}</Text>
       </Pressable>
       {open
         ? steps.map((s, i) => (
             <View key={i} style={styles.stepRow}>
-              {s.status === 'active' ? (
-                <ActivityIndicator size="small" color={C.accent} style={{ width: 16 }} />
-              ) : (
-                <Text style={[styles.stepIcon, s.status === 'error' && { color: C.danger }]}>{s.status === 'done' ? '✓' : '!'}</Text>
-              )}
-              <Text style={[styles.stepText, s.status === 'active' && { color: C.text }]}>{s.label}</Text>
-              <Text style={styles.stepMs}>
-                {((s.ms ?? (s.status === 'active' ? Date.now() - s.startedAt : 0)) / 1000).toFixed(1)}s
+              <Text style={[styles.stepIcon, s.status === 'error' && { color: C.danger }]}>
+                {s.status === 'active' ? '-' : s.status === 'done' ? '✓' : '!'}
               </Text>
+              <Text style={[styles.stepText, s.status === 'active' && { color: C.text }]}>{s.label}</Text>
             </View>
           ))
         : null}
@@ -785,10 +757,10 @@ function StepsView({ steps, streaming }: { steps: Step[]; streaming?: boolean })
 /* ------------------------------------------------------------------ */
 
 const MODEL_CHOICES: { id: string; name: string; note: string }[] = [
-  { id: 'gemini-2.5-flash', name: '⚡ 2.5 Flash', note: 'Fastest multimodal + agent model' },
-  { id: 'gemini-2.5-flash-lite', name: '🚀 Flash-Lite', note: 'Ultra-fast instant replies (1–2 s)' },
-  { id: 'gemini-flash-latest', name: '✨ Flash', note: 'Balanced speed & reasoning' },
-  { id: 'gemini-pro-latest', name: '🧠 Pro', note: 'Deepest reasoning & complex coding' },
+  { id: 'gemini-2.5-flash', name: '2.5 Flash', note: 'Default fast multimodal & automation model' },
+  { id: 'gemini-2.5-flash-lite', name: 'Flash-Lite', note: 'Instant low-latency replies' },
+  { id: 'gemini-flash-latest', name: 'Flash Latest', note: 'Balanced speed & reasoning' },
+  { id: 'gemini-pro-latest', name: 'Pro Latest', note: 'Complex reasoning & coding' },
 ];
 
 function modelLabel(id: string) {
@@ -851,7 +823,7 @@ async function geminiJson(
         return { json, model: m };
       } catch (e: any) {
         if (e?.message === 'KEY_REJECTED') {
-          throw new Error('Your Gemini API key was rejected. Check it in Settings → Assistant.');
+          throw new Error('Your Gemini API key was rejected. Check it in Settings.');
         }
         lastErr = e?.name === 'AbortError' ? 'slow' : e?.message || String(e);
         coolDown(m, 30000);
@@ -862,9 +834,9 @@ async function geminiJson(
     }
   }
   if (/quota|429|exhausted/i.test(lastErr)) {
-    throw new Error('Your free Gemini quota is used up for now. Try again in a minute, or pick another model.');
+    throw new Error('Gemini quota reached. Try again in a minute.');
   }
-  throw new Error("Google's models are busy right now. Try again in a few seconds.");
+  throw new Error('Model busy. Try again in a few seconds.');
 }
 
 /* ------------------------------------------------------------------ */
@@ -876,41 +848,40 @@ type AppArgs = { query?: string; to?: string; text?: string };
 type AppCatalogItem = {
   id: string;
   name: string;
-  icon: string;
   hint: string;
   aliases: string[];
   packages: string[];
 };
 
 const APPS: AppCatalogItem[] = [
-  { id: 'blinkit', name: 'Blinkit', icon: '⚡', hint: 'Groceries in 10m', aliases: ['blinkit', 'grofers'], packages: ['com.grofers.customerapp'] },
-  { id: 'uber', name: 'Uber', icon: '🚖', hint: 'Book a ride', aliases: ['uber', 'uber cab', 'uber auto'], packages: ['com.ubercab', 'com.ubercab.uberlite'] },
-  { id: 'meesho', name: 'Meesho', icon: '🛍️', hint: 'Shop products', aliases: ['meesho'], packages: ['com.meesho.supply'] },
-  { id: 'whatsapp', name: 'WhatsApp', icon: '💬', hint: 'Message to send', aliases: ['whatsapp', 'wa', 'whats app'], packages: ['com.whatsapp', 'com.whatsapp.w4b'] },
-  { id: 'instagram', name: 'Instagram', icon: '📸', hint: 'Username / Reels', aliases: ['instagram', 'insta', 'ig'], packages: ['com.instagram.android', 'com.instagram.lite'] },
-  { id: 'telegram', name: 'Telegram', icon: '✈️', hint: 'Message / Channel', aliases: ['telegram', 'tg', 'tele'], packages: ['org.telegram.messenger', 'org.telegram.messenger.web', 'org.thunderdog.challegram'] },
-  { id: 'freefire', name: 'Free Fire', icon: '🔥', hint: 'Launch game', aliases: ['freefire', 'free fire', 'free fire max', 'ff'], packages: ['com.dts.freefiremax', 'com.dts.freefireth'] },
-  { id: 'zepto', name: 'Zepto', icon: '🛒', hint: 'Fast groceries', aliases: ['zepto'], packages: ['com.zeptoconsumerapp'] },
-  { id: 'swiggy', name: 'Swiggy', icon: '🍔', hint: 'Food & Instamart', aliases: ['swiggy', 'instamart'], packages: ['in.swiggy.android'] },
-  { id: 'zomato', name: 'Zomato', icon: '🍕', hint: 'Order food', aliases: ['zomato'], packages: ['com.application.zomato'] },
-  { id: 'ola', name: 'Ola', icon: '🚕', hint: 'Book Ola cab', aliases: ['ola', 'ola cabs'], packages: ['com.olacabs.customer'] },
-  { id: 'rapido', name: 'Rapido', icon: '🛵', hint: 'Bike taxi & auto', aliases: ['rapido'], packages: ['com.rapido.passenger'] },
-  { id: 'flipkart', name: 'Flipkart', icon: '📦', hint: 'Search products', aliases: ['flipkart', 'fk'], packages: ['com.flipkart.android'] },
-  { id: 'amazon', name: 'Amazon', icon: '🛒', hint: 'Shop Amazon', aliases: ['amazon', 'amazon shopping'], packages: ['in.amazon.mShop.android.shopping', 'com.amazon.mShop.android.shopping'] },
-  { id: 'phonepe', name: 'PhonePe', icon: '🟣', hint: 'UPI & payments', aliases: ['phonepe', 'phone pe'], packages: ['com.phonepe.app'] },
-  { id: 'gpay', name: 'Google Pay', icon: '💳', hint: 'GPay UPI', aliases: ['gpay', 'google pay', 'tez'], packages: ['com.google.android.apps.nbu.paisa.user'] },
-  { id: 'paytm', name: 'Paytm', icon: '💠', hint: 'Paytm wallet/UPI', aliases: ['paytm'], packages: ['net.one97.paytm'] },
-  { id: 'youtube', name: 'YouTube', icon: '▶️', hint: 'Video to search', aliases: ['youtube', 'yt'], packages: ['com.google.android.youtube'] },
-  { id: 'spotify', name: 'Spotify', icon: '🎵', hint: 'Song or artist', aliases: ['spotify', 'music'], packages: ['com.spotify.music'] },
-  { id: 'maps', name: 'Maps', icon: '🗺️', hint: 'Place to find', aliases: ['maps', 'google maps'], packages: ['com.google.android.apps.maps'] },
-  { id: 'navigate', name: 'Navigate', icon: '🧭', hint: 'Turn-by-turn', aliases: ['navigate', 'directions'], packages: ['com.google.android.apps.maps'] },
-  { id: 'phone', name: 'Call', icon: '📞', hint: 'Phone number', aliases: ['phone', 'call', 'dialer'], packages: ['com.google.android.dialer', 'com.android.dialer'] },
-  { id: 'sms', name: 'SMS', icon: '✉️', hint: 'Message text', aliases: ['sms', 'messages'], packages: ['com.google.android.apps.messaging'] },
-  { id: 'email', name: 'Email', icon: '📧', hint: 'Subject', aliases: ['email', 'gmail', 'mail'], packages: ['com.google.android.gm'] },
-  { id: 'calendar', name: 'Calendar', icon: '📅', hint: 'Event title', aliases: ['calendar'], packages: ['com.google.android.calendar'] },
-  { id: 'playstore', name: 'Play Store', icon: '▶️', hint: 'App to find', aliases: ['playstore', 'play store'], packages: ['com.android.vending'] },
-  { id: 'web', name: 'Chrome', icon: '🌐', hint: 'Search the web', aliases: ['web', 'chrome', 'browser'], packages: ['com.android.chrome'] },
-  { id: 'settings', name: 'Settings', icon: '⚙️', hint: 'Phone settings', aliases: ['settings'], packages: ['com.android.settings'] },
+  { id: 'blinkit', name: 'Blinkit', hint: 'Groceries', aliases: ['blinkit', 'grofers'], packages: ['com.grofers.customerapp'] },
+  { id: 'uber', name: 'Uber', hint: 'Book ride', aliases: ['uber', 'uber cab', 'uber auto'], packages: ['com.ubercab', 'com.ubercab.uberlite'] },
+  { id: 'meesho', name: 'Meesho', hint: 'Shopping', aliases: ['meesho'], packages: ['com.meesho.supply'] },
+  { id: 'whatsapp', name: 'WhatsApp', hint: 'Messaging', aliases: ['whatsapp', 'wa', 'whats app'], packages: ['com.whatsapp', 'com.whatsapp.w4b'] },
+  { id: 'instagram', name: 'Instagram', hint: 'Social', aliases: ['instagram', 'insta', 'ig'], packages: ['com.instagram.android', 'com.instagram.lite'] },
+  { id: 'telegram', name: 'Telegram', hint: 'Messaging', aliases: ['telegram', 'tg', 'tele'], packages: ['org.telegram.messenger', 'org.telegram.messenger.web', 'org.thunderdog.challegram'] },
+  { id: 'freefire', name: 'Free Fire', hint: 'Game', aliases: ['freefire', 'free fire', 'free fire max', 'ff'], packages: ['com.dts.freefiremax', 'com.dts.freefireth'] },
+  { id: 'zepto', name: 'Zepto', hint: 'Groceries', aliases: ['zepto'], packages: ['com.zeptoconsumerapp'] },
+  { id: 'swiggy', name: 'Swiggy', hint: 'Food & Instamart', aliases: ['swiggy', 'instamart'], packages: ['in.swiggy.android'] },
+  { id: 'zomato', name: 'Zomato', hint: 'Food delivery', aliases: ['zomato'], packages: ['com.application.zomato'] },
+  { id: 'ola', name: 'Ola', hint: 'Cab booking', aliases: ['ola', 'ola cabs'], packages: ['com.olacabs.customer'] },
+  { id: 'rapido', name: 'Rapido', hint: 'Bike & Auto', aliases: ['rapido'], packages: ['com.rapido.passenger'] },
+  { id: 'flipkart', name: 'Flipkart', hint: 'Shopping', aliases: ['flipkart', 'fk'], packages: ['com.flipkart.android'] },
+  { id: 'amazon', name: 'Amazon', hint: 'Shopping', aliases: ['amazon', 'amazon shopping'], packages: ['in.amazon.mShop.android.shopping', 'com.amazon.mShop.android.shopping'] },
+  { id: 'phonepe', name: 'PhonePe', hint: 'UPI Payments', aliases: ['phonepe', 'phone pe'], packages: ['com.phonepe.app'] },
+  { id: 'gpay', name: 'Google Pay', hint: 'UPI Payments', aliases: ['gpay', 'google pay', 'tez'], packages: ['com.google.android.apps.nbu.paisa.user'] },
+  { id: 'paytm', name: 'Paytm', hint: 'Payments', aliases: ['paytm'], packages: ['net.one97.paytm'] },
+  { id: 'youtube', name: 'YouTube', hint: 'Videos', aliases: ['youtube', 'yt'], packages: ['com.google.android.youtube'] },
+  { id: 'spotify', name: 'Spotify', hint: 'Music', aliases: ['spotify', 'music'], packages: ['com.spotify.music'] },
+  { id: 'maps', name: 'Maps', hint: 'Navigation', aliases: ['maps', 'google maps'], packages: ['com.google.android.apps.maps'] },
+  { id: 'navigate', name: 'Navigate', hint: 'Directions', aliases: ['navigate', 'directions'], packages: ['com.google.android.apps.maps'] },
+  { id: 'phone', name: 'Call', hint: 'Dialer', aliases: ['phone', 'call', 'dialer'], packages: ['com.google.android.dialer', 'com.android.dialer'] },
+  { id: 'sms', name: 'SMS', hint: 'Messages', aliases: ['sms', 'messages'], packages: ['com.google.android.apps.messaging'] },
+  { id: 'email', name: 'Email', hint: 'Gmail', aliases: ['email', 'gmail', 'mail'], packages: ['com.google.android.gm'] },
+  { id: 'calendar', name: 'Calendar', hint: 'Schedule', aliases: ['calendar'], packages: ['com.google.android.calendar'] },
+  { id: 'playstore', name: 'Play Store', hint: 'Install apps', aliases: ['playstore', 'play store'], packages: ['com.android.vending'] },
+  { id: 'web', name: 'Chrome', hint: 'Web search', aliases: ['web', 'chrome', 'browser'], packages: ['com.android.chrome'] },
+  { id: 'settings', name: 'Settings', hint: 'Device settings', aliases: ['settings'], packages: ['com.android.settings'] },
 ];
 
 function phoneDigits(to: string) {
@@ -991,8 +962,9 @@ function appUrls(app: string, a: AppArgs): string[] {
 }
 
 /**
- * Universal mobile app launcher with native bridge, package manager intent fallback,
- * deep-link support, and structured exception status reporting.
+ * Universal mobile app launcher.
+ * Note: HarkBridge.launchApp already triggers HarkAccessibilityService.runAutonomousAppWorkflow,
+ * so we NEVER call runAutonomousWorkflow a second time when launchApp succeeds.
  */
 async function openAppWithStatus(
   appNameOrId: string,
@@ -1012,23 +984,41 @@ async function openAppWithStatus(
     (x) => x.id === clean || x.name.toLowerCase() === clean || x.aliases.includes(clean),
   );
   const displayName = catalogMatch ? catalogMatch.name : appNameOrId.trim();
+  const qText = (a.query || a.text || '').trim();
 
-  // 1. Try Native HarkBridge (launches ANY installed mobile app on the phone by label or package name, + root/accessibility fallback)
+  // 1. For WhatsApp/Phone/SMS with explicit phone number, use direct URI first
+  if (catalogMatch && (catalogMatch.id === 'whatsapp' || catalogMatch.id === 'phone' || catalogMatch.id === 'sms') && (a.to || qText)) {
+    for (const u of appUrls(catalogMatch.id, a)) {
+      try {
+        if (await Linking.canOpenURL(u)) {
+          await Linking.openURL(u);
+          if (qText && HarkBridge?.runAutonomousWorkflow) {
+            await HarkBridge.runAutonomousWorkflow(catalogMatch.id, qText, 'order').catch(() => false);
+          }
+          return {
+            ok: true,
+            appName: displayName,
+            statusMessage: `Opened ${displayName}${qText ? ` for "${qText}"` : ''}.`,
+          };
+        }
+      } catch {
+        /* fallback */
+      }
+    }
+  }
+
+  // 2. Native HarkBridge (handles direct search intents + deep links + single-thread Accessibility workflow)
   if (Platform.OS === 'android' && HarkBridge?.launchApp) {
     try {
-      const qText = (a.query || a.text || '').trim();
       const targetKey = catalogMatch ? catalogMatch.id : clean;
       const launched = await HarkBridge.launchApp(targetKey, qText);
-      if (launched && qText && HarkBridge?.runAutonomousWorkflow) {
-        await HarkBridge.runAutonomousWorkflow(targetKey, qText, 'order').catch(() => false);
-      }
       if (launched) {
         return {
           ok: true,
           appName: displayName,
           statusMessage: qText
-            ? `⚡ Hark Handoff launched ${displayName} and is autonomously executing "${qText}" on screen.`
-            : `⚡ Opened ${displayName}.`,
+            ? `Opened ${displayName} and executing "${qText}".`
+            : `Opened ${displayName}.`,
         };
       }
     } catch {
@@ -1036,16 +1026,19 @@ async function openAppWithStatus(
     }
   }
 
-  // 2. Try deep link URLs (with query/message parameters if present)
+  // 3. Try deep link URLs
   if (catalogMatch) {
     for (const u of appUrls(catalogMatch.id, a)) {
       try {
         if (await Linking.canOpenURL(u)) {
           await Linking.openURL(u);
+          if (qText && HarkBridge?.runAutonomousWorkflow) {
+            await HarkBridge.runAutonomousWorkflow(catalogMatch.id, qText, 'order').catch(() => false);
+          }
           return {
             ok: true,
             appName: displayName,
-            statusMessage: `Opened ${displayName}${a.query ? ` for "${a.query}"` : ''}.`,
+            statusMessage: `Opened ${displayName}${qText ? ` for "${qText}"` : ''}.`,
           };
         }
       } catch {
@@ -1053,7 +1046,7 @@ async function openAppWithStatus(
       }
     }
 
-    // 3. Try Android IntentLauncher for each known package variant (works for Blinkit, Uber, Meesho, Free Fire, etc.)
+    // 4. Try Android IntentLauncher for each known package variant
     if (Platform.OS === 'android') {
       for (const pkg of catalogMatch.packages) {
         try {
@@ -1062,7 +1055,6 @@ async function openAppWithStatus(
             category: 'android.intent.category.LAUNCHER',
             flags: 0x10000000,
           });
-          const qText = (a.query || a.text || '').trim();
           if (qText && HarkBridge?.runAutonomousWorkflow) {
             await HarkBridge.runAutonomousWorkflow(catalogMatch.id, qText, 'order').catch(() => false);
           }
@@ -1070,8 +1062,8 @@ async function openAppWithStatus(
             ok: true,
             appName: displayName,
             statusMessage: qText
-              ? `⚡ Hark Handoff opened ${displayName} and is executing "${qText}" automatically.`
-              : `⚡ Opened ${displayName}.`,
+              ? `Opened ${displayName} and executing "${qText}".`
+              : `Opened ${displayName}.`,
           };
         } catch {
           /* try next package */
@@ -1080,11 +1072,10 @@ async function openAppWithStatus(
     }
   }
 
-  // 4. Exception handling when app is missing or fails to load: offer Play Store / web fallback & return clear status
   return {
     ok: false,
     appName: displayName,
-    statusMessage: `Exception: "${displayName}" is not installed or failed to load on this device. You can install it from the Play Store or continue in the Live Browser.`,
+    statusMessage: `"${displayName}" is not installed on this device.`,
   };
 }
 
@@ -1094,7 +1085,108 @@ async function openApp(app: string, a: AppArgs): Promise<boolean> {
 }
 
 /**
- * Executes a multi-step UI automation sequence on the device via HarkAccessibilityService / Root shell.
+ * Extracts a clean search/action query from natural user text for a target app.
+ */
+function extractCleanAppQuery(rawGoal: string, app: AppCatalogItem): string {
+  let q = rawGoal.trim();
+  const names = [app.id, app.name, ...(app.aliases || [])]
+    .map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .sort((a, b) => b.length - a.length);
+  const appPattern = names.join('|');
+
+  q = q
+    .replace(/^(?:please\s+|can you\s+|pls\s+|hey\s+pulse\s+|pulse\s+)?/i, '')
+    .replace(new RegExp(`\\b(?:open|launch|start|run|go\\s+to|in|on|using|via|from|into)\\s+(?:the\\s+)?(?:${appPattern})(?:\\s+app)?\\b`, 'gi'), ' ')
+    .replace(new RegExp(`^(?:${appPattern})(?:\\s+app)?\\b`, 'i'), ' ')
+    .replace(/\b(?:in\s+(?:the\s+)?search\s*bar|search\s+for|search|look\s+for|find|order|buy|add\s+to\s+cart|add|book\s+a\s+ride\s+to|book|play|watch|listen\s+to|send\s+message|send)\b/gi, ' ')
+    .replace(/\b(?:to\s+my\s+cart|in\s+my\s+cart|directly|right\s+now|please|and\s+do\s+the\s+work|and)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  q = q.replace(/^(?:for|to|of|on|in|and)\s+/i, '').replace(/\s+(?:on|in|from|to)$/i, '').trim();
+  return q;
+}
+
+/**
+ * Deterministic pre-flight parser: checks if the user's message is a direct app open, search, order, play, message, or login task,
+ * and executes it immediately without letting the LLM hallucinate plain text.
+ */
+async function tryDirectDeviceExecution(
+  rawText: string,
+  recentContext: string,
+  userAuth: UserAuthData,
+  onStep?: (label: string) => void,
+): Promise<{ handled: boolean; statusMessage: string; appName?: string }> {
+  const clean = rawText.trim();
+  const lower = clean.toLowerCase();
+
+  // Check if user is asking to log in to an app
+  const loginMatch = lower.match(/\b(?:log\s*in|login|sign\s*in)\b/);
+  const matchedApp = APPS.find(
+    (app) =>
+      app.id !== 'web' &&
+      [app.id, app.name.toLowerCase(), ...(app.aliases || [])].some((al) => {
+        const escaped = al.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return new RegExp(`(?:^|\\b)${escaped}(?:\\b|$)`, 'i').test(lower);
+      }),
+  );
+
+  if (loginMatch && matchedApp) {
+    const saved = userAuth.savedLogins.find(
+      (s) =>
+        s.app.toLowerCase() === matchedApp.id ||
+        s.app.toLowerCase() === matchedApp.name.toLowerCase() ||
+        matchedApp.aliases.includes(s.app.toLowerCase()),
+    );
+    const u = saved?.username || userAuth.email || userAuth.phone || '';
+    const p = saved?.password || userAuth.password || '';
+    onStep?.(`Logging into ${matchedApp.name}...`);
+    const loginPayload = u || p ? `${u}|${p}` : '';
+    const res = await openAppWithStatus(matchedApp.id, { query: loginPayload, text: loginPayload });
+    return {
+      handled: true,
+      appName: matchedApp.name,
+      statusMessage: u
+        ? `${res.statusMessage} Auto-filling saved login for ${u}.`
+        : `${res.statusMessage} Add credentials in the LOGIN tab to auto-fill.`,
+    };
+  }
+
+  // Check if any known app is mentioned in the user message
+  if (matchedApp) {
+    const query = extractCleanAppQuery(clean, matchedApp);
+    // Extract phone number if present for WhatsApp / Call / SMS
+    const phoneMatch = clean.match(/(?:\+?91[\s-]?)?[6-9]\d{9}\b/);
+    const toPhone = phoneMatch ? phoneMatch[0] : '';
+    onStep?.(`Opening ${matchedApp.name}${query ? ` for "${query}"` : ''}...`);
+    const res = await openAppWithStatus(matchedApp.id, {
+      query,
+      text: query,
+      to: toPhone || undefined,
+    });
+    return {
+      handled: true,
+      appName: matchedApp.name,
+      statusMessage: res.statusMessage,
+    };
+  }
+
+  // Generic "open <installed app>" command for any non-catalog phone app
+  const genericOpen = clean.match(/^(?:please\s+|can you\s+|pls\s+)?(?:open|launch|start|run)\s+([a-zA-Z0-9._\s-]{2,30})$/i);
+  if (genericOpen) {
+    const target = genericOpen[1].trim();
+    onStep?.(`Opening ${target}...`);
+    const res = await openAppWithStatus(target);
+    if (res.ok) {
+      return { handled: true, appName: res.appName, statusMessage: res.statusMessage };
+    }
+  }
+
+  return { handled: false, statusMessage: '' };
+}
+
+/**
+ * Executes a multi-step UI automation sequence on the device via HarkAccessibilityService.
  */
 async function executeOsAutomationScript(
   script: AutomationStep[],
@@ -1115,9 +1207,7 @@ async function executeOsAutomationScript(
       } else if (act === 'tap_text' || act === 'click_text') {
         if (HarkBridge?.clickByText) {
           const clicked = await HarkBridge.clickByText(target);
-          logs.push(clicked ? `Tapped UI element "${target}".` : `UI element "${target}" not found on screen.`);
-        } else {
-          logs.push(`Queued assistive tap on "${target}".`);
+          logs.push(clicked ? `Tapped "${target}".` : `Element "${target}" not found.`);
         }
         await new Promise((r) => setTimeout(r, 500));
       } else if (act === 'tap_xy' || act === 'tap_coordinate') {
@@ -1126,32 +1216,21 @@ async function executeOsAutomationScript(
         const y = parseFloat(yStr);
         if (HarkBridge?.tapCoordinate && Number.isFinite(x) && Number.isFinite(y)) {
           await HarkBridge.tapCoordinate(x, y);
-          logs.push(`Tapped screen coordinates (${x}, ${y}).`);
-        } else {
-          logs.push(`Queued coordinate tap (${target}).`);
+          logs.push(`Tapped (${x}, ${y}).`);
         }
         await new Promise((r) => setTimeout(r, 450));
       } else if (act === 'input_text' || act === 'type') {
         if (HarkBridge?.inputText) {
           const typed = await HarkBridge.inputText(target, val);
-          logs.push(typed ? `Entered "${val}" into "${target || 'focused input'}".` : `Could not find input field "${target}".`);
-        } else {
-          logs.push(`Queued text input "${val}".`);
+          logs.push(typed ? `Entered "${val}".` : `Input "${target}" not found.`);
         }
         await new Promise((r) => setTimeout(r, 450));
-      } else if (act === 'root_exec' || act === 'shell') {
-        if (HarkBridge?.runRootCommand) {
-          const out = await HarkBridge.runRootCommand(target || val);
-          logs.push(`Root shell: ${String(out || 'done').slice(0, 120)}`);
-        } else {
-          logs.push(`Root shell not available on this device; skipped "${target || val}".`);
-        }
       } else if (act === 'wait') {
         await new Promise((r) => setTimeout(r, Math.min(5000, Number(val) || 1000)));
         logs.push(`Waited ${val || 1000}ms.`);
       }
     } catch (err: any) {
-      logs.push(`Exception at step ${s.step || act}: ${err?.message || String(err)}`);
+      logs.push(`Error at step ${s.step || act}: ${err?.message || String(err)}`);
       return { ok: false, log: logs };
     }
   }
@@ -1159,7 +1238,7 @@ async function executeOsAutomationScript(
 }
 
 /* ------------------------------------------------------------------ */
-/* Agent: Pulse drives its own in-app browser (LIVE tab)               */
+/* Agent: Pulse drives its in-app browser (only when needed)           */
 /* ------------------------------------------------------------------ */
 
 type PageSnap = { url: string; title: string; els: { i: number; tag: string; label: string }[]; text: string };
@@ -1241,7 +1320,6 @@ const ACT_JS = String.raw`
 var e=document.querySelector('[data-pulse-id="'+I+'"]');
 if(!e)return {ok:false,msg:'element '+I+' not found; take a new look at the page'};
 e.scrollIntoView({block:'center'});
-var old=e.style.outline;e.style.outline='3px solid #7C5CFF';setTimeout(function(){e.style.outline=old},1500);
 if(KIND==='click'){if(e.focus)e.focus();e.click();return {ok:true};}
 if(KIND==='type'){
   e.focus();
@@ -1259,22 +1337,22 @@ return {ok:false,msg:'unknown action'};
 `;
 
 const AGENT_SYSTEM = [
-  'You are Pulse OS-Level Agent with Accessibility Service & root permissions. You operate both the mobile web browser and ANY installed Android app (Blinkit, Uber, Ola, Rapido, Zepto, Swiggy, Zomato, Meesho, Flipkart, Amazon, WhatsApp, Instagram, Telegram, Free Fire, PhonePe, GPay, Paytm, YouTube, Spotify, Maps, etc.).',
-  'Parse the user command, identify the target app and action, and execute the steps cleanly.',
-  'Each turn you get the goal, steps taken, and the current page snapshot.',
+  'You are Pulse OS Agent. You operate both installed Android apps and the web browser.',
+  'If the user wants to use an installed mobile app, use open_app immediately.',
+  'If the user asks to log in or fill forms, use the saved user login credentials provided in context.',
   'Reply with ONE JSON object: {"thought": "<=12 words describing step", "action": {...}}.',
   'Actions:',
-  '{"type":"navigate","url":"https://..."}  open a web URL.',
-  '{"type":"click","i":N}  tap web element N.',
-  '{"type":"type","i":N,"text":"...","submit":true|false}  type into web field N.',
+  '{"type":"open_app","app":"blinkit|uber|meesho|whatsapp|instagram|telegram|freefire|zepto|swiggy|zomato|ola|rapido|flipkart|amazon|phonepe|gpay|paytm|maps|navigate|youtube|spotify|phone|sms|email|calendar|playstore","query":"clean search query","to":"phone","text":"message","ui_steps":[{"step":1,"action":"tap_text","target":"Search"},{"step":2,"action":"input_text","target":"Search","value":"milk"}]}',
+  '{"type":"navigate","url":"https://..."}',
+  '{"type":"click","i":N}',
+  '{"type":"type","i":N,"text":"...","submit":true|false}',
   '{"type":"scroll","dir":"down"|"up"}',
-  '{"type":"open_app","app":"blinkit|uber|meesho|whatsapp|instagram|telegram|freefire|zepto|swiggy|zomato|ola|rapido|flipkart|amazon|phonepe|gpay|paytm|maps|navigate|youtube|spotify|phone|sms|email|calendar|playstore","query":"...","to":"phone","text":"message","ui_steps":[{"step":1,"action":"tap_text","target":"Search"},{"step":2,"action":"input_text","target":"Search","value":"milk"}]}  launches the installed app and runs the UI automation sequence.',
-  '{"type":"answer","text":"..."}  task finished; provide clear status update.',
-  '{"type":"ask","text":"..."}  ask user for explicit confirmation before final checkout/payment/sending message.',
+  '{"type":"answer","text":"..."}',
+  '{"type":"ask","text":"..."}',
 ].join('\n');
 
 const AGENT_RE =
-  /^(please\s+|can you\s+|pls\s+)?(open|launch|start|run|go to|goto|search|find|look ?up|book|order|play|send|message|whatsapp|blinkit|uber|meesho|free ?fire|instagram|telegram|call|dial|navigate|take me|directions|show me|check|buy|download|watch|listen|browse|visit|compare|track|fill|apply|sign up|tap|click)\b/i;
+  /\b(open|launch|start|run|go to|goto|search|find|look ?up|book|order|play|send|message|whatsapp|blinkit|uber|meesho|free ?fire|instagram|telegram|zepto|swiggy|zomato|flipkart|amazon|youtube|spotify|ola|rapido|phonepe|gpay|paytm|call|dial|navigate|directions|buy|watch|listen|browse|visit|login|log in|sign in|tap|click)\b/i;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -1299,69 +1377,20 @@ async function runAgent(o: {
   model: string;
   goal: string;
   context: string;
+  userAuth: UserAuthData;
   onStep: (label: string) => void;
 }): Promise<string> {
-  const combinedText = (o.goal + ' ' + (o.context || '')).toLowerCase();
-  const goalLower = o.goal.toLowerCase();
-
-  const mentionedApp =
-    APPS.find(
-      (app: any) =>
-        app.id !== 'web' &&
-        [app.id, app.name.toLowerCase(), ...(app.aliases || [])].some((al: string) =>
-          goalLower.includes(al.toLowerCase()),
-        ),
-    ) ||
-    (/(cart|order|add|buy)/i.test(goalLower)
-      ? APPS.find(
-          (app: any) =>
-            app.id !== 'web' &&
-            [app.id, app.name.toLowerCase(), ...(app.aliases || [])].some((al: string) =>
-              combinedText.includes(al.toLowerCase()),
-            ),
-        )
-      : undefined);
-
-  if (mentionedApp) {
-    let cleanQuery = o.goal
-      .replace(/^(?:please\s+|can you\s+|hey pulse\s+)?(?:open|launch|start|run|search|order|book|buy|add|play|send|message)\s+/i, '')
-      .replace(new RegExp('\\b(?:on|in|using|via|from|to|into)\\s+(?:my\\s+cart\\s+(?:on|in)\\s+)?' + mentionedApp.name + '\\b', 'gi'), '')
-      .replace(new RegExp('^' + mentionedApp.name + '\\s*(?:and|to|for)?\\s*', 'i'), '')
-      .replace(/\b(?:to my cart|in my cart|directly|right now|please)\b/gi, '')
-      .trim();
-
-    if (/nothing in my cart/i.test(o.goal)) {
-      const prevMatch = (o.context || '').match(/(?:order|add|buy)\s+([a-zA-Z0-9\s]{2,25}?)(?:\s+on|\s+in|\s+from|\s+to|\n|$)/i);
-      if (prevMatch?.[1]) cleanQuery = prevMatch[1].trim();
-    }
-
-    o.onStep(`Launching ${mentionedApp.name}${cleanQuery ? ' for "' + cleanQuery + '"' : ''}…`);
-
-    const webUrlMap: Record<string, string> = {
-      blinkit: cleanQuery ? 'https://blinkit.com/s/?q=' + encodeURIComponent(cleanQuery) : 'https://blinkit.com',
-      zepto: cleanQuery ? 'https://www.zeptonow.com/search?query=' + encodeURIComponent(cleanQuery) : 'https://www.zeptonow.com',
-      swiggy: cleanQuery ? 'https://www.swiggy.com/search?query=' + encodeURIComponent(cleanQuery) : 'https://www.swiggy.com',
-      zomato: cleanQuery ? 'https://www.zomato.com/search?q=' + encodeURIComponent(cleanQuery) : 'https://www.zomato.com',
-      meesho: cleanQuery ? 'https://www.meesho.com/search?q=' + encodeURIComponent(cleanQuery) : 'https://www.meesho.com',
-      flipkart: cleanQuery ? 'https://www.flipkart.com/search?q=' + encodeURIComponent(cleanQuery) : 'https://www.flipkart.com',
-      amazon: cleanQuery ? 'https://www.amazon.in/s?k=' + encodeURIComponent(cleanQuery) : 'https://www.amazon.in',
-      uber: 'https://m.uber.com',
-      youtube: cleanQuery ? 'https://m.youtube.com/results?search_query=' + encodeURIComponent(cleanQuery) : 'https://m.youtube.com',
-    };
-    if (webUrlMap[mentionedApp.id]) {
-      LiveBus.open(webUrlMap[mentionedApp.id]);
-      LiveBus.set({}, `⚡ Hark Handoff synced ${mentionedApp.name} (${cleanQuery || 'home'})`);
-    }
-
-    const launchRes = await openAppWithStatus(mentionedApp.id, { query: cleanQuery, text: cleanQuery });
-    return `✅ ${launchRes.statusMessage}`;
+  // 1. Always try direct native app execution first so we never waste time or show fake text
+  const direct = await tryDirectDeviceExecution(o.goal, o.context, o.userAuth, o.onStep);
+  if (direct.handled) {
+    return direct.statusMessage;
   }
 
   const runner = AgentBus.runner();
-  if (!runner) throw new Error('The live browser is not ready yet. Try again in a second.');
+  if (!runner) throw new Error('Browser runner is initializing. Try again.');
   const done: string[] = [];
-  for (let n = 0; n < 25; n++) {
-    if (AgentBus.isStopped()) return 'Stopped. The page is still open in the LIVE tab.';
+  for (let n = 0; n < 15; n++) {
+    if (AgentBus.isStopped()) return 'Stopped.';
     const snap = await agentSnapshot();
     const page = snap
       ? 'URL: ' + snap.url + '\nTitle: ' + snap.title + '\nElements:\n' +
@@ -1370,38 +1399,28 @@ async function runAgent(o: {
       : 'No page is open yet (blank).';
     const prompt =
       'Goal: ' + o.goal +
-      (o.context ? '\nRecent chat:\n' + o.context : '') +
+      (o.context ? '\nContext & Saved User Login Data:\n' + o.context : '') +
       '\nSteps so far:\n' + (done.length ? done.map((d, i) => i + 1 + '. ' + d).join('\n') : '(none)') +
       '\n\nCurrent page:\n' + page;
     const { json } = await geminiJson(o.apiKey, o.model, AGENT_SYSTEM, [{ role: 'user', parts: [{ text: prompt }] }]);
     const a: any = json?.action || {};
     const thought = String(json?.thought || '').trim();
     const type = String(a.type || '');
-    if ((type === 'answer' || type === 'ask') && done.length === 0) {
-      const goalLower = o.goal.toLowerCase();
-      const matchedApp = APPS.find((ap: any) => ap.id !== 'web' && (goalLower.includes(ap.id) || goalLower.includes(ap.name.toLowerCase())));
-      if (matchedApp) {
-        o.onStep('Launching ' + matchedApp.name + ' on your phone…');
-        const ok = await openApp(matchedApp.id, { query: o.goal, text: o.goal });
-        return ok ? '✅ Opened ' + matchedApp.name + ' and started your task.' : matchedApp.name + ' is not installed on this phone.';
+
+    if (type === 'open_app' && a.app) {
+      const app = String(a.app);
+      o.onStep(thought || 'Opening ' + app);
+      const res = await openAppWithStatus(app, { query: a.query, to: a.to, text: a.text });
+      if (res.ok && Array.isArray(a.ui_steps) && a.ui_steps.length) {
+        const scriptRes = await executeOsAutomationScript(a.ui_steps, o.onStep);
+        return `${res.statusMessage}\n${scriptRes.log.join('\n')}`;
       }
-      const searchTarget = searchUrl(o.goal);
-      o.onStep('Opening Live Browser for: ' + o.goal.slice(0, 40));
-      runner.navigate(searchTarget);
-      await waitForPage();
-      done.push('navigate ' + searchTarget);
-      continue;
+      return res.statusMessage;
     }
+
     if ((type === 'answer' || type === 'ask') && done.length === 0) {
-      const goalLower = o.goal.toLowerCase();
-      const matchedApp = APPS.find((ap: any) => ap.id !== 'web' && (goalLower.includes(ap.id) || goalLower.includes(ap.name.toLowerCase())));
-      if (matchedApp) {
-        o.onStep('Launching ' + matchedApp.name + ' on your phone…');
-        const ok = await openApp(matchedApp.id, { query: o.goal, text: o.goal });
-        return ok ? '✅ Opened ' + matchedApp.name + ' and started your task.' : matchedApp.name + ' is not installed on this phone.';
-      }
       const searchTarget = searchUrl(o.goal);
-      o.onStep('Opening Live Browser for: ' + o.goal.slice(0, 40));
+      o.onStep('Searching: ' + o.goal.slice(0, 40));
       runner.navigate(searchTarget);
       await waitForPage();
       done.push('navigate ' + searchTarget);
@@ -1421,39 +1440,30 @@ async function runAgent(o: {
       o.onStep(thought || 'Tapping "' + (el?.label || a.i) + '"');
       const r: any = await runner.evalJs('var I=' + JSON.stringify(Number(a.i)) + ',KIND="click",TEXT="",SUBMIT=false;' + ACT_JS);
       await waitForPage(5000);
-      done.push('click [' + a.i + '] "' + (el?.label || '') + '" → ' + (r?.ok ? 'ok' : r?.msg || 'failed'));
+      done.push('click [' + a.i + '] "' + (el?.label || '') + '" -> ' + (r?.ok ? 'ok' : r?.msg || 'failed'));
     } else if (type === 'type' && Number.isFinite(Number(a.i))) {
       const text = String(a.text || '');
-      o.onStep(thought || 'Typing "' + text.slice(0, 30) + '"');
+      o.onStep(thought || 'Entering "' + text.slice(0, 30) + '"');
       const r: any = await runner.evalJs(
         'var I=' + JSON.stringify(Number(a.i)) + ',KIND="type",TEXT=' + JSON.stringify(text) + ',SUBMIT=' + (a.submit ? 'true' : 'false') + ';' + ACT_JS,
       );
       if (a.submit) await waitForPage(5000);
-      done.push('type [' + a.i + '] "' + text + '"' + (a.submit ? ' + Enter' : '') + ' → ' + (r?.ok ? 'ok' : r?.msg || 'failed'));
+      done.push('type [' + a.i + '] "' + text + '"' + (a.submit ? ' + Enter' : '') + ' -> ' + (r?.ok ? 'ok' : r?.msg || 'failed'));
     } else if (type === 'scroll') {
       const up = a.dir === 'up';
       o.onStep(thought || 'Scrolling ' + (up ? 'up' : 'down'));
       await runner.evalJs('window.scrollBy(0,' + (up ? '-' : '') + 'window.innerHeight*0.8);return {ok:true};');
       await sleep(300);
       done.push('scroll ' + (up ? 'up' : 'down'));
-    } else if (type === 'open_app' && a.app) {
-      const app = String(a.app);
-      o.onStep(thought || 'Launching ' + app);
-      const res = await openAppWithStatus(app, { query: a.query, to: a.to, text: a.text });
-      if (res.ok && Array.isArray(a.ui_steps) && a.ui_steps.length) {
-        const scriptRes = await executeOsAutomationScript(a.ui_steps, o.onStep);
-        return `${res.statusMessage}\n\nUI Automation Sequence:\n- ${scriptRes.log.join('\n- ')}`;
-      }
-      return res.statusMessage;
     } else {
       done.push('invalid action ' + JSON.stringify(a).slice(0, 80));
     }
   }
-  return 'Completed 10 automation steps. You can view or finish the current screen in the LIVE tab.';
+  return 'Completed browser automation steps.';
 }
 
 /* ------------------------------------------------------------------ */
-/* Conversations (side drawer with summaries)                          */
+/* Conversations (plain side drawer, no animations)                    */
 /* ------------------------------------------------------------------ */
 
 type Convo = { id: string; title: string; summary: string; updatedAt: number; messages: ChatMessage[] };
@@ -1499,7 +1509,7 @@ async function summarizeConvo(apiKey: string, messages: ChatMessage[]): Promise<
     const { json } = await geminiJson(
       apiKey,
       FAST_MODEL,
-      'Summarize this chat. Reply JSON {"title": "max 6 words", "summary": "max 25 words, what was asked and the outcome"}. Same language as the chat.',
+      'Summarize this chat. Reply JSON {"title": "max 6 words", "summary": "max 25 words"}.',
       [{ role: 'user', parts: [{ text }] }],
       9000,
     );
@@ -1518,18 +1528,275 @@ function timeAgo(ts: number) {
 }
 
 /* ------------------------------------------------------------------ */
-/* APPS tab (Universal App Launcher + Installed Device Apps)           */
+/* LOGIN & USER DATA SCREEN (Saves User Login Data & Runs Work)        */
 /* ------------------------------------------------------------------ */
 
+function LoginScreen({
+  userAuth,
+  saveAuth,
+  settings,
+  patchSettings,
+  onDoneLogin,
+}: {
+  userAuth: UserAuthData;
+  saveAuth: (next: UserAuthData) => void;
+  settings: Settings;
+  patchSettings: (p: Partial<Settings>) => void;
+  onDoneLogin?: () => void;
+}) {
+  const [name, setName] = useState(userAuth.name || settings.name || '');
+  const [email, setEmail] = useState(userAuth.email || settings.email || '');
+  const [phone, setPhone] = useState(userAuth.phone || '');
+  const [password, setPassword] = useState(userAuth.password || '');
+  const [address, setAddress] = useState(userAuth.address || '');
+  const [apiKey, setApiKey] = useState(settings.apiKey || '');
+  const [appKey, setAppKey] = useState('');
+  const [appUser, setAppUser] = useState('');
+  const [appPass, setAppPass] = useState('');
+  const [statusMsg, setStatusMsg] = useState('');
+
+  const handleSaveLogin = () => {
+    if (!name.trim() && !email.trim() && !phone.trim()) {
+      Alert.alert('Required', 'Please enter your Name, Email, or Phone number to log in.');
+      return;
+    }
+    const nextAuth: UserAuthData = {
+      ...userAuth,
+      isLoggedIn: true,
+      name: name.trim(),
+      email: email.trim(),
+      phone: phone.trim(),
+      password: password.trim(),
+      address: address.trim(),
+    };
+    saveAuth(nextAuth);
+    patchSettings({
+      name: name.trim() || settings.name,
+      email: email.trim() || settings.email,
+      ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+    });
+    setStatusMsg('User login data saved and synced with automation bridge.');
+    onDoneLogin?.();
+  };
+
+  const addSavedAppLogin = () => {
+    if (!appKey.trim() || !appUser.trim()) {
+      Alert.alert('Missing fields', 'Enter the App/Site name and Username/Email/Phone.');
+      return;
+    }
+    const entry: SavedAppLogin = {
+      id: uid(),
+      app: appKey.trim(),
+      username: appUser.trim(),
+      password: appPass.trim(),
+    };
+    const filtered = userAuth.savedLogins.filter(
+      (x) => x.app.toLowerCase() !== entry.app.toLowerCase(),
+    );
+    const nextAuth: UserAuthData = {
+      ...userAuth,
+      isLoggedIn: true,
+      name: name.trim() || userAuth.name,
+      email: email.trim() || userAuth.email,
+      phone: phone.trim() || userAuth.phone,
+      password: password.trim() || userAuth.password,
+      address: address.trim() || userAuth.address,
+      savedLogins: [entry, ...filtered],
+    };
+    saveAuth(nextAuth);
+    setAppKey('');
+    setAppUser('');
+    setAppPass('');
+    setStatusMsg(`Saved login credentials for ${entry.app}.`);
+  };
+
+  const removeSavedAppLogin = (id: string) => {
+    const nextAuth: UserAuthData = {
+      ...userAuth,
+      savedLogins: userAuth.savedLogins.filter((x) => x.id !== id),
+    };
+    saveAuth(nextAuth);
+  };
+
+  const loginAndOpenApp = async (item: SavedAppLogin) => {
+    const payload = `${item.username}|${item.password}`;
+    const res = await openAppWithStatus(item.app, { query: payload, text: payload });
+    setStatusMsg(res.statusMessage);
+  };
+
+  return (
+    <ScrollView contentContainerStyle={{ padding: 16, gap: 14, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
+      <View style={styles.rowBetween}>
+        <Text style={styles.sectionTitle}>User Login & Data</Text>
+        <View style={styles.chip}>
+          <Text style={styles.chipText}>{userAuth.isLoggedIn ? 'LOGGED IN' : 'NOT LOGGED IN'}</Text>
+        </View>
+      </View>
+
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>Account Login Details</Text>
+        <Text style={styles.mutedSmall}>
+          Saves your user profile and login credentials on device so Pulse can log into apps/sites and complete tasks using your data.
+        </Text>
+
+        <Text style={styles.fieldLabel}>Full Name</Text>
+        <TextInput
+          value={name}
+          onChangeText={setName}
+          placeholder="Your name"
+          placeholderTextColor={C.muted}
+          style={styles.input}
+        />
+
+        <Text style={styles.fieldLabel}>Email / Username</Text>
+        <TextInput
+          value={email}
+          onChangeText={setEmail}
+          placeholder="user@example.com"
+          placeholderTextColor={C.muted}
+          autoCapitalize="none"
+          keyboardType="email-address"
+          style={styles.input}
+        />
+
+        <Text style={styles.fieldLabel}>Phone Number (for WhatsApp, Shopping, Rides, OTP)</Text>
+        <TextInput
+          value={phone}
+          onChangeText={setPhone}
+          placeholder="10-digit mobile number"
+          placeholderTextColor={C.muted}
+          keyboardType="phone-pad"
+          style={styles.input}
+        />
+
+        <Text style={styles.fieldLabel}>Default Password / PIN (for App & Web Auto-Login)</Text>
+        <TextInput
+          value={password}
+          onChangeText={setPassword}
+          placeholder="Password or PIN"
+          placeholderTextColor={C.muted}
+          secureTextEntry
+          autoCapitalize="none"
+          style={styles.input}
+        />
+
+        <Text style={styles.fieldLabel}>Default Address / City (for Delivery & Ride Apps)</Text>
+        <TextInput
+          value={address}
+          onChangeText={setAddress}
+          placeholder="Address or location"
+          placeholderTextColor={C.muted}
+          style={styles.input}
+        />
+
+        <Text style={styles.fieldLabel}>Gemini API Key (Required for AI Tasks)</Text>
+        <TextInput
+          value={apiKey}
+          onChangeText={setApiKey}
+          placeholder="AIza..."
+          placeholderTextColor={C.muted}
+          secureTextEntry
+          autoCapitalize="none"
+          style={styles.input}
+        />
+
+        <Pressable onPress={handleSaveLogin} style={styles.primaryBtn}>
+          <Text style={styles.primaryBtnText}>{userAuth.isLoggedIn ? 'Update Login Data' : 'Save & Login'}</Text>
+        </Pressable>
+
+        {userAuth.isLoggedIn ? (
+          <Pressable
+            onPress={() => {
+              saveAuth({ ...userAuth, isLoggedIn: false });
+              setStatusMsg('Logged out.');
+            }}
+            style={styles.secondaryBtn}
+          >
+            <Text style={styles.primaryBtnText}>Log Out</Text>
+          </Pressable>
+        ) : null}
+
+        {statusMsg ? <Text style={{ color: C.good, fontSize: 13, marginTop: 4 }}>{statusMsg}</Text> : null}
+      </View>
+
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>Saved App & Website Logins ({userAuth.savedLogins.length})</Text>
+        <Text style={styles.mutedSmall}>
+          Add specific app credentials (e.g. Flipkart, Meesho, Instagram, Amazon). Tap "Login & Work" or say "login to Flipkart" in Chat.
+        </Text>
+
+        <Text style={styles.fieldLabel}>App or Website Name</Text>
+        <TextInput
+          value={appKey}
+          onChangeText={setAppKey}
+          placeholder="e.g. flipkart, meesho, instagram, amazon"
+          placeholderTextColor={C.muted}
+          autoCapitalize="none"
+          style={styles.input}
+        />
+
+        <Text style={styles.fieldLabel}>Username / Email / Phone</Text>
+        <TextInput
+          value={appUser}
+          onChangeText={setAppUser}
+          placeholder="Username, email, or phone"
+          placeholderTextColor={C.muted}
+          autoCapitalize="none"
+          style={styles.input}
+        />
+
+        <Text style={styles.fieldLabel}>Password</Text>
+        <TextInput
+          value={appPass}
+          onChangeText={setAppPass}
+          placeholder="Password"
+          placeholderTextColor={C.muted}
+          secureTextEntry
+          autoCapitalize="none"
+          style={styles.input}
+        />
+
+        <Pressable onPress={addSavedAppLogin} style={styles.secondaryBtn}>
+          <Text style={styles.primaryBtnText}>+ Save App Login</Text>
+        </Pressable>
+
+        {userAuth.savedLogins.map((item) => (
+          <View
+            key={item.id}
+            style={[
+              styles.rowBetween,
+              { paddingVertical: 8, borderTopWidth: 1, borderTopColor: C.border, marginTop: 6 },
+            ]}
+          >
+            <View style={{ flex: 1 }}>
+              <Text style={{ color: C.text, fontWeight: '700', fontSize: 14 }}>{item.app}</Text>
+              <Text style={styles.mutedSmall}>{item.username}</Text>
+            </View>
+            <View style={{ flexDirection: 'row', gap: 6 }}>
+              <Pressable onPress={() => loginAndOpenApp(item)} style={[styles.chip, { borderColor: C.accent }]}>
+                <Text style={styles.chipText}>Login & Open</Text>
+              </Pressable>
+              <Pressable onPress={() => removeSavedAppLogin(item.id)} style={styles.chip}>
+                <Text style={[styles.chipText, { color: C.danger }]}>Delete</Text>
+              </Pressable>
+            </View>
+          </View>
+        ))}
+      </View>
+    </ScrollView>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* CLOUD & APPS TABS                                                   */
+/* ------------------------------------------------------------------ */
 
 function CloudComputerScreen({
   settings,
   patchSettings,
-  say,
 }: {
   settings: Settings;
   patchSettings: (p: Partial<Settings>) => void;
-  say: (t: string) => void;
 }) {
   const [status, setStatus] = useState<'checking' | 'online' | 'offline'>('checking');
   const [taskType, setTaskType] = useState<'plan' | 'summarize' | 'budget' | 'echo'>('plan');
@@ -1564,27 +1831,25 @@ function CloudComputerScreen({
       if (status === 'online' && base) {
         const payload =
           taskType === 'plan'
-            ? { summary: taskInput || 'Extended testing sprint', checklist: ['Deep work block', 'Verify features', 'Ship release'], start: '09:00' }
+            ? { summary: taskInput || 'Work sprint', checklist: ['Execute task', 'Verify output', 'Complete'], start: '09:00' }
             : taskType === 'summarize'
-              ? { text: taskInput || 'Pulse OS cloud computer workload.' }
+              ? { text: taskInput || 'Cloud workload.' }
               : taskType === 'budget'
-                ? { income: 50000, items: [{ label: 'Cloud Server', amount: 2500 }, { label: 'AI API', amount: 1500 }] }
-                : { message: taskInput || 'Hello Cloud Computer!' };
+                ? { income: 50000, items: [{ label: 'Server', amount: 2500 }, { label: 'API', amount: 1500 }] }
+                : { message: taskInput || 'Ping' };
         const run = await runCloudTask(base, settings.cloudToken, settings.apiKey || undefined, taskType, payload);
-        setOutput('✅ Cloud Server Output:\n' + JSON.stringify(run?.result ?? run, null, 2));
-        say('Cloud task completed.');
+        setOutput('Cloud Output:\n' + JSON.stringify(run?.result ?? run, null, 2));
       } else if (settings.apiKey) {
         const { json, model } = await geminiJson(
           settings.apiKey,
           settings.model || DEFAULT_MODEL,
-          'You are the Pulse OS Cloud Computer Engine. Execute the requested cloud workload and return structured JSON.',
-          [{ role: 'user', parts: [{ text: 'Task: ' + taskType + '\nInput: ' + (taskInput || 'Generate productivity plan & system report') }] }],
+          'Execute the requested workload and return structured JSON.',
+          [{ role: 'user', parts: [{ text: 'Task: ' + taskType + '\nInput: ' + (taskInput || 'Generate task plan') }] }],
           25000,
         );
-        setOutput('⚡ Pulse Hybrid Cloud Engine (' + model + '):\n' + JSON.stringify(json, null, 2));
-        say('Cloud computer task complete.');
+        setOutput('Hybrid Engine (' + model + '):\n' + JSON.stringify(json, null, 2));
       } else {
-        setOutput('⚠️ Add your Gemini API key in Settings or wake your GitHub Codespace.');
+        setOutput('Add your Gemini API key in LOGIN or SETTINGS.');
       }
     } catch (e: any) {
       setOutput('Error: ' + (e?.message || String(e)));
@@ -1596,10 +1861,10 @@ function CloudComputerScreen({
   return (
     <ScrollView contentContainerStyle={{ padding: 16, gap: 14, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
       <View style={styles.rowBetween}>
-        <Text style={styles.sectionTitle}>☁️ Cloud Computer</Text>
-        <View style={[styles.chip, { borderColor: status === 'online' ? C.good : C.accent2 }]}>
-          <Text style={[styles.chipText, { color: status === 'online' ? C.good : C.accent2 }]}>
-            {status === 'online' ? '🟢 Remote Server Online' : status === 'checking' ? '⏳ Checking…' : '⚡ Hybrid Cloud Active'}
+        <Text style={styles.sectionTitle}>Cloud Computer</Text>
+        <View style={styles.chip}>
+          <Text style={styles.chipText}>
+            {status === 'online' ? 'Remote Online' : status === 'checking' ? 'Checking...' : 'Local Engine'}
           </Text>
         </View>
       </View>
@@ -1608,16 +1873,13 @@ function CloudComputerScreen({
           <Text style={styles.cardTitle}>Cloud Routing</Text>
           <Switch value={settings.cloudMode} onValueChange={(v) => patchSettings({ cloudMode: v })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
         </View>
-        <Text style={styles.mutedSmall}>
-          Routes tasks to your Cloud Server when online and automatically fails over to the local Hybrid Cloud Engine so your Cloud Computer always works.
-        </Text>
         <TextInput value={settings.cloudUrl} onChangeText={(t) => patchSettings({ cloudUrl: t })} onBlur={() => patchSettings({ cloudUrl: normalizeCloudUrl(settings.cloudUrl) })} placeholder={DEFAULT_CLOUD_URL} placeholderTextColor={C.muted} autoCapitalize="none" style={styles.input} />
         <Pressable onPress={refreshCloud} style={styles.secondaryBtn}>
-          <Text style={styles.primaryBtnText}>↻ Ping Cloud Server</Text>
+          <Text style={styles.primaryBtnText}>Ping Server</Text>
         </Pressable>
       </View>
       <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>🚀 Run Cloud Computer Task</Text>
+        <Text style={styles.cardTitle}>Run Task</Text>
         <View style={styles.segment}>
           {(['plan', 'summarize', 'budget', 'echo'] as const).map((t) => (
             <Pressable key={t} onPress={() => setTaskType(t)} style={[styles.segItem, taskType === t && styles.segItemOn]}>
@@ -1625,12 +1887,12 @@ function CloudComputerScreen({
             </Pressable>
           ))}
         </View>
-        <TextInput value={taskInput} onChangeText={setTaskInput} placeholder="Enter goal, document text, or cloud job parameters…" placeholderTextColor={C.muted} multiline style={[styles.input, { minHeight: 70, marginTop: 8 }]} />
+        <TextInput value={taskInput} onChangeText={setTaskInput} placeholder="Enter task input..." placeholderTextColor={C.muted} multiline style={[styles.input, { minHeight: 70, marginTop: 8 }]} />
         <Pressable onPress={executeTask} disabled={running} style={styles.primaryBtn}>
-          {running ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>▶ Execute on Cloud Computer</Text>}
+          {running ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Execute Task</Text>}
         </Pressable>
         {output ? (
-          <View style={{ marginTop: 10, padding: 12, borderRadius: 10, backgroundColor: C.bg, borderWidth: 1, borderColor: C.border }}>
+          <View style={{ marginTop: 10, padding: 12, borderRadius: 6, backgroundColor: C.bg, borderWidth: 1, borderColor: C.border }}>
             <Text style={{ color: C.text, fontSize: 12 }}>{output}</Text>
           </View>
         ) : null}
@@ -1639,9 +1901,9 @@ function CloudComputerScreen({
   );
 }
 
-function AppsScreen({ say }: { say: (t: string) => void }) {
+function AppsScreen({ userAuth }: { userAuth: UserAuthData }) {
   const [text, setText] = useState('');
-  const [to, setTo] = useState('');
+  const [to, setTo] = useState(userAuth.phone || '');
   const [last, setLast] = useState('');
   const [installedApps, setInstalledApps] = useState<{ label: string; packageName: string }[]>([]);
 
@@ -1655,34 +1917,32 @@ function AppsScreen({ say }: { say: (t: string) => void }) {
     }
   }, []);
 
-  const launch = async (idOrPkg: string, name: string) => {
-    const res = await openAppWithStatus(idOrPkg, idOrPkg === 'email' ? { query: text, text: '' } : { query: text, text, to });
+  const launch = async (idOrPkg: string) => {
+    const cleanQ = text.trim();
+    const res = await openAppWithStatus(
+      idOrPkg,
+      idOrPkg === 'email' ? { query: cleanQ, text: '' } : { query: cleanQ, text: cleanQ, to: to.trim() },
+    );
     setLast(res.statusMessage);
-    say(res.statusMessage);
   };
 
   return (
     <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
-      <View style={{ gap: 8, marginBottom: 4 }}>
-        <View style={styles.rowBetween}>
-          <Text style={styles.sectionTitle}>Universal Apps</Text>
-          <Pressable
-            onPress={() => openAppWithStatus('accessibility')}
-            style={[styles.chip, { borderColor: C.accent2, paddingHorizontal: 12, paddingVertical: 6 }]}
-          >
-            <Text style={[styles.chipText, { color: C.accent2, fontSize: 11 }]}>♿ Assistive Bridge</Text>
-          </Pressable>
-        </View>
+      <View style={styles.rowBetween}>
+        <Text style={styles.sectionTitle}>Apps & Direct Actions</Text>
+        <Pressable onPress={() => openAppWithStatus('accessibility')} style={styles.chip}>
+          <Text style={styles.chipText}>Accessibility Bridge</Text>
+        </Pressable>
       </View>
       <Text style={[styles.mutedSmall, { marginTop: 4 }]}>
-        Launch Blinkit, Uber, Meesho, WhatsApp, Instagram, Telegram, Free Fire, or any app installed on your phone.
+        Enter a search term, product to order, video to play, or message, then tap an app to open and execute it.
       </Text>
       <TextInput
         value={text}
         onChangeText={setText}
-        placeholder="Search query, item to order, destination, or message…"
+        placeholder="Search query, product to buy, video to play, or message..."
         placeholderTextColor={C.muted}
-        style={[styles.input, { marginTop: 12 }]}
+        style={[styles.input, { marginTop: 10 }]}
       />
       <TextInput
         value={to}
@@ -1693,14 +1953,13 @@ function AppsScreen({ say }: { say: (t: string) => void }) {
         style={[styles.input, { marginTop: 8 }]}
       />
       {last ? (
-        <View style={[styles.settingsCard, { marginTop: 10, borderColor: C.accent }]}>
+        <View style={[styles.settingsCard, { marginTop: 10 }]}>
           <Text style={styles.bubbleText}>{last}</Text>
         </View>
       ) : null}
       <View style={styles.appGrid}>
         {APPS.map((a) => (
-          <Pressable key={a.id} onPress={() => launch(a.id, a.name)} style={styles.appTile} accessibilityLabel={'Open ' + a.name}>
-            <Text style={{ fontSize: 26 }}>{a.icon}</Text>
+          <Pressable key={a.id} onPress={() => launch(a.id)} style={styles.appTile} accessibilityLabel={'Open ' + a.name}>
             <Text style={styles.appName} numberOfLines={1}>{a.name}</Text>
             <Text style={[styles.mutedSmall, { fontSize: 10 }]} numberOfLines={1}>{a.hint}</Text>
           </Pressable>
@@ -1708,16 +1967,15 @@ function AppsScreen({ say }: { say: (t: string) => void }) {
       </View>
 
       {installedApps.length > 0 ? (
-        <View style={{ marginTop: 22 }}>
-          <Text style={styles.sectionTitle}>All Installed Phone Apps ({installedApps.length})</Text>
+        <View style={{ marginTop: 20 }}>
+          <Text style={styles.sectionTitle}>Installed Device Apps ({installedApps.length})</Text>
           <View style={styles.appGrid}>
             {installedApps.map((item) => (
               <Pressable
                 key={item.packageName}
-                onPress={() => launch(item.packageName, item.label)}
+                onPress={() => launch(item.packageName)}
                 style={styles.appTile}
               >
-                <Text style={{ fontSize: 22 }}>📱</Text>
                 <Text style={styles.appName} numberOfLines={1}>{item.label}</Text>
               </Pressable>
             ))}
@@ -1768,14 +2026,14 @@ async function cloudFetch(
     } catch {
       throw new Error(
         res.status === 401 || /<html/i.test(text)
-          ? 'Cloud URL returned a web page. Set port ' + CLOUD_PORT + ' to Public in the Codespace Ports tab.'
+          ? 'Cloud URL returned a web page. Set port ' + CLOUD_PORT + ' to Public.'
           : 'Cloud returned non-JSON (HTTP ' + res.status + ').',
       );
     }
     if (!res.ok || json?.ok === false) throw new Error(json?.error || 'Cloud HTTP ' + res.status);
     return json;
   } catch (e: any) {
-    if (e?.name === 'AbortError') throw new Error('Cloud timed out. Is the Codespace running?');
+    if (e?.name === 'AbortError') throw new Error('Cloud timed out.');
     throw e;
   } finally {
     clearTimeout(timer);
@@ -1818,6 +2076,7 @@ async function callCloudChat(
       direct_response: String(r.direct_response ?? ''),
       proactive_checklist: Array.isArray(r.proactive_checklist) ? r.proactive_checklist.map(String) : [],
       one_line_summary: String(r.one_line_summary ?? ''),
+      automation_script: Array.isArray(r.automation_script) ? r.automation_script : undefined,
     },
     modelUsed: String(json?.model ?? ''),
   };
@@ -1832,21 +2091,6 @@ async function runCloudTask(
 ): Promise<any> {
   const json = await cloudFetch(base, token, '/api/task', { body: { type, payload }, geminiKey, timeoutMs: 45000 });
   return json.run;
-}
-
-function speak(text: string) {
-  if (!text.trim()) return;
-  Speech.stop();
-  Speech.speak(text, { language: 'en-US', rate: 1.0, pitch: 1.0 });
-}
-
-function replyToSpeech(r: PulseReply): string {
-  const parts: string[] = [];
-  if (r.one_line_summary) parts.push(r.one_line_summary);
-  if (r.proactive_checklist.length) {
-    parts.push('Suggested next steps: ' + r.proactive_checklist.join('. ') + '.');
-  }
-  return parts.join(' ');
 }
 
 function pad(n: number) {
@@ -1889,38 +2133,8 @@ function smsUrl(body: string) {
   return 'sms:?body=' + encodeURIComponent(body);
 }
 
-async function openLink(url: string) {
-  try {
-    await Linking.openURL(url);
-  } catch {
-    Alert.alert('Could not open', 'No app on this device can handle that action.');
-  }
-}
-
-type ActionItem = { label: string; url: string };
-
-function actionsForItem(item: string, summary: string): ActionItem[] {
-  const lower = item.toLowerCase();
-  const actions: ActionItem[] = [{ label: '📅 Calendar', url: calendarUrl(item, summary) }];
-  if (/(weather|rain|forecast|temperature)/.test(lower)) {
-    actions.push({ label: '🌦 Weather', url: searchUrl('weather today') });
-  } else {
-    actions.push({ label: '🔎 Search', url: searchUrl(item) });
-  }
-  if (/(email|mail|send|write)/.test(lower)) {
-    actions.push({ label: '✉️ Email', url: mailtoUrl(item, summary) });
-  }
-  if (/(text|message|sms|whatsapp|remind)/.test(lower)) {
-    actions.push({ label: '💬 SMS', url: smsUrl(item) });
-  }
-  if (/(call|phone|ring)/.test(lower)) {
-    actions.push({ label: '📞 Dial', url: 'tel:' });
-  }
-  return actions;
-}
-
 /* ------------------------------------------------------------------ */
-/* Multimodal Picker & Native Voice Recognition WebView Modal          */
+/* Multimodal Picker HTML (Plain UI)                                   */
 /* ------------------------------------------------------------------ */
 
 const MULTIMODAL_PICKER_HTML = `<!DOCTYPE html>
@@ -1929,80 +2143,49 @@ const MULTIMODAL_PICKER_HTML = `<!DOCTYPE html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
 <style>
-  body { background: #121826; color: #E6EAF2; font-family: system-ui, -apple-system, Roboto, sans-serif; margin: 0; padding: 18px; }
-  h3 { margin: 0 0 6px 0; font-size: 17px; color: #fff; }
-  p { margin: 0 0 14px 0; font-size: 13px; color: #8A94A8; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
-  .btn { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 14px 10px; border-radius: 14px; background: #1A2233; border: 1px solid #263047; color: #E6EAF2; font-weight: 700; font-size: 13px; cursor: pointer; text-align: center; gap: 6px; }
-  .btn:active { border-color: #7C5CFF; background: #2A1F5C; }
-  .icon { font-size: 24px; }
-  .box { background: #1A2233; border: 1px solid #263047; border-radius: 12px; padding: 12px; margin-top: 10px; }
-  input[type="url"], input[type="text"] { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 10px; border: 1px solid #263047; background: #0B0F17; color: #fff; font-size: 14px; margin-top: 6px; }
-  .act { width: 100%; margin-top: 10px; padding: 11px; border-radius: 10px; border: none; background: #7C5CFF; color: #fff; font-weight: 700; font-size: 14px; cursor: pointer; }
-  .status { margin-top: 10px; font-size: 12px; color: #22D3EE; text-align: center; }
+  body { background: #1C1C1C; color: #F0F0F0; font-family: system-ui, sans-serif; margin: 0; padding: 16px; }
+  h3 { margin: 0 0 6px 0; font-size: 16px; color: #fff; }
+  p { margin: 0 0 12px 0; font-size: 12px; color: #9E9E9E; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+  .btn { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 12px 8px; border-radius: 6px; background: #252525; border: 1px solid #383838; color: #F0F0F0; font-weight: 600; font-size: 13px; cursor: pointer; text-align: center; gap: 4px; }
+  .box { background: #252525; border: 1px solid #383838; border-radius: 6px; padding: 12px; margin-top: 8px; }
+  input[type="url"], input[type="text"] { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 6px; border: 1px solid #383838; background: #121212; color: #fff; font-size: 14px; margin-top: 6px; }
+  .act { width: 100%; margin-top: 8px; padding: 10px; border-radius: 6px; border: none; background: #2563EB; color: #fff; font-weight: 600; font-size: 14px; cursor: pointer; }
+  .status { margin-top: 8px; font-size: 12px; color: #9E9E9E; text-align: center; }
   input[type="file"] { display: none; }
 </style>
 </head>
 <body>
-  <h3>📎 Attach Image, Photo, Video or Document</h3>
-  <p>Select a file from your phone or paste a YouTube / Video URL for deep multimodal analysis, OCR, & action extraction.</p>
+  <h3>Attach File or Link</h3>
+  <p>Select a file or paste a video link for analysis.</p>
   <div class="grid">
-    <label class="btn" for="imgInput">
-      <span class="icon">🖼️</span>
-      <span>Photo / Image</span>
-      <span style="font-size:11px;color:#8A94A8;font-weight:400">OCR & Object Detect</span>
-    </label>
-    <label class="btn" for="camInput">
-      <span class="icon">📷</span>
-      <span>Camera Photo</span>
-      <span style="font-size:11px;color:#8A94A8;font-weight:400">Snap & Analyze</span>
-    </label>
-    <label class="btn" for="docInput">
-      <span class="icon">📄</span>
-      <span>Document / PDF</span>
-      <span style="font-size:11px;color:#8A94A8;font-weight:400">PDF, TXT, CSV, JSON, MD</span>
-    </label>
-    <label class="btn" for="vidInput">
-      <span class="icon">🎬</span>
-      <span>Video File</span>
-      <span style="font-size:11px;color:#8A94A8;font-weight:400">MP4 / WebM Analysis</span>
-    </label>
+    <label class="btn" for="imgInput"><span>Photo / Image</span></label>
+    <label class="btn" for="camInput"><span>Camera</span></label>
+    <label class="btn" for="docInput"><span>Document / PDF</span></label>
+    <label class="btn" for="vidInput"><span>Video File</span></label>
   </div>
-
   <input id="imgInput" type="file" accept="image/*" />
   <input id="camInput" type="file" accept="image/*" capture="environment" />
   <input id="docInput" type="file" accept=".pdf,.txt,.md,.csv,.json,.xml,.html,.doc,.docx,application/pdf,text/*" />
   <input id="vidInput" type="file" accept="video/*" />
-
   <div class="box">
-    <div style="font-size:13px;font-weight:700;">🔗 Or Analyze a YouTube / Video Link</div>
+    <div style="font-size:13px;font-weight:600;">YouTube / Video URL</div>
     <input id="ytUrl" type="url" placeholder="https://www.youtube.com/watch?v=..." />
-    <button class="act" id="ytBtn">Attach Video Link for Transcript & Summary</button>
+    <button class="act" id="ytBtn">Attach Link</button>
   </div>
   <div id="status" class="status"></div>
-
 <script>
   function send(payload) {
-    if (window.ReactNativeWebView) {
-      window.ReactNativeWebView.postMessage(JSON.stringify(payload));
-    }
+    if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify(payload));
   }
   function handleFile(file, kind) {
     if (!file) return;
-    var st = document.getElementById('status');
-    st.textContent = 'Reading ' + file.name + ' (' + Math.round(file.size/1024) + ' KB)...';
+    document.getElementById('status').textContent = 'Reading ' + file.name + '...';
     var isText = /^text\\/|\\.(txt|md|csv|json|xml|html|js|ts|py)$/i.test(file.type || file.name);
     var reader = new FileReader();
     if (isText) {
       reader.onload = function(e) {
-        send({
-          type: 'attachment',
-          name: file.name,
-          mimeType: file.type || 'text/plain',
-          kind: 'document',
-          textContent: String(e.target.result || '').slice(0, 40000),
-          sizeBytes: file.size
-        });
+        send({ type: 'attachment', name: file.name, mimeType: file.type || 'text/plain', kind: 'document', textContent: String(e.target.result || '').slice(0, 40000), sizeBytes: file.size });
       };
       reader.readAsText(file);
     } else {
@@ -2010,15 +2193,7 @@ const MULTIMODAL_PICKER_HTML = `<!DOCTYPE html>
         var dataUrl = String(e.target.result || '');
         var comma = dataUrl.indexOf(',');
         var b64 = comma !== -1 ? dataUrl.slice(comma + 1) : dataUrl;
-        send({
-          type: 'attachment',
-          name: file.name,
-          mimeType: file.type || (kind === 'image' ? 'image/jpeg' : kind === 'video' ? 'video/mp4' : 'application/pdf'),
-          kind: kind,
-          base64: b64,
-          uri: dataUrl,
-          sizeBytes: file.size
-        });
+        send({ type: 'attachment', name: file.name, mimeType: file.type || (kind === 'image' ? 'image/jpeg' : kind === 'video' ? 'video/mp4' : 'application/pdf'), kind: kind, base64: b64, uri: dataUrl, sizeBytes: file.size });
       };
       reader.readAsDataURL(file);
     }
@@ -2029,21 +2204,15 @@ const MULTIMODAL_PICKER_HTML = `<!DOCTYPE html>
   document.getElementById('vidInput').onchange = function(e){ handleFile(e.target.files[0], 'video'); };
   document.getElementById('ytBtn').onclick = function(){
     var u = document.getElementById('ytUrl').value.trim();
-    if (!u) { alert('Paste a video URL first.'); return; }
-    send({
-      type: 'attachment',
-      name: u,
-      mimeType: 'text/uri-list',
-      kind: 'video_link',
-      uri: u
-    });
+    if (!u) return;
+    send({ type: 'attachment', name: u, mimeType: 'text/uri-list', kind: 'video_link', uri: u });
   };
 </script>
 </body>
 </html>`;
 
 /* ------------------------------------------------------------------ */
-/* Settings model                                                      */
+/* Settings model (Voice OFF by default — silent execution)            */
 /* ------------------------------------------------------------------ */
 
 const STORAGE_SETTINGS = 'pulseos.settings.v2';
@@ -2084,28 +2253,28 @@ const DEFAULT_SETTINGS: Settings = {
   name: '',
   email: '',
   role: '',
-  avatar: '⚡',
+  avatar: 'P',
   profilePhotoUri: '',
   selfLearn: true,
   focusGoalMin: 480,
   personalize: true,
   apiKey: '',
   model: DEFAULT_MODEL,
-  temperature: 0.5,
+  temperature: 0.3,
   speed: 'fast',
   fastModel: FAST_MODEL,
-  replyLength: 'balanced',
+  replyLength: 'short',
   historyLimit: 200,
   cloudUrl: DEFAULT_CLOUD_URL,
   cloudToken: '',
-  cloudMode: true,
-  voiceOn: true,
+  cloudMode: false,
+  voiceOn: false,
   voiceRate: 1.0,
   voicePitch: 1.0,
-  voiceLang: 'en-US',
+  voiceLang: 'en-IN',
   homeUrl: 'https://www.google.com',
-  confirmBeforeComplete: true,
-  haptics: true,
+  confirmBeforeComplete: false,
+  haptics: false,
   updateRepo: DEFAULT_UPDATE_REPO,
   updateToken: '',
   autoCheckUpdates: true,
@@ -2117,13 +2286,14 @@ async function loadSettings(): Promise<Settings> {
     try {
       const saved: any = JSON.parse(raw);
       const merged: Settings = { ...DEFAULT_SETTINGS, ...saved };
-      if (!saved.rev || saved.rev < 4) {
+      if (!saved.rev || saved.rev < 5) {
         merged.speed = 'fast';
         merged.fastModel = FAST_MODEL;
         merged.model = DEFAULT_MODEL;
         merged.cloudMode = false;
+        merged.voiceOn = false;
         if (!merged.cloudUrl) merged.cloudUrl = DEFAULT_CLOUD_URL;
-        merged.rev = 4;
+        merged.rev = 5;
         await AsyncStorage.setItem(STORAGE_SETTINGS, JSON.stringify(merged));
       }
       return merged;
@@ -2131,51 +2301,43 @@ async function loadSettings(): Promise<Settings> {
       /* fallback */
     }
   }
-  const [k, m, v, cu, ct, cm] = await Promise.all([
+  const [k, m, cu, ct] = await Promise.all([
     AsyncStorage.getItem(STORAGE_API_KEY),
     AsyncStorage.getItem(STORAGE_MODEL),
-    AsyncStorage.getItem(STORAGE_VOICE),
     AsyncStorage.getItem(STORAGE_CLOUD_URL),
     AsyncStorage.getItem(STORAGE_CLOUD_TOKEN),
-    AsyncStorage.getItem(STORAGE_CLOUD_MODE),
   ]);
   const s: Settings = {
     ...DEFAULT_SETTINGS,
     apiKey: k || '',
     model: m || DEFAULT_MODEL,
-    voiceOn: v ? v === '1' : true,
-    cloudUrl: cu || '',
+    voiceOn: false,
+    cloudUrl: cu || DEFAULT_CLOUD_URL,
     cloudToken: ct || '',
-    cloudMode: cm === '1' && !!cu,
+    cloudMode: false,
+    rev: 5,
   };
   await AsyncStorage.setItem(STORAGE_SETTINGS, JSON.stringify(s));
   return s;
 }
 
-function profileContext(s: Settings): string {
-  if (!s.personalize) return '';
+function profileContext(s: Settings, auth: UserAuthData): string {
   const bits: string[] = [];
-  if (s.name.trim()) bits.push("The user's name is " + s.name.trim() + '.');
-  if (s.role.trim()) bits.push('They describe themselves as: ' + s.role.trim() + '.');
-  if (s.focusGoalMin > 0) bits.push('Their daily focus goal is ' + s.focusGoalMin + ' minutes.');
-  const len =
-    s.replyLength === 'short'
-      ? 'Keep the answer to 1-2 sentences.'
-      : s.replyLength === 'detailed'
-        ? 'Provide a thorough, well-structured breakdown.'
-        : 'Keep the answer concise and practical.';
-  bits.push(len);
-  return bits.join(' ');
-}
-
-function speakWith(s: Settings, text: string) {
-  if (!text.trim()) return;
-  Speech.stop();
-  Speech.speak(text, { language: s.voiceLang || 'en-US', rate: s.voiceRate || 1, pitch: s.voicePitch || 1 });
+  const uName = auth.name.trim() || s.name.trim();
+  if (uName) bits.push(`User Name: ${uName}`);
+  if (auth.email.trim() || s.email.trim()) bits.push(`User Email: ${auth.email.trim() || s.email.trim()}`);
+  if (auth.phone.trim()) bits.push(`User Phone: ${auth.phone.trim()}`);
+  if (auth.address.trim()) bits.push(`User Address: ${auth.address.trim()}`);
+  if (auth.savedLogins.length > 0) {
+    bits.push(
+      `Saved App Logins available: ${auth.savedLogins.map((l) => `${l.app} (user: ${l.username})`).join(', ')}`,
+    );
+  }
+  return bits.join('\n');
 }
 
 /* ------------------------------------------------------------------ */
-/* In-app updates (GitHub Releases, no Play Store)                     */
+/* In-app updates (GitHub Releases)                                    */
 /* ------------------------------------------------------------------ */
 
 type UpdateInfo = {
@@ -2210,13 +2372,13 @@ async function checkForUpdate(repo: string, token: string): Promise<UpdateInfo> 
   try {
     res = await fetch('https://api.github.com/repos/' + r + '/releases/latest', { headers });
   } catch {
-    throw new Error('No internet connection. Try again.');
+    throw new Error('No internet connection.');
   }
-  if (res.status === 404) throw new Error('Update server unavailable right now.');
-  if (!res.ok) throw new Error("Couldn't check for updates (" + res.status + '). Try again later.');
+  if (res.status === 404) throw new Error('Update server unavailable.');
+  if (!res.ok) throw new Error("Couldn't check for updates (" + res.status + ').');
   const rel: any = await res.json();
   const asset = (rel.assets || []).find((a: any) => /\.apk$/i.test(String(a?.name)));
-  if (!asset) throw new Error('Update server unavailable right now.');
+  if (!asset) throw new Error('No APK found in latest release.');
   const latestBuild = buildFromTag(rel.tag_name);
   const currentBuild = currentBuildNumber();
   return {
@@ -2252,7 +2414,7 @@ async function downloadAndInstall(
     throw new Error('Download failed (HTTP ' + (result?.status ?? '?') + ').');
   }
   const stat = await FileSystem.getInfoAsync(dest);
-  if (!stat.exists || (stat.size ?? 0) < 1024 * 1024) throw new Error('Downloaded file looks incomplete.');
+  if (!stat.exists || (stat.size ?? 0) < 1024 * 1024) throw new Error('Downloaded file incomplete.');
   onProgress(1);
   const contentUri = await FileSystem.getContentUriAsync(dest);
   await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
@@ -2268,19 +2430,24 @@ function formatBytes(n: number) {
 }
 
 /* ------------------------------------------------------------------ */
-/* App                                                                 */
+/* Root App                                                            */
 /* ------------------------------------------------------------------ */
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('CHAT');
   const [settings, setSettings] = useState<Settings | null>(null);
   const settingsRef = useRef<Settings>(DEFAULT_SETTINGS);
+  const [userAuth, setUserAuth] = useState<UserAuthData>(DEFAULT_USER_AUTH);
+  const [authLoaded, setAuthLoaded] = useState(false);
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
 
   useEffect(() => {
-    loadSettings().then((s) => {
+    Speech.stop();
+    Promise.all([loadSettings(), loadUserAuth()]).then(([s, auth]) => {
       settingsRef.current = s;
       setSettings(s);
+      setUserAuth(auth);
+      setAuthLoaded(true);
       if (s.autoCheckUpdates) {
         checkForUpdate(DEFAULT_UPDATE_REPO, s.updateToken)
           .then((u) => setUpdate(u.available ? u : null))
@@ -2289,8 +2456,6 @@ export default function App() {
     });
   }, []);
 
-  useEffect(() => LiveBus.onFocus(() => setTab('LIVE')), []);
-
   const patchSettings = useCallback((patch: Partial<Settings>) => {
     const next = { ...settingsRef.current, ...patch };
     settingsRef.current = next;
@@ -2298,18 +2463,12 @@ export default function App() {
     AsyncStorage.setItem(STORAGE_SETTINGS, JSON.stringify(next));
   }, []);
 
-  const toggleVoice = useCallback(() => {
-    const next = !settingsRef.current.voiceOn;
-    patchSettings({ voiceOn: next });
-    if (next) speakWith(settingsRef.current, 'Voice readout on.');
-    else Speech.stop();
-  }, [patchSettings]);
-
-  const say = useCallback((text: string) => {
-    if (settingsRef.current.voiceOn) speakWith(settingsRef.current, text);
+  const updateAuth = useCallback((next: UserAuthData) => {
+    setUserAuth(next);
+    saveUserAuth(next).catch(() => undefined);
   }, []);
 
-  if (!settings) {
+  if (!settings || !authLoaded) {
     return (
       <View style={styles.center}>
         <ActivityIndicator color={C.accent} />
@@ -2317,69 +2476,99 @@ export default function App() {
     );
   }
 
-  const tabs: { id: Tab; icon: string }[] = [
-    { id: 'CHAT', icon: '💬' },
-    { id: 'APPS', icon: '📱' },
-    { id: 'CLOUD', icon: '☁️' },
-    { id: 'LIVE', icon: '🖥️' },
-    { id: 'SETTINGS', icon: '⚙️' },
+  // First-time Login Gate: if user has not logged in yet, show the plain Login & Setup screen
+  if (!userAuth.isLoggedIn) {
+    return (
+      <SafeAreaView style={styles.root}>
+        <StatusBar style="light" backgroundColor={C.bg} />
+        <View style={styles.header}>
+          <Text style={styles.brand}>Pulse OS</Text>
+          <Pressable
+            onPress={() => updateAuth({ ...userAuth, isLoggedIn: true })}
+            style={styles.chip}
+          >
+            <Text style={styles.chipText}>Skip to App</Text>
+          </Pressable>
+        </View>
+        <LoginScreen
+          userAuth={userAuth}
+          saveAuth={updateAuth}
+          settings={settings}
+          patchSettings={patchSettings}
+          onDoneLogin={() => setTab('CHAT')}
+        />
+      </SafeAreaView>
+    );
+  }
+
+  const tabs: { id: Tab; label: string }[] = [
+    { id: 'CHAT', label: 'CHAT' },
+    { id: 'APPS', label: 'APPS' },
+    { id: 'LOGIN', label: 'LOGIN' },
+    { id: 'CLOUD', label: 'CLOUD' },
+    { id: 'LIVE', label: 'BROWSER' },
+    { id: 'SETTINGS', label: 'SETTINGS' },
   ];
+
+  const displayUser = userAuth.name.trim() || settings.name.trim();
 
   return (
     <SafeAreaView style={styles.root}>
       <StatusBar style="light" backgroundColor={C.bg} />
       <View style={styles.header}>
-        <Pressable onPress={() => setTab('SETTINGS')} style={styles.rowCenter} accessibilityLabel="Open profile">
-          <View style={[styles.avatarSmall, { overflow: 'hidden' }]}>
-            {settings.profilePhotoUri ? (
-              <Image source={{ uri: settings.profilePhotoUri }} style={{ width: 34, height: 34, borderRadius: 17 }} />
-            ) : (
-              <Text style={{ fontSize: 18 }}>{settings.avatar || '⚡'}</Text>
-            )}
-          </View>
-          <View>
-            <Text style={styles.brand}>Pulse OS 3.0</Text>
-            <Text style={styles.brandSub}>
-              {settings.name.trim() ? 'Hi, ' + settings.name.trim().split(' ')[0] : tab.charAt(0) + tab.slice(1).toLowerCase()}
-            </Text>
-          </View>
-        </Pressable>
-        <Pressable
-          onPress={toggleVoice}
-          accessibilityRole="switch"
-          accessibilityState={{ checked: settings.voiceOn }}
-          accessibilityLabel="Voice readout"
-          style={[styles.voiceBtn, settings.voiceOn && styles.voiceBtnOn]}
-        >
-          <Text style={styles.voiceIcon}>{settings.voiceOn ? '🔊' : '🔈'}</Text>
-          <Text style={[styles.voiceText, settings.voiceOn && { color: C.text }]}>{settings.voiceOn ? 'VOICE ON' : 'VOICE OFF'}</Text>
-        </Pressable>
+        <View>
+          <Text style={styles.brand}>Pulse OS</Text>
+          <Text style={styles.brandSub}>
+            {displayUser ? `User: ${displayUser}` : 'Ready'}
+          </Text>
+        </View>
+        <View style={styles.rowCenter}>
+          <Pressable onPress={() => setTab('LOGIN')} style={styles.chip}>
+            <Text style={styles.chipText}>{displayUser ? 'Account' : 'Login'}</Text>
+          </Pressable>
+          <Pressable onPress={() => openAppWithStatus('accessibility')} style={styles.chip}>
+            <Text style={styles.chipText}>Bridge</Text>
+          </Pressable>
+        </View>
       </View>
 
       {update && tab !== 'SETTINGS' ? (
         <Pressable onPress={() => setTab('SETTINGS')} style={styles.updateBanner}>
           <Text style={styles.updateBannerText}>
-            ⬆️ Update available: build {update.latestBuild} (you have {update.currentBuild}). Tap to install.
+            Update available: build {update.latestBuild} (current: {update.currentBuild}). Tap to install.
           </Text>
         </Pressable>
       ) : null}
 
       <View style={{ flex: 1 }}>
         <View style={[styles.fill, tab !== 'CHAT' && styles.hidden]}>
-          <ChatScreen say={say} settings={settings} patchSettings={patchSettings} openSettings={() => setTab('SETTINGS')} />
+          <ChatScreen
+            settings={settings}
+            userAuth={userAuth}
+            patchSettings={patchSettings}
+            openSettings={() => setTab('SETTINGS')}
+          />
         </View>
         <View style={[styles.fill, tab !== 'APPS' && styles.hidden]}>
-          <AppsScreen say={say} />
+          <AppsScreen userAuth={userAuth} />
+        </View>
+        <View style={[styles.fill, tab !== 'LOGIN' && styles.hidden]}>
+          <LoginScreen
+            userAuth={userAuth}
+            saveAuth={updateAuth}
+            settings={settings}
+            patchSettings={patchSettings}
+          />
         </View>
         <View style={[styles.fill, tab !== 'CLOUD' && styles.hidden]}>
-          <CloudComputerScreen settings={settings} patchSettings={patchSettings} say={say} />
+          <CloudComputerScreen settings={settings} patchSettings={patchSettings} />
         </View>
         <View
           style={[styles.fill, tab !== 'LIVE' && styles.offscreen]}
           pointerEvents={tab === 'LIVE' ? 'auto' : 'none'}
           importantForAccessibility={tab === 'LIVE' ? 'auto' : 'no-hide-descendants'}
         >
-          <WorkspaceScreen say={say} homeUrl={settings.homeUrl} confirmFirst={settings.confirmBeforeComplete} />
+          <WorkspaceScreen homeUrl={settings.homeUrl} confirmFirst={settings.confirmBeforeComplete} />
         </View>
         <View style={[styles.fill, tab !== 'SETTINGS' && styles.hidden]}>
           <SettingsScreen
@@ -2392,17 +2581,15 @@ export default function App() {
       </View>
 
       <View style={styles.tabBar}>
-        {tabs.map(({ id, icon }) => (
+        {tabs.map(({ id, label }) => (
           <Pressable
             key={id}
             onPress={() => setTab(id)}
-            style={styles.tabItem}
+            style={[styles.tabItem, tab === id && styles.tabItemActive]}
             accessibilityRole="tab"
             accessibilityState={{ selected: tab === id }}
           >
-            <Text style={styles.tabIcon}>{icon}</Text>
-            <Text style={[styles.tabLabel, tab === id && styles.tabLabelActive]}>{id}</Text>
-            {tab === id ? <View style={styles.tabDot} /> : id === 'SETTINGS' && update ? <View style={styles.tabBadge} /> : null}
+            <Text style={[styles.tabLabel, tab === id && styles.tabLabelActive]}>{label}</Text>
           </Pressable>
         ))}
       </View>
@@ -2411,17 +2598,17 @@ export default function App() {
 }
 
 /* ------------------------------------------------------------------ */
-/* CHAT (Multimodal Attachments + Voice Mic + OS Automation + Memory)  */
+/* CHAT (Direct Task Execution + Attachments + Silent Operation)       */
 /* ------------------------------------------------------------------ */
 
 function ChatScreen({
-  say,
   settings,
+  userAuth,
   patchSettings,
   openSettings,
 }: {
-  say: (t: string) => void;
   settings: Settings;
+  userAuth: UserAuthData;
   patchSettings: (p: Partial<Settings>) => void;
   openSettings: () => void;
 }) {
@@ -2434,19 +2621,16 @@ function ChatScreen({
   const [attachModal, setAttachModal] = useState(false);
   const [pendingAttachment, setPendingAttachment] = useState<AttachmentItem | null>(null);
   const [smartMemory, setSmartMemory] = useState<string[]>([]);
-  const [cloudStatus, setCloudStatus] = useState<CloudStatus>('off');
+  const [, setCloudStatus] = useState<CloudStatus>('off');
   const [cloudHealthInfo, setCloudHealthInfo] = useState<CloudHealth | null>(null);
   const listRef = useRef<FlatList<ChatMessage>>(null);
   const isNearBottomRef = useRef(true);
   const userDraggingRef = useRef(false);
-  const [showScrollBottomBtn, setShowScrollBottomBtn] = useState(false);
 
   const onChatScroll = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
     const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
     const dist = contentSize.height - layoutMeasurement.height - contentOffset.y;
-    const near = dist < 90;
-    isNearBottomRef.current = near;
-    setShowScrollBottomBtn(!near && contentSize.height > layoutMeasurement.height + 120);
+    isNearBottomRef.current = dist < 90;
   };
   const inputRef = useRef<TextInput>(null);
 
@@ -2454,17 +2638,22 @@ function ChatScreen({
     loadSmartMemory().then(setSmartMemory);
   }, []);
 
-  const lastPolledAutomationTs = useRef<number>(0);
+  const lastPolledAutomationTs = useRef<number>(Date.now());
 
   useEffect(() => {
     if (Platform.OS !== 'android' || !HarkBridge?.getAutomationResult) return;
     const checkResult = async () => {
       try {
         const res = await HarkBridge.getAutomationResult();
-        if (res && res.ts && res.ts > lastPolledAutomationTs.current && (res.status === 'verified' || res.status === 'needs_confirmation' || res.status === 'error')) {
+        if (
+          res &&
+          res.ts &&
+          res.ts > lastPolledAutomationTs.current &&
+          (res.status === 'verified' || res.status === 'needs_confirmation' || res.status === 'error')
+        ) {
           lastPolledAutomationTs.current = res.ts;
-          const badge = res.cartVerified ? '✅ Cart & Action Verified' : '⚠️ Manual Confirmation Needed';
-          const statusLine = `${badge}: ${res.message || res.cartSummary || ''}`;
+          const badge = res.cartVerified ? '[Done]' : '[Status]';
+          const statusLine = `${badge} ${res.message || res.cartSummary || ''}`;
           setMessages((prev) => {
             if (!prev.length) return prev;
             const copy = [...prev];
@@ -2472,9 +2661,7 @@ function ChatScreen({
               if (copy[i].role === 'assistant') {
                 copy[i] = {
                   ...copy[i],
-                  text: copy[i].text.includes(statusLine) ? copy[i].text : `${copy[i].text}
-
-${statusLine}`,
+                  text: copy[i].text.includes(statusLine) ? copy[i].text : `${copy[i].text}\n\n${statusLine}`,
                   verificationShotUri: res.screenshot || copy[i].verificationShotUri,
                   verificationSummary: res.cartSummary || res.message,
                 };
@@ -2483,20 +2670,18 @@ ${statusLine}`,
             }
             return copy;
           });
-          if (res.message) say(res.message);
         }
       } catch {}
     };
     const sub = AppState.addEventListener('change', (state) => {
       if (state === 'active') checkResult();
     });
-    const timer = setInterval(checkResult, 2200);
+    const timer = setInterval(checkResult, 2500);
     return () => {
       sub.remove();
       clearInterval(timer);
     };
-  }, [say]);
-
+  }, []);
 
   const checkCloud = useCallback(async (base: string) => {
     if (!base) {
@@ -2527,7 +2712,6 @@ ${statusLine}`,
   const [drawer, setDrawer] = useState(false);
   const [modelPicker, setModelPicker] = useState(false);
   const [mode, setMode] = useState<'auto' | 'agent' | 'chat'>('auto');
-  const drawerX = useRef(new Animated.Value(-320)).current;
   const summarizing = useRef(false);
 
   useEffect(() => {
@@ -2550,7 +2734,6 @@ ${statusLine}`,
           ...c,
           messages: messages.slice(-Math.max(10, settings.historyLimit)).map((m) => ({
             ...m,
-            // Strip large base64 strings when persisting to AsyncStorage so storage stays fast
             attachment: m.attachment ? { ...m.attachment, base64: undefined } : undefined,
           })),
           updatedAt: lastTs,
@@ -2566,25 +2749,18 @@ ${statusLine}`,
     AsyncStorage.setItem(STORAGE_CONVO_CURRENT, currentId);
   }, [convos, currentId, loaded]);
 
-  const showDrawer = (open: boolean) => {
-    if (open) setDrawer(true);
-    Animated.timing(drawerX, { toValue: open ? 0 : -320, duration: 200, useNativeDriver: true }).start(() => {
-      if (!open) setDrawer(false);
-    });
-  };
-
   const newChat = () => {
     if (busy) return;
     const cur = convos.find((c) => c.id === currentId);
     if (cur && !messages.length) {
-      showDrawer(false);
+      setDrawer(false);
       return;
     }
     const c: Convo = { id: uid(), title: 'New chat', summary: '', updatedAt: Date.now(), messages: [] };
     setConvos((prev) => [c, ...prev]);
     setCurrentId(c.id);
     setMessages([]);
-    showDrawer(false);
+    setDrawer(false);
   };
 
   const openConvo = (id: string) => {
@@ -2593,7 +2769,7 @@ ${statusLine}`,
     if (!c) return;
     setCurrentId(id);
     setMessages(c.messages);
-    showDrawer(false);
+    setDrawer(false);
   };
 
   const deleteConvo = (id: string) => {
@@ -2637,18 +2813,10 @@ ${statusLine}`,
       });
   };
 
-  const [voiceModal, setVoiceModal] = useState(false);
-  const [handsFree, setHandsFree] = useState(false);
-  const handsFreeRef = useRef(false);
   const pendingVoiceAutoSendRef = useRef<string>('');
 
-  /**
-   * Starts Native Android Voice Input (RecognizerIntent via HarkBridge) with Web Speech fallback & Hands-Free loop.
-   */
-  const startVoiceInput = async (autoContinue: any = false) => {
-    const isAuto = autoContinue === true;
+  const startVoiceInput = async () => {
     if (busy) return;
-    if (settings.haptics) Vibration.vibrate(15);
     Speech.stop();
     if (Platform.OS === 'android' && HarkBridge?.startVoiceRecognition) {
       try {
@@ -2660,13 +2828,9 @@ ${statusLine}`,
           setInput(cleanSpoken);
           pendingVoiceAutoSendRef.current = cleanSpoken;
         }
-        return;
       } catch {
         setListening(false);
       }
-    }
-    if (!isAuto) {
-      setVoiceModal(true);
     }
   };
 
@@ -2717,45 +2881,45 @@ ${statusLine}`,
     const text =
       rawInput ||
       (attached?.kind === 'image'
-        ? 'Describe this image in detail, extract any visible text (OCR), detect objects, and pull any actionable tasks or reminders.'
+        ? 'Analyze this image, extract text (OCR), and list key details.'
         : attached?.kind === 'video' || attached?.kind === 'video_link'
-          ? 'Extract the transcript/details of this video, summarize the core content, and pull any tasks, events, or reminders.'
-          : 'Read this document, extract key information, provide a concise summary, and pull any tasks, calendar events, or reminders.');
+          ? 'Summarize this video from its transcript and metadata.'
+          : 'Summarize this document and extract key facts.');
+
+    const recentContext = messages
+      .filter((m) => m.role !== 'error' && m.text.trim())
+      .slice(-6)
+      .map((m) => (m.role === 'user' ? 'User: ' : 'Pulse: ') + m.text.slice(0, 300))
+      .join('\n');
+
+    // 1. ALWAYS try direct native app execution FIRST (even before checking API key!)
+    // This guarantees app opening, searching, ordering, playing videos, and logging in ALWAYS execute on the device and NEVER return fake plain text.
+    if (!attached && mode !== 'chat') {
+      const directExec = await tryDirectDeviceExecution(rawInput, recentContext, userAuth);
+      if (directExec.handled) {
+        setInput('');
+        const userMsg: ChatMessage = { id: uid(), role: 'user', text: rawInput, ts: Date.now() };
+        const botMsg: ChatMessage = {
+          id: uid(),
+          role: 'assistant',
+          text: directExec.statusMessage,
+          reply: {
+            direct_response: directExec.statusMessage,
+            proactive_checklist: [],
+            one_line_summary: directExec.statusMessage,
+            source_verified: 'Verified',
+          },
+          source: 'device',
+          ts: Date.now(),
+        };
+        setMessages((prev) => [...prev, userMsg, botMsg]);
+        return;
+      }
+    }
 
     const useCloud = !apiKey && cloudMode && !!cloudUrl;
     if (!apiKey && !useCloud) {
       openSettings();
-      return;
-    }
-    if (settings.haptics) Vibration.vibrate(10);
-
-    // Instant OS-level app launch fast-path for simple voice/text commands like "open Blinkit", "open Uber", "open Free Fire", "open Instagram"
-    const quickOpenMatch =
-      !attached &&
-      !/\b(and|to|for|order|buy|search|find|add|cart|book|send|message|play|watch)\b/i.test(rawInput) &&
-      rawInput.match(/^(?:please\s+|can you\s+|hey pulse\s+|hey hark\s+)?(?:open|launch|start|run)\s+([a-z0-9._@-]+(?:\s+max|\s+store|\s+pay|\s+maps|\s+fire)?)$/i);
-    if (quickOpenMatch) {
-      const targetApp = quickOpenMatch[1].trim();
-      setInput('');
-      const launchRes = await openAppWithStatus(targetApp);
-      const userMsg: ChatMessage = { id: uid(), role: 'user', text: rawInput, ts: Date.now() };
-      const botMsg: ChatMessage = {
-        id: uid(),
-        role: 'assistant',
-        text: launchRes.statusMessage,
-        reply: {
-          direct_response: launchRes.statusMessage,
-          proactive_checklist: launchRes.ok
-            ? [`Opened ${launchRes.appName}`, 'Use voice command for next UI step']
-            : [`Install ${launchRes.appName} on Play Store`, `Open ${launchRes.appName} in Live Browser`],
-          one_line_summary: launchRes.statusMessage,
-          source_verified: 'Verified',
-        },
-        source: 'device',
-        ts: Date.now(),
-      };
-      setMessages((prev) => [...prev, userMsg, botMsg]);
-      say(launchRes.statusMessage);
       return;
     }
 
@@ -2770,9 +2934,7 @@ ${statusLine}`,
     const botId = uid();
     let steps: Step[] = [
       {
-        label: attached
-          ? `Analyzing attached ${attached.kind} (${attached.name.slice(0, 28)})`
-          : 'Reading your command & smart context memory',
+        label: attached ? `Reading ${attached.name.slice(0, 28)}` : 'Processing request',
         status: 'active',
         startedAt: Date.now(),
       },
@@ -2798,41 +2960,33 @@ ${statusLine}`,
     setPendingAttachment(null);
     setBusy(true);
 
-    // Quick-Verify Source Checking step for any URLs or video links in the user prompt
     let verifiedSourceContext = '';
     if (/https?:\/\//i.test(text)) {
-      step('Running Quick-Verify source & transcript check');
+      step('Checking source link');
       verifiedSourceContext = await quickVerifyUrlsInText(text);
     }
 
-    const ctx = [profileContext(settings), verifiedSourceContext].filter(Boolean).join('\n\n');
+    const ctx = [profileContext(settings, userAuth), verifiedSourceContext].filter(Boolean).join('\n\n');
     const convoId = currentId;
     const useAgent = !attached && !!apiKey && (mode === 'agent' || (mode === 'auto' && AGENT_RE.test(text)));
 
     if (useAgent) {
       AgentBus.begin(text);
-      LiveBus.set({ active: true, startedAt: Date.now(), loading: false, thumb: null, log: [] }, '🤖 ' + text.slice(0, 60));
       try {
-        const recent = messages
-          .filter((m) => m.role !== 'error' && m.text.trim())
-          .slice(-6)
-          .map((m) => (m.role === 'user' ? 'User: ' : 'Pulse: ') + m.text.slice(0, 300))
-          .join('\n');
         const agentModel = /lite/i.test(model) ? 'gemini-2.5-flash' : model;
         const answer = await runAgent({
           apiKey,
           model: agentModel,
-          goal: text + (ctx ? '\n(' + ctx + ')' : ''),
-          context: recent,
+          goal: text,
+          context: [recentContext, ctx].filter(Boolean).join('\n\n'),
+          userAuth,
           onStep: (label) => {
             step(label);
             AgentBus.step(label);
-            LiveBus.set({}, label);
           },
         });
         step('Done', 'done');
         finishSteps();
-        LiveBus.set({}, '✅ ' + answer.slice(0, 80));
         const final: ChatMessage = {
           id: botId,
           role: 'assistant',
@@ -2845,10 +2999,6 @@ ${statusLine}`,
         };
         setMessages((prev) => prev.map((m) => (m.id === botId ? final : m)));
         refreshSummary(convoId, [...next, final]);
-        say(answer);
-        if (handsFreeRef.current) {
-          setTimeout(() => startVoiceInput(true), 4200);
-        }
       } catch (e: any) {
         setMessages((prev) => [
           ...prev.filter((m) => m.id !== botId),
@@ -2865,7 +3015,7 @@ ${statusLine}`,
       let result: { reply: PulseReply; modelUsed: string } | null = null;
       let source: 'cloud' | 'device' = 'device';
       if (useCloud) {
-        step('Asking your cloud server');
+        step('Running on cloud server');
         try {
           result = await callCloudChat(cloudUrl, cloudToken, keyForCloud(), next, ctx, smartMemory);
           source = 'cloud';
@@ -2873,12 +3023,12 @@ ${statusLine}`,
         } catch (cloudErr: any) {
           setCloudStatus('offline');
           if (!apiKey) throw cloudErr;
-          step('Cloud unreachable, switching to on-device', 'error');
+          step('Switching to local model', 'error');
         }
       }
       if (!result) {
         const useModel = model || FAST_MODEL;
-        step('Thinking with ' + modelLabel(useModel).replace(/^\W+/, ''));
+        step('Running ' + modelLabel(useModel));
         let writing = false;
         let lastUi = 0;
         result = await streamGemini(
@@ -2892,7 +3042,7 @@ ${statusLine}`,
           (visible) => {
             if (!writing && visible.trim()) {
               writing = true;
-              step('Writing reply & extracting actions');
+              step('Generating response');
             }
             const now = Date.now();
             if (now - lastUi >= 45) {
@@ -2906,13 +3056,24 @@ ${statusLine}`,
       if (reply.memory_facts && reply.memory_facts.length) {
         saveSmartMemoryFacts(reply.memory_facts).then(setSmartMemory).catch(() => undefined);
       }
-      const n = reply.proactive_checklist.length;
-      step(n ? `Extracted ${n} action item${n > 1 ? 's' : ''} & verified sources` : 'Reply ready', 'done');
+
+      // If the LLM returned an automation_script, execute it on the device so it actually does the work!
+      let execLogText = '';
+      if (reply.automation_script && reply.automation_script.length > 0) {
+        step('Executing device actions');
+        const execRes = await executeOsAutomationScript(reply.automation_script, (msg) => step(msg));
+        if (execRes.log.length > 0) {
+          execLogText = '\n\nExecuted:\n- ' + execRes.log.join('\n- ');
+        }
+      }
+
+      step('Done', 'done');
       finishSteps();
+      const finalText = (reply.direct_response + execLogText).trim();
       const botMsg: ChatMessage = {
         id: botId,
         role: 'assistant',
-        text: reply.direct_response,
+        text: finalText,
         reply,
         source,
         streaming: false,
@@ -2921,56 +3082,10 @@ ${statusLine}`,
       };
       setMessages((prev) => (prev.some((m) => m.id === botId) ? prev.map((m) => (m.id === botId ? botMsg : m)) : [...prev, botMsg]));
       refreshSummary(convoId, [...next, botMsg]);
-      say(reply.direct_response.slice(0, 400));
-      if (handsFreeRef.current) {
-        setTimeout(() => startVoiceInput(true), 4200);
-      }
     } catch (e: any) {
       setMessages((prev) => [
         ...prev.filter((m) => m.id !== botId),
         { id: uid(), role: 'error', text: 'Request failed: ' + (e?.message || String(e)), ts: Date.now() },
-      ]);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const cloudPlan = async (reply: PulseReply) => {
-    if (!cloudUrl) {
-      openSettings();
-      return;
-    }
-    if (busy) return;
-    setBusy(true);
-    const now = new Date();
-    const start = pad((now.getHours() + (now.getMinutes() > 0 ? 1 : 0)) % 24) + ':00';
-    try {
-      const run = await runCloudTask(cloudUrl, cloudToken, keyForCloud(), 'plan', {
-        summary: reply.one_line_summary || reply.direct_response.slice(0, 300),
-        checklist: reply.proactive_checklist,
-        start,
-      });
-      setCloudStatus('online');
-      const blocks: any[] = Array.isArray(run?.result?.blocks) ? run.result.blocks : [];
-      const lines = blocks.map(
-        (b) => String(b?.time ?? '') + '  ·  ' + String(b?.minutes ?? '?') + ' min  ·  ' + String(b?.task ?? ''),
-      );
-      const tip = String(run?.result?.tip ?? '').trim();
-      const plan: PulseReply = {
-        direct_response: (lines.length ? lines.join('\n') : 'The server returned no blocks.') + (tip ? '\n\nTip: ' + tip : ''),
-        proactive_checklist: blocks.slice(0, 5).map((b) => String(b?.time ?? '') + ' ' + String(b?.task ?? '')),
-        one_line_summary: 'Time-blocked plan from ' + start + ' (' + blocks.length + ' blocks)',
-      };
-      setMessages((prev) => [
-        ...prev,
-        { id: uid(), role: 'assistant', text: plan.direct_response, reply: plan, source: 'cloud', ts: Date.now() },
-      ]);
-      say(plan.one_line_summary);
-    } catch (e: any) {
-      setCloudStatus('offline');
-      setMessages((prev) => [
-        ...prev,
-        { id: uid(), role: 'error', text: 'Cloud task failed: ' + (e?.message || String(e)), ts: Date.now() },
       ]);
     } finally {
       setBusy(false);
@@ -2988,24 +3103,24 @@ ${statusLine}`,
   return (
     <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
       <View style={styles.chatToolbar}>
-        <Pressable onPress={() => showDrawer(true)} style={styles.chip} accessibilityLabel="Open chats and summaries">
-          <Text style={styles.chipText}>☰</Text>
+        <Pressable onPress={() => setDrawer(true)} style={styles.chip} accessibilityLabel="Open chats">
+          <Text style={styles.chipText}>Chats</Text>
         </Pressable>
         <Pressable onPress={() => setModelPicker(true)} style={[styles.chip, { flexShrink: 1 }]} accessibilityLabel="Choose model">
           <Text style={styles.chipText} numberOfLines={1}>
-            {!apiKey && cloudMode && cloudUrl ? '☁️ Cloud' : modelLabel(model || FAST_MODEL)} ▾
+            {!apiKey && cloudMode && cloudUrl ? 'Cloud' : modelLabel(model || FAST_MODEL)}
           </Text>
         </Pressable>
         {smartMemory.length > 0 ? (
           <Pressable
             onPress={() =>
               Alert.alert(
-                '🧠 Smart Context Memory',
+                'Context Memory',
                 smartMemory.map((m, i) => `${i + 1}. ${m}`).join('\n'),
                 [
                   { text: 'Close', style: 'cancel' },
                   {
-                    text: 'Clear Memory',
+                    text: 'Clear',
                     style: 'destructive',
                     onPress: () => {
                       AsyncStorage.removeItem(STORAGE_SMART_MEMORY);
@@ -3015,40 +3130,20 @@ ${statusLine}`,
                 ],
               )
             }
-            style={[styles.chip, { borderColor: C.accent2 }]}
+            style={styles.chip}
           >
-            <Text style={[styles.chipText, { color: C.accent2 }]}>🧠 {smartMemory.length}</Text>
+            <Text style={styles.chipText}>Memory ({smartMemory.length})</Text>
           </Pressable>
         ) : null}
         <View style={{ flex: 1 }} />
         <Pressable
-          onPress={() => {
-            const nextHf = !handsFree;
-            setHandsFree(nextHf);
-            handsFreeRef.current = nextHf;
-            if (nextHf) {
-              patchSettings({ voiceOn: true });
-              startVoiceInput(true);
-            } else {
-              Speech.stop();
-            }
-          }}
-          style={[styles.chip, handsFree && { borderColor: C.good, backgroundColor: '#064E3B' }]}
-          accessibilityLabel="Hands-Free Voice Mode"
-        >
-          <Text style={[styles.chipText, handsFree && { color: '#fff' }]}>
-            {handsFree ? '🟢 Hands-Free' : '🎙️ Hands-Free'}
-          </Text>
-        </Pressable>
-        <Pressable
           onPress={() => setMode((m) => (m === 'auto' ? 'agent' : m === 'agent' ? 'chat' : 'auto'))}
           style={[styles.chip, mode === 'agent' && { borderColor: C.accent }]}
-          accessibilityLabel="Agent mode"
         >
-          <Text style={styles.chipText}>{mode === 'auto' ? '🤖 Auto' : mode === 'agent' ? '🤖 Agent' : '💬 Chat'}</Text>
+          <Text style={styles.chipText}>Mode: {mode.toUpperCase()}</Text>
         </Pressable>
-        <Pressable onPress={newChat} style={styles.chip} accessibilityLabel="New chat">
-          <Text style={styles.chipText}>✎ New</Text>
+        <Pressable onPress={newChat} style={styles.chip}>
+          <Text style={styles.chipText}>New</Text>
         </Pressable>
       </View>
 
@@ -3068,45 +3163,28 @@ ${statusLine}`,
         }}
         ListEmptyComponent={
           <View style={styles.empty}>
-            <Text style={styles.emptyTitle}>
-              {settings.name.trim() ? "What's on your plate, " + settings.name.trim().split(' ')[0] + '?' : 'Pulse OS Agent Ready'}
-            </Text>
+            <Text style={styles.emptyTitle}>Pulse OS Ready</Text>
             <Text style={[styles.muted, { textAlign: 'center' }]}>
-              Tap 📎 to analyze photos, PDFs, documents, or video links. Tap 🎙️ to speak commands like "open Blinkit", "open Uber", "open Meesho", or "open Free Fire".
+              Enter a task below (e.g., "order milk on Blinkit", "play Telugu songs on YouTube", "search shoes on Flipkart", or "login to Instagram").
             </Text>
             {!apiKey && !(cloudMode && cloudUrl) ? (
               <Pressable onPress={openSettings} style={[styles.primaryBtn, { paddingHorizontal: 18 }]}>
-                <Text style={styles.primaryBtnText}>Open Settings to add your Gemini API Key</Text>
+                <Text style={styles.primaryBtnText}>Add Gemini API Key in Settings</Text>
               </Pressable>
             ) : null}
           </View>
         }
-        renderItem={({ item }) => (
-          <MessageBubble msg={item} say={say} onCloudPlan={cloudUrl ? cloudPlan : undefined} />
-        )}
+        renderItem={({ item }) => <MessageBubble msg={item} />}
       />
-
-      <LiveCard />
 
       {pendingAttachment ? (
         <View style={styles.attachmentPreviewBar}>
-          {pendingAttachment.kind === 'image' && pendingAttachment.uri ? (
-            <Image source={{ uri: pendingAttachment.uri }} style={styles.attachmentThumb} />
-          ) : (
-            <View style={[styles.attachmentThumb, styles.center]}>
-              <Text style={{ fontSize: 20 }}>
-                {pendingAttachment.kind === 'video' || pendingAttachment.kind === 'video_link' ? '🎬' : '📄'}
-              </Text>
-            </View>
-          )}
           <View style={{ flex: 1 }}>
             <Text style={styles.convoTitle} numberOfLines={1}>{pendingAttachment.name}</Text>
-            <Text style={styles.mutedSmall}>
-              {pendingAttachment.kind.toUpperCase()} ready for Multimodal Analysis & Action Extraction
-            </Text>
+            <Text style={styles.mutedSmall}>{pendingAttachment.kind.toUpperCase()} attached</Text>
           </View>
           <Pressable onPress={() => setPendingAttachment(null)} style={styles.chip}>
-            <Text style={styles.chipText}>✕</Text>
+            <Text style={styles.chipText}>Remove</Text>
           </Pressable>
         </View>
       ) : null}
@@ -3116,31 +3194,27 @@ ${statusLine}`,
           onPress={() => setAttachModal(true)}
           disabled={busy}
           style={styles.iconBtn}
-          accessibilityLabel="Attach image, photo, video, or file"
+          accessibilityLabel="Attach file"
         >
-          <Text style={{ fontSize: 20 }}>📎</Text>
+          <Text style={styles.chipText}>File</Text>
         </Pressable>
 
-        <Pressable
-          onPress={() => startVoiceInput(false)}
-          disabled={busy}
-          style={[styles.iconBtn, listening && { borderColor: C.danger, backgroundColor: '#3B1418' }]}
-          accessibilityLabel="Voice talk input"
-        >
-          <Text style={{ fontSize: 19 }}>{listening ? '🔴' : '🎙️'}</Text>
-        </Pressable>
+        {Platform.OS === 'android' ? (
+          <Pressable
+            onPress={startVoiceInput}
+            disabled={busy}
+            style={[styles.iconBtn, listening && { borderColor: C.danger }]}
+            accessibilityLabel="Dictate command"
+          >
+            <Text style={styles.chipText}>{listening ? 'Stop' : 'Mic'}</Text>
+          </Pressable>
+        ) : null}
 
         <TextInput
           ref={inputRef}
           value={input}
           onChangeText={setInput}
-          placeholder={
-            pendingAttachment
-              ? 'Ask a question about this attachment or tap ➤…'
-              : apiKey || (cloudMode && cloudUrl)
-                ? 'Message Pulse or say "order apples on Blinkit"…'
-                : 'Add a Gemini key in Settings'
-          }
+          placeholder="Type command or question..."
           placeholderTextColor={C.muted}
           style={styles.composerInput}
           multiline
@@ -3148,82 +3222,18 @@ ${statusLine}`,
           onSubmitEditing={send}
         />
         <Pressable onPress={send} disabled={busy} style={[styles.sendBtn, busy && { opacity: 0.6 }]}>
-          {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.sendText}>➤</Text>}
+          {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.sendText}>Run</Text>}
         </Pressable>
       </View>
 
-      {/* In-App Voice Recognizer Fallback Modal */}
-      <Modal visible={voiceModal} transparent animationType="fade" onRequestClose={() => setVoiceModal(false)}>
+      {/* Multimodal Attachment Modal (No Animation) */}
+      <Modal visible={attachModal} transparent animationType="none" onRequestClose={() => setAttachModal(false)}>
         <View style={styles.modalBackdrop}>
-          <View style={[styles.modalCard, { height: 300, padding: 0, overflow: 'hidden' }]}>
+          <View style={[styles.modalCard, { height: 380, padding: 0, overflow: 'hidden' }]}>
             <View style={[styles.rowBetween, { paddingHorizontal: 14, paddingTop: 12 }]}>
-              <Text style={styles.cardTitle}>🎙️ Pulse OS Voice Talk</Text>
-              <Pressable onPress={() => setVoiceModal(false)} style={styles.chip}>
-                <Text style={styles.chipText}>✕ Close</Text>
-              </Pressable>
-            </View>
-            <WebView
-              originWhitelist={['*']}
-              source={{
-                html: `<!DOCTYPE html><html><body style="background:#0F1523;color:#F3F6FC;font-family:sans-serif;text-align:center;padding:24px;">
-                  <div id="st" style="font-size:15px;font-weight:700;color:#06B6D4;margin-bottom:14px;">Tap mic and speak your command</div>
-                  <button id="btn" style="width:78px;height:78px;border-radius:39px;border:none;background:#6366F1;color:#fff;font-size:32px;cursor:pointer;box-shadow:0 0 20px rgba(99,102,241,0.6);">🎙️</button>
-                  <p id="out" style="font-size:14px;color:#94A3B8;margin-top:16px;">Say "Order apples on Blinkit" or "Open Uber"</p>
-                  <script>
-                    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-                    var btn = document.getElementById("btn");
-                    var st = document.getElementById("st");
-                    var out = document.getElementById("out");
-                    if (SR) {
-                      var rec = new SR();
-                      rec.lang = "${settings.voiceLang || 'en-IN'}";
-                      rec.interimResults = true;
-                      rec.onstart = function(){ st.textContent = "🔴 Listening now... Speak clearly"; btn.style.background = "#F43F5E"; };
-                      rec.onresult = function(e){
-                        var t = "";
-                        for (var i=0; i<e.results.length; i++) t += e.results[i][0].transcript;
-                        out.textContent = t;
-                        if (e.results[e.results.length-1].isFinal) {
-                          window.ReactNativeWebView.postMessage(JSON.stringify({ type: "voice_result", text: t }));
-                        }
-                      };
-                      rec.onerror = function(e){ st.textContent = "Tap mic to try again (" + e.error + ")"; btn.style.background = "#6366F1"; };
-                      btn.onclick = function(){ try { rec.start(); } catch(err){} };
-                      setTimeout(function(){ try { rec.start(); } catch(err){} }, 300);
-                    } else {
-                      st.textContent = "Type or use keyboard microphone below:";
-                      out.innerHTML = "<input id=\"inp\" style=\"width:90%;padding:10px;border-radius:8px;border:1px solid #283552;background:#172034;color:#fff;font-size:15px;\" placeholder=\"Speak with keyboard mic...\" /><br/><button onclick=\"window.ReactNativeWebView.postMessage(JSON.stringify({type:'voice_result',text:document.getElementById('inp').value}))\" style=\"margin-top:10px;padding:10px 20px;background:#6366F1;color:#fff;border:none;border-radius:8px;font-weight:bold;\">Send Command</button>";
-                    }
-                  </script>
-                </body></html>`
-              }}
-              javaScriptEnabled
-              mediaPlaybackRequiresUserAction={false}
-              onMessage={(e) => {
-                try {
-                  const d = JSON.parse(e.nativeEvent.data);
-                  if (d?.type === 'voice_result' && d.text?.trim()) {
-                    setVoiceModal(false);
-                    const clean = String(d.text).trim();
-                    setInput(clean);
-                    pendingVoiceAutoSendRef.current = clean;
-                  }
-                } catch {}
-              }}
-              style={{ flex: 1, backgroundColor: C.panel }}
-            />
-          </View>
-        </View>
-      </Modal>
-
-      {/* Multimodal Attachment Modal (Photos, Camera, Documents, Videos, YouTube Links) */}
-      <Modal visible={attachModal} transparent animationType="slide" onRequestClose={() => setAttachModal(false)}>
-        <View style={styles.modalBackdrop}>
-          <View style={[styles.modalCard, { height: 420, padding: 0, overflow: 'hidden' }]}>
-            <View style={[styles.rowBetween, { paddingHorizontal: 14, paddingTop: 12 }]}>
-              <Text style={styles.cardTitle}>Multimodal Upload</Text>
+              <Text style={styles.cardTitle}>Attach File</Text>
               <Pressable onPress={() => setAttachModal(false)} style={styles.chip}>
-                <Text style={styles.chipText}>✕ Close</Text>
+                <Text style={styles.chipText}>Close</Text>
               </Pressable>
             </View>
             <WebView
@@ -3242,12 +3252,12 @@ ${statusLine}`,
 
       {drawer ? (
         <View style={styles.drawerWrap}>
-          <Pressable style={styles.drawerBackdrop} onPress={() => showDrawer(false)} />
-          <Animated.View style={[styles.drawer, { transform: [{ translateX: drawerX }] }]}>
+          <Pressable style={styles.drawerBackdrop} onPress={() => setDrawer(false)} />
+          <View style={styles.drawer}>
             <View style={styles.rowBetween}>
-              <Text style={styles.cardTitle}>Chats</Text>
+              <Text style={styles.cardTitle}>Chat History</Text>
               <Pressable onPress={newChat} style={styles.chip}>
-                <Text style={styles.chipText}>✎ New chat</Text>
+                <Text style={styles.chipText}>New</Text>
               </Pressable>
             </View>
             <ScrollView style={{ marginTop: 10 }} contentContainerStyle={{ gap: 8, paddingBottom: 30 }}>
@@ -3264,21 +3274,21 @@ ${statusLine}`,
                       <Text style={styles.convoTitle} numberOfLines={1}>{c.title || 'New chat'}</Text>
                       <Text style={styles.mutedSmall}>{timeAgo(c.updatedAt)}</Text>
                     </View>
-                    <Text style={styles.mutedSmall} numberOfLines={3}>
+                    <Text style={styles.mutedSmall} numberOfLines={2}>
                       {c.summary || (c.messages.length ? c.messages.length + ' messages' : 'Empty')}
                     </Text>
                   </Pressable>
                 ))}
             </ScrollView>
-            <Text style={styles.mutedSmall}>Long-press a chat to delete it.</Text>
-          </Animated.View>
+            <Text style={styles.mutedSmall}>Long-press a conversation to delete it.</Text>
+          </View>
         </View>
       ) : null}
 
-      <Modal visible={modelPicker} transparent animationType="fade" onRequestClose={() => setModelPicker(false)}>
+      <Modal visible={modelPicker} transparent animationType="none" onRequestClose={() => setModelPicker(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setModelPicker(false)}>
           <View style={styles.modalCard}>
-            <Text style={styles.cardTitle}>Model</Text>
+            <Text style={styles.cardTitle}>Select Model</Text>
             {MODEL_CHOICES.map((m) => (
               <Pressable
                 key={m.id}
@@ -3299,25 +3309,17 @@ ${statusLine}`,
   );
 }
 
-function MessageBubble({
-  msg,
-  say,
-  onCloudPlan,
-}: {
-  msg: ChatMessage;
-  say: (t: string) => void;
-  onCloudPlan?: (r: PulseReply) => void;
-}) {
+function MessageBubble({ msg }: { msg: ChatMessage }) {
   if (msg.role === 'user') {
     return (
       <View style={[styles.bubble, styles.userBubble]}>
         {msg.attachment ? (
           <View style={{ marginBottom: 6 }}>
             {msg.attachment.kind === 'image' && msg.attachment.uri ? (
-              <Image source={{ uri: msg.attachment.uri }} style={{ width: 180, height: 130, borderRadius: 10, marginBottom: 4 }} resizeMode="cover" />
+              <Image source={{ uri: msg.attachment.uri }} style={{ width: 180, height: 130, borderRadius: 6, marginBottom: 4 }} resizeMode="cover" />
             ) : null}
-            <Text style={{ color: '#E0E7FF', fontSize: 12, fontWeight: '700' }}>
-              📎 {msg.attachment.name}
+            <Text style={{ color: '#fff', fontSize: 12, fontWeight: '600' }}>
+              File: {msg.attachment.name}
             </Text>
           </View>
         ) : null}
@@ -3333,143 +3335,36 @@ function MessageBubble({
     );
   }
   return (
-    <View style={{ marginBottom: 12, gap: 6 }}>
+    <View style={{ marginBottom: 10 }}>
       <View style={[styles.bubble, styles.botBubble]}>
         {msg.steps && msg.steps.length ? <StepsView steps={msg.steps} streaming={msg.streaming} /> : null}
         {msg.streaming && !msg.text && msg.steps && msg.steps.length ? null : msg.streaming && !msg.text ? (
-          <View style={styles.rowCenter}>
-            <ActivityIndicator size="small" color={C.accent} />
-            <Text style={[styles.muted, { marginLeft: 8 }]}>Thinking…</Text>
-          </View>
+          <Text style={styles.muted}>Working...</Text>
         ) : (
-          <Text style={styles.bubbleText}>
-            {msg.text}
-            {msg.streaming ? <Text style={{ color: C.accent }}> ▍</Text> : null}
-          </Text>
+          <Text style={styles.bubbleText}>{msg.text}</Text>
         )}
         {msg.verificationShotUri ? (
-          <View style={{ marginTop: 10, borderRadius: 12, overflow: 'hidden', borderWidth: 1, borderColor: C.good, backgroundColor: C.bg, padding: 8, gap: 6 }}>
-            <Text style={{ color: C.good, fontSize: 12, fontWeight: '800' }}>
-              📸 Real-Time Cart & Action Verification
+          <View style={{ marginTop: 8, borderRadius: 6, borderWidth: 1, borderColor: C.border, backgroundColor: C.bg, padding: 8, gap: 4 }}>
+            <Text style={{ color: C.good, fontSize: 12, fontWeight: '700' }}>
+              Screen Verification
             </Text>
             <Image
               source={{ uri: msg.verificationShotUri }}
-              style={{ width: 220, height: 340, borderRadius: 8, alignSelf: 'center' }}
+              style={{ width: 200, height: 300, borderRadius: 4, alignSelf: 'center' }}
               resizeMode="contain"
             />
             {msg.verificationSummary ? (
-              <Text style={{ color: C.text, fontSize: 12, fontWeight: '600' }}>
-                {msg.verificationSummary}
-              </Text>
+              <Text style={{ color: C.text, fontSize: 12 }}>{msg.verificationSummary}</Text>
             ) : null}
           </View>
         ) : null}
-        <View style={[styles.rowBetween, { marginTop: 6 }]}>
-          <Pressable onPress={() => speak(msg.text)} hitSlop={8}>
-            <Text style={{ fontSize: 13, color: C.accent2 }}>🔊 Listen</Text>
-          </Pressable>
-          {msg.reply?.source_verified ? (
-            <Text style={{ fontSize: 11, color: C.good, fontWeight: '700' }}>
-              ✓ Quick-Verify: {msg.reply.source_verified}
-            </Text>
-          ) : null}
-          {msg.source === 'cloud' ? <Text style={styles.sourceTag}>☁️ cloud</Text> : null}
-        </View>
       </View>
-      {/* Removed EXTRACTED ACTIONS card per user request */}
     </View>
-  );
-}
-
-function ActionCard({
-  reply,
-  say,
-  onCloudPlan,
-}: {
-  reply: PulseReply;
-  say: (t: string) => void;
-  onCloudPlan?: (r: PulseReply) => void;
-}) {
-  const summary = reply.one_line_summary || reply.direct_response.slice(0, 120);
-  const fullText =
-    summary + (reply.proactive_checklist.length ? '\n\n- ' + reply.proactive_checklist.join('\n- ') : '');
-  return (
-    <View style={styles.card}>
-      <View style={styles.cardHeader}>
-        <Text style={styles.cardKicker}>EXTRACTED ACTIONS, EVENTS & REMINDERS</Text>
-        <Pressable onPress={() => speak(replyToSpeech(reply) || summary)} hitSlop={8}>
-          <Text style={styles.cardSpeak}>🔊</Text>
-        </Pressable>
-      </View>
-      {reply.one_line_summary ? <Text style={styles.cardSummary}>{summary}</Text> : null}
-
-      <View style={styles.cardRow}>
-        <ActionButton label="📅 Add Calendar" url={calendarUrl(summary, fullText)} />
-        <ActionButton label="✉️ Email" url={mailtoUrl(summary, fullText)} />
-        <ActionButton label="💬 SMS" url={smsUrl(fullText)} />
-        {onCloudPlan && reply.proactive_checklist.length ? (
-          <Pressable
-            onPress={() => onCloudPlan(reply)}
-            style={({ pressed }) => [styles.actionBtn, styles.cloudBtn, pressed && { opacity: 0.7 }]}
-          >
-            <Text style={styles.actionText}>☁️ Time-Block Plan</Text>
-          </Pressable>
-        ) : null}
-      </View>
-
-      {reply.proactive_checklist.length ? (
-        <View style={{ marginTop: 10 }}>
-          {reply.proactive_checklist.map((item, i) => (
-            <ChecklistRow key={i + item} item={item} summary={summary} say={say} />
-          ))}
-        </View>
-      ) : null}
-    </View>
-  );
-}
-
-function ChecklistRow({ item, summary, say }: { item: string; summary: string; say: (t: string) => void }) {
-  const [done, setDone] = useState(false);
-  return (
-    <View style={styles.checkRow}>
-      <Pressable
-        onPress={() => {
-          const next = !done;
-          setDone(next);
-          if (next) say('Done: ' + item);
-        }}
-        style={styles.checkLine}
-        accessibilityRole="checkbox"
-        accessibilityState={{ checked: done }}
-      >
-        <Text style={styles.checkBox}>{done ? '☑' : '☐'}</Text>
-        <Text style={[styles.checkText, done && styles.checkTextDone]}>{item}</Text>
-      </Pressable>
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 6 }}>
-        {actionsForItem(item, summary).map((a) => (
-          <ActionButton key={a.label} label={a.label} url={a.url} small />
-        ))}
-      </ScrollView>
-    </View>
-  );
-}
-
-function ActionButton({ label, url, small }: { label: string; url: string; small?: boolean }) {
-  const inApp = /^https:\/\//i.test(url) && !/calendar\.google\.com/i.test(url);
-  return (
-    <Pressable
-      onPress={() => (inApp ? LiveBus.open(url) : openLink(url))}
-      style={({ pressed }) => [styles.actionBtn, small && styles.actionBtnSmall, pressed && { opacity: 0.7 }]}
-      accessibilityRole="button"
-      accessibilityLabel={label}
-    >
-      <Text style={[styles.actionText, small && { fontSize: 12 }]}>{label}</Text>
-    </Pressable>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/* WORKSPACE                                                           */
+/* WORKSPACE / BROWSER TAB (Only active when user opens BROWSER tab)  */
 /* ------------------------------------------------------------------ */
 
 const HOME_URL = 'https://www.google.com';
@@ -3482,9 +3377,9 @@ function normalizeUrl(raw: string): string {
   return searchUrl(s);
 }
 
-function WidgetsScreen({ say }: { say: (t: string) => void }) {
-  const [minutes, setMinutes] = useState(120);
-  const [secondsLeft, setSecondsLeft] = useState(120 * 60);
+function WidgetsScreen() {
+  const [minutes, setMinutes] = useState(60);
+  const [secondsLeft, setSecondsLeft] = useState(60 * 60);
   const [running, setRunning] = useState(false);
   const [note, setNote] = useState('');
   const [savedNotes, setSavedNotes] = useState<string[]>([]);
@@ -3506,14 +3401,13 @@ function WidgetsScreen({ say }: { say: (t: string) => void }) {
       setSecondsLeft((s) => {
         if (s <= 1) {
           setRunning(false);
-          say('Focus session complete.');
           return 0;
         }
         return s - 1;
       });
     }, 1000);
     return () => clearInterval(id);
-  }, [running, say]);
+  }, [running]);
 
   const setPreset = (m: number) => {
     setRunning(false);
@@ -3536,16 +3430,16 @@ function WidgetsScreen({ say }: { say: (t: string) => void }) {
   return (
     <ScrollView contentContainerStyle={{ padding: 14, gap: 12, paddingBottom: 36 }} keyboardShouldPersistTaps="handled">
       <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>⏱️ Extended Testing & Productivity Timer</Text>
-        <Text style={{ color: C.text, fontSize: 32, fontWeight: '800', textAlign: 'center', marginVertical: 6 }}>
+        <Text style={styles.cardTitle}>Timer</Text>
+        <Text style={{ color: C.text, fontSize: 28, fontWeight: '700', textAlign: 'center', marginVertical: 6 }}>
           {pad(mm)}:{pad(ss)}
         </Text>
-        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, justifyContent: 'center' }}>
-          {[25, 60, 120, 240, 480, 1440].map((m) => (
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, justifyContent: 'center' }}>
+          {[25, 60, 120, 240].map((m) => (
             <Pressable
               key={m}
               onPress={() => setPreset(m)}
-              style={[styles.chip, minutes === m && { borderColor: C.accent, backgroundColor: '#2A1F5C' }]}
+              style={[styles.chip, minutes === m && { borderColor: C.accent }]}
             >
               <Text style={styles.chipText}>{m >= 60 ? `${m / 60}h` : `${m}m`}</Text>
             </Pressable>
@@ -3553,7 +3447,7 @@ function WidgetsScreen({ say }: { say: (t: string) => void }) {
         </View>
         <View style={{ flexDirection: 'row', gap: 8, marginTop: 8 }}>
           <Pressable onPress={() => setRunning((r) => !r)} style={[styles.primaryBtn, { flex: 1, marginTop: 0 }]}>
-            <Text style={styles.primaryBtnText}>{running ? '⏸ Pause' : '▶ Start Session'}</Text>
+            <Text style={styles.primaryBtnText}>{running ? 'Pause' : 'Start'}</Text>
           </Pressable>
           <Pressable onPress={() => setPreset(minutes)} style={[styles.secondaryBtn, { flex: 0.5 }]}>
             <Text style={styles.primaryBtnText}>Reset</Text>
@@ -3562,12 +3456,12 @@ function WidgetsScreen({ say }: { say: (t: string) => void }) {
       </View>
 
       <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>📝 Quick Scratchpad & Agent Notes</Text>
+        <Text style={styles.cardTitle}>Notes</Text>
         <View style={{ flexDirection: 'row', gap: 8 }}>
           <TextInput
             value={note}
             onChangeText={setNote}
-            placeholder="Write a quick testing note or task…"
+            placeholder="Add a note..."
             placeholderTextColor={C.muted}
             style={[styles.input, { flex: 1 }]}
           />
@@ -3576,7 +3470,7 @@ function WidgetsScreen({ say }: { say: (t: string) => void }) {
           </Pressable>
         </View>
         {savedNotes.map((n, idx) => (
-          <View key={idx} style={[styles.rowBetween, { paddingVertical: 6, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: C.border }]}>
+          <View key={idx} style={[styles.rowBetween, { paddingVertical: 6, borderTopWidth: 1, borderTopColor: C.border }]}>
             <Text style={{ color: C.text, fontSize: 13, flex: 1 }}>{n}</Text>
             <Pressable
               onPress={() => {
@@ -3585,7 +3479,7 @@ function WidgetsScreen({ say }: { say: (t: string) => void }) {
                 AsyncStorage.setItem('pulseos.quick_notes.v1', JSON.stringify(next)).catch(() => undefined);
               }}
             >
-              <Text style={{ color: C.danger, fontSize: 12, marginLeft: 8 }}>✕</Text>
+              <Text style={{ color: C.danger, fontSize: 12, marginLeft: 8 }}>Delete</Text>
             </Pressable>
           </View>
         ))}
@@ -3595,11 +3489,8 @@ function WidgetsScreen({ say }: { say: (t: string) => void }) {
 }
 
 function WorkspaceScreen({
-  say,
   homeUrl,
-  confirmFirst,
 }: {
-  say: (t: string) => void;
   homeUrl: string;
   confirmFirst: boolean;
 }) {
@@ -3609,18 +3500,13 @@ function WorkspaceScreen({
   const [field, setField] = useState(home);
   const [canBack, setCanBack] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [title, setTitle] = useState('');
   const [liveMode, setLiveMode] = useState<'handoff' | 'os_bridge' | 'panels'>('handoff');
   const [screenDump, setScreenDump] = useState('');
   const [osShot, setOsShot] = useState('');
   const [osStatus, setOsStatus] = useState<any>(null);
-  const [completed, setCompleted] = useState<{ title: string; url: string; ts: number }[]>([]);
-  const shotRef = useRef<View>(null);
-  const loadStart = useRef(0);
   const loadingRef = useRef(false);
   const pending = useRef(new Map<string, (v: any) => void>());
   const agent = useAgentStatus();
-  const live = useLive();
 
   useEffect(
     () =>
@@ -3669,8 +3555,6 @@ function WorkspaceScreen({
   useEffect(() => {
     if (liveMode !== 'os_bridge') return;
     refreshOsBridge();
-    const id = setInterval(refreshOsBridge, 2000);
-    return () => clearInterval(id);
   }, [liveMode, refreshOsBridge]);
 
   const onMessage = (e: WebViewMessageEvent) => {
@@ -3695,78 +3579,27 @@ function WorkspaceScreen({
     [],
   );
 
-  const snap = useCallback(async () => {
-    if (!LiveBus.get().active || !shotRef.current) return;
-    try {
-      const uri = await captureRef(shotRef, { format: 'jpg', quality: 0.5, width: 360, result: 'tmpfile' });
-      LiveBus.set({ thumb: uri + '?t=' + Date.now() });
-    } catch {}
-  }, []);
-
-  useEffect(() => {
-    const id = setInterval(() => {
-      const l = LiveBus.get();
-      if (l.active && Date.now() - l.startedAt < 15 * 60 * 1000) snap();
-    }, 2000);
-    return () => clearInterval(id);
-  }, [snap]);
-
   const go = (targetUrl?: string) => {
     const u = normalizeUrl(targetUrl || field);
     setUrl(u);
     setField(u);
-    if (LiveBus.get().active) LiveBus.set({ url: u }, 'Opening ' + hostOf(u));
   };
 
   const onNav = (nav: WebViewNavigation) => {
     setCanBack(nav.canGoBack);
     setField(nav.url);
-    setTitle(nav.title || '');
-    if (LiveBus.get().active) LiveBus.set({ url: nav.url, title: nav.title || '' });
   };
-
-  const confirmComplete = () => {
-    const label = title || field;
-    const markDone = () => {
-      setCompleted((prev) => [{ title: label, url: field, ts: Date.now() }, ...prev].slice(0, 20));
-      say('Task complete: ' + label);
-      if (LiveBus.get().active) LiveBus.set({}, '✅ Marked done: ' + label);
-    };
-    if (!confirmFirst) {
-      markDone();
-      return;
-    }
-    Alert.alert('Confirm task complete', 'Mark "' + label + '" as done?', [
-      { text: 'Cancel', style: 'cancel' },
-      { text: 'Confirm', onPress: markDone },
-    ]);
-  };
-
-  const QUICK_HANDOFF_SITES = [
-    { label: '⚡ Blinkit', url: 'https://blinkit.com' },
-    { label: '🛒 Zepto', url: 'https://www.zeptonow.com' },
-    { label: '🍔 Swiggy', url: 'https://www.swiggy.com' },
-    { label: '🛍️ Meesho', url: 'https://www.meesho.com' },
-    { label: '📦 Flipkart', url: 'https://www.flipkart.com' },
-    { label: '🚖 Uber', url: 'https://m.uber.com' },
-    { label: '▶️ YouTube', url: 'https://m.youtube.com' },
-  ];
 
   return (
     <View style={{ flex: 1, backgroundColor: C.bg }}>
-      <View style={{ paddingHorizontal: 12, paddingTop: 8, paddingBottom: 6, backgroundColor: C.panel, borderBottomWidth: 1, borderBottomColor: C.border, gap: 8 }}>
+      <View style={{ paddingHorizontal: 12, paddingVertical: 8, backgroundColor: C.panel, borderBottomWidth: 1, borderBottomColor: C.border }}>
         <View style={styles.rowBetween}>
-          <View style={styles.rowCenter}>
-            <View style={[styles.liveDot, { backgroundColor: agent.running ? C.accent2 : C.good, width: 8, height: 8, borderRadius: 4 }]} />
-            <Text style={{ color: C.text, fontWeight: '800', fontSize: 15 }}>
-              Hark Handoff Live Studio
-            </Text>
-          </View>
+          <Text style={{ color: C.text, fontWeight: '700', fontSize: 14 }}>Workspace</Text>
           <View style={styles.segment}>
             {[
-              { id: 'handoff', label: '🌐 Web Handoff' },
-              { id: 'os_bridge', label: '📱 OS Bridge' },
-              { id: 'panels', label: '⚡ Panels' },
+              { id: 'handoff', label: 'Browser' },
+              { id: 'os_bridge', label: 'OS Bridge' },
+              { id: 'panels', label: 'Tools' },
             ].map((m) => (
               <Pressable
                 key={m.id}
@@ -3782,29 +3615,19 @@ function WorkspaceScreen({
 
       {liveMode === 'handoff' ? (
         <View style={{ flex: 1 }}>
-          <View style={{ backgroundColor: C.panel, paddingVertical: 6, paddingHorizontal: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: C.border }}>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 6 }}>
-              {QUICK_HANDOFF_SITES.map((s) => (
-                <Pressable key={s.label} onPress={() => go(s.url)} style={styles.chip}>
-                  <Text style={styles.chipText}>{s.label}</Text>
-                </Pressable>
-              ))}
-            </ScrollView>
-          </View>
-
           <View style={styles.urlBar}>
             <Pressable
               onPress={() => webRef.current?.goBack()}
               disabled={!canBack}
               style={[styles.navBtn, !canBack && { opacity: 0.35 }]}
             >
-              <Text style={styles.navText}>‹</Text>
+              <Text style={styles.navText}>Back</Text>
             </Pressable>
             <TextInput
               value={field}
               onChangeText={setField}
               onSubmitEditing={() => go()}
-              placeholder="Search or enter URL for Handoff Agent…"
+              placeholder="Enter URL or search..."
               placeholderTextColor={C.muted}
               autoCapitalize="none"
               autoCorrect={false}
@@ -3816,52 +3639,35 @@ function WorkspaceScreen({
             <Pressable onPress={() => go()} style={styles.navBtn}>
               <Text style={styles.navText}>Go</Text>
             </Pressable>
-            <Pressable onPress={() => webRef.current?.reload()} style={styles.navBtn}>
-              <Text style={styles.navText}>↻</Text>
-            </Pressable>
           </View>
 
           {loading ? <View style={styles.progress} /> : null}
 
           {agent.running ? (
             <View style={styles.agentStrip}>
-              <ActivityIndicator size="small" color={C.accent2} />
               <View style={{ flex: 1 }}>
-                <Text style={styles.liveTitle} numberOfLines={1}>🤖 {agent.step || 'Executing Handoff…'}</Text>
+                <Text style={styles.liveTitle} numberOfLines={1}>{agent.step || 'Working...'}</Text>
                 <Text style={styles.mutedSmall} numberOfLines={1}>{agent.goal}</Text>
               </View>
               <Pressable onPress={() => AgentBus.stop()} style={[styles.chip, { borderColor: C.danger }]}>
-                <Text style={[styles.chipText, { color: C.danger }]}>■ Stop</Text>
+                <Text style={[styles.chipText, { color: C.danger }]}>Stop</Text>
               </Pressable>
             </View>
           ) : null}
 
-          <View ref={shotRef} collapsable={false} style={{ flex: 1, backgroundColor: '#fff' }}>
+          <View style={{ flex: 1, backgroundColor: '#fff' }}>
             <WebView
               ref={webRef}
               source={{ uri: url }}
               onNavigationStateChange={onNav}
               onMessage={onMessage}
-              onLoadStart={(e) => {
+              onLoadStart={() => {
                 loadingRef.current = true;
                 setLoading(true);
-                loadStart.current = Date.now();
-                if (LiveBus.get().active) LiveBus.set({ loading: true, progress: 0.05 }, 'Loading ' + hostOf(e.nativeEvent.url));
               }}
-              onLoadProgress={(e) => {
-                if (LiveBus.get().active) LiveBus.set({ progress: e.nativeEvent.progress });
-              }}
-              onLoadEnd={(e) => {
+              onLoadEnd={() => {
                 loadingRef.current = false;
                 setLoading(false);
-                if (LiveBus.get().active) {
-                  const secs = ((Date.now() - loadStart.current) / 1000).toFixed(1);
-                  LiveBus.set(
-                    { loading: false, progress: 1, title: e.nativeEvent.title || '' },
-                    'Loaded "' + (e.nativeEvent.title || hostOf(e.nativeEvent.url)) + '" in ' + secs + 's',
-                  );
-                  setTimeout(snap, 400);
-                }
               }}
               javaScriptEnabled
               domStorageEnabled
@@ -3869,52 +3675,19 @@ function WorkspaceScreen({
               style={{ flex: 1, backgroundColor: '#fff' }}
             />
           </View>
-
-          {live.log.length > 0 ? (
-            <View style={{ maxHeight: 74, backgroundColor: C.panel, paddingHorizontal: 12, paddingVertical: 6, borderTopWidth: 1, borderTopColor: C.border }}>
-              <Text style={{ color: C.accent2, fontSize: 10, fontWeight: '800', letterSpacing: 0.8 }}>LIVE HANDOFF STEP LOG</Text>
-              <ScrollView>
-                {live.log.slice(-3).map((entry, idx) => (
-                  <Text key={idx} style={styles.mutedSmall} numberOfLines={1}>• {entry.text}</Text>
-                ))}
-              </ScrollView>
-            </View>
-          ) : null}
-
-          <View style={styles.confirmBar}>
-            <Pressable onPress={confirmComplete} style={[styles.confirmBtn, { backgroundColor: C.good }]}>
-              <Text style={styles.confirmText}>✓ Approve & Complete Handoff</Text>
-            </Pressable>
-            <Pressable
-              onPress={() => {
-                setUrl(home);
-                setField(home);
-                setTitle('');
-                LiveBus.reset();
-              }}
-              style={[styles.confirmBtn, { backgroundColor: C.panel2, flex: 0.45 }]}
-            >
-              <Text style={styles.confirmText}>Reset</Text>
-            </Pressable>
-          </View>
         </View>
       ) : liveMode === 'os_bridge' ? (
         <ScrollView contentContainerStyle={{ padding: 14, gap: 12, paddingBottom: 36 }}>
           <View style={styles.settingsCard}>
             <View style={styles.rowBetween}>
-              <Text style={styles.cardTitle}>📱 Native OS Assistive Bridge Monitor</Text>
+              <Text style={styles.cardTitle}>OS Assistive Bridge</Text>
               <Pressable onPress={refreshOsBridge} style={styles.chip}>
-                <Text style={styles.chipText}>↻ Refresh</Text>
+                <Text style={styles.chipText}>Refresh</Text>
               </Pressable>
             </View>
             <Text style={styles.mutedSmall}>
-              Status: {osStatus?.status ? String(osStatus.status).toUpperCase() : 'IDLE'} · {osStatus?.message || 'Waiting for cross-app command'}
+              Status: {osStatus?.status ? String(osStatus.status).toUpperCase() : 'IDLE'} · {osStatus?.message || 'Ready'}
             </Text>
-            {osStatus?.cartSummary ? (
-              <Text style={{ color: C.good, fontWeight: '700', fontSize: 13 }}>
-                🛒 Cart Verification: {osStatus.cartSummary}
-              </Text>
-            ) : null}
             <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 6 }}>
               <Pressable
                 onPress={async () => {
@@ -3925,31 +3698,31 @@ function WorkspaceScreen({
                 }}
                 style={styles.chip}
               >
-                <Text style={styles.chipText}>📸 Capture Verification Shot</Text>
+                <Text style={styles.chipText}>Capture Screenshot</Text>
               </Pressable>
               <Pressable onPress={() => openAppWithStatus('accessibility')} style={styles.chip}>
-                <Text style={styles.chipText}>⚙️ Accessibility Settings</Text>
+                <Text style={styles.chipText}>Accessibility Settings</Text>
               </Pressable>
             </View>
           </View>
 
           {osShot ? (
             <View style={styles.settingsCard}>
-              <Text style={styles.cardTitle}>📸 Latest Cart / Action Screenshot</Text>
-              <Image source={{ uri: osShot }} style={{ width: '100%', height: 360, borderRadius: 12 }} resizeMode="contain" />
+              <Text style={styles.cardTitle}>Latest Screen Capture</Text>
+              <Image source={{ uri: osShot }} style={{ width: '100%', height: 340, borderRadius: 6 }} resizeMode="contain" />
             </View>
           ) : null}
 
           <View style={styles.settingsCard}>
-            <Text style={styles.cardTitle}>🔍 Live Active Window Accessibility Tree</Text>
+            <Text style={styles.cardTitle}>Window Nodes</Text>
             <Text style={{ color: C.text, fontFamily: Platform.OS === 'android' ? 'monospace' : 'Courier', fontSize: 11 }}>
-              {screenDump || 'No external app window captured yet. Launch Blinkit, Uber, or Meesho from Chat or Apps tab!'}
+              {screenDump || 'No external window captured yet.'}
             </Text>
           </View>
         </ScrollView>
       ) : (
         <View style={{ flex: 1 }}>
-          <WidgetsScreen say={say} />
+          <WidgetsScreen />
         </View>
       )}
     </View>
@@ -3960,31 +3733,7 @@ function WorkspaceScreen({
 /* SETTINGS                                                            */
 /* ------------------------------------------------------------------ */
 
-const AVATARS = ['⚡', '🧠', '🚀', '🦊', '🐼', '🐱', '🔥', '🌙', '🎯', '💡', '😎', '🙂'];
 const REPLY_LENGTHS: Settings['replyLength'][] = ['short', 'balanced', 'detailed'];
-
-function SettingRow({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
-  return (
-    <View style={styles.settingRow}>
-      <View style={{ flex: 1, paddingRight: 10 }}>
-        <Text style={styles.settingLabel}>{label}</Text>
-        {hint ? <Text style={styles.mutedSmall}>{hint}</Text> : null}
-      </View>
-      {children}
-    </View>
-  );
-}
-
-function Stepper({ value, onChange, step, min, max, suffix }: { value: number; onChange: (n: number) => void; step: number; min: number; max: number; suffix?: string }) {
-  const set = (n: number) => onChange(Math.max(min, Math.min(max, Math.round(n * 100) / 100)));
-  return (
-    <View style={styles.stepper}>
-      <Pressable onPress={() => set(value - step)} style={styles.stepBtn}><Text style={styles.stepBtnText}>−</Text></Pressable>
-      <Text style={styles.stepValue}>{value}{suffix || ''}</Text>
-      <Pressable onPress={() => set(value + step)} style={styles.stepBtn}><Text style={styles.stepBtnText}>+</Text></Pressable>
-    </View>
-  );
-}
 
 function SettingsScreen({
   settings,
@@ -3999,7 +3748,6 @@ function SettingsScreen({
 }) {
   const s = settings;
   const [testing, setTesting] = useState(false);
-  const [photoModal, setPhotoModal] = useState(false);
   const [cloudAdv, setCloudAdv] = useState(false);
   const [checking, setChecking] = useState(false);
   const [installing, setInstalling] = useState(false);
@@ -4010,21 +3758,16 @@ function SettingsScreen({
   const testCloud = async () => {
     const cu = normalizeCloudUrl(s.cloudUrl);
     if (!cu) {
-      Alert.alert('Cloud URL needed', 'Paste the URL your Codespace printed.');
+      Alert.alert('Cloud URL needed', 'Enter your cloud server URL.');
       return;
     }
     patchSettings({ cloudUrl: cu });
     setTesting(true);
     try {
       const h = await cloudHealth(cu);
-      Alert.alert(
-        'Cloud online',
-        'Model: ' + (h.model || '?') +
-          '\nGemini key on server: ' + (h.gemini_key_on_server ? 'yes' : 'no') +
-          '\nToken required: ' + (h.auth_required ? 'yes' : 'no'),
-      );
+      Alert.alert('Cloud online', 'Model: ' + (h.model || '?'));
     } catch (e: any) {
-      Alert.alert('Cloud not reachable', e?.message || String(e));
+      Alert.alert('Cloud offline', e?.message || String(e));
     } finally {
       setTesting(false);
     }
@@ -4038,11 +3781,11 @@ function SettingsScreen({
       const info = await checkForUpdate(DEFAULT_UPDATE_REPO, s.updateToken);
       setUpdate(info.available ? info : null);
       setCheckState(info.available ? 'new' : 'ok');
-      setCheckMsg(info.available ? 'A new version is available.' : "✓ You're up to date.");
+      setCheckMsg(info.available ? 'New version available.' : 'Up to date.');
     } catch (e: any) {
       setUpdate(null);
       setCheckState('error');
-      setCheckMsg(e?.message || "Couldn't check for updates. Try again.");
+      setCheckMsg(e?.message || "Couldn't check for updates.");
     } finally {
       setChecking(false);
     }
@@ -4055,7 +3798,7 @@ function SettingsScreen({
     try {
       await downloadAndInstall(update, s.updateToken, setProgress);
       setCheckState('ok');
-      setCheckMsg('Tap Install on the next screen to finish.');
+      setCheckMsg('Tap Install on the next screen.');
     } catch (e: any) {
       setCheckState('error');
       setCheckMsg('Update failed: ' + (e?.message || String(e)));
@@ -4070,63 +3813,20 @@ function SettingsScreen({
     <ScrollView contentContainerStyle={{ padding: 16, gap: 14, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
       <Text style={styles.sectionTitle}>Settings</Text>
 
-      {/* OS-Level Accessibility & Root Bridge */}
-      <View style={[styles.settingsCard, { borderColor: C.accent2 }]}>
-        <Text style={styles.cardTitle}>♿ OS-Level Accessibility & Root Bridge</Text>
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>OS Accessibility Bridge</Text>
         <Text style={styles.mutedSmall}>
-          Enable "Pulse OS Assistive Bridge" in Android Accessibility Settings so Pulse can read screen elements, tap coordinates, and automate apps like Blinkit, Uber, Meesho, WhatsApp, and Free Fire.
+          Enable "Pulse OS Assistive Bridge" in Android Accessibility Settings so Pulse can automate search bars, buttons, and app workflows.
         </Text>
         <Pressable onPress={() => openAppWithStatus('accessibility')} style={styles.primaryBtn}>
-          <Text style={styles.primaryBtnText}>Open Android Accessibility Settings</Text>
+          <Text style={styles.primaryBtnText}>Open Accessibility Settings</Text>
         </Pressable>
       </View>
 
-      {/* Profile with Custom Profile Picture Upload */}
       <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>👤 Profile & Custom Photo</Text>
-        <View style={styles.profileRow}>
-          <Pressable onPress={() => setPhotoModal(true)} style={[styles.avatarBig, { overflow: 'hidden' }]}>
-            {s.profilePhotoUri ? (
-              <Image source={{ uri: s.profilePhotoUri }} style={{ width: 60, height: 60, borderRadius: 30 }} />
-            ) : (
-              <Text style={{ fontSize: 30 }}>{s.avatar}</Text>
-            )}
-          </Pressable>
-          <View style={{ flex: 1, gap: 6 }}>
-            <Text style={styles.profileName}>{s.name.trim() || 'Your name'}</Text>
-            <View style={{ flexDirection: 'row', gap: 8 }}>
-              <Pressable onPress={() => setPhotoModal(true)} style={[styles.chip, { borderColor: C.accent }]}>
-                <Text style={[styles.chipText, { color: C.accent }]}>📸 Upload Profile Pic</Text>
-              </Pressable>
-              {s.profilePhotoUri ? (
-                <Pressable onPress={() => patchSettings({ profilePhotoUri: '' })} style={styles.chip}>
-                  <Text style={styles.chipText}>Reset</Text>
-                </Pressable>
-              ) : null}
-            </View>
-          </View>
-        </View>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingVertical: 6 }}>
-          {AVATARS.map((a) => (
-            <Pressable key={a} onPress={() => patchSettings({ avatar: a })} style={[styles.emojiPick, s.avatar === a && styles.emojiPickOn]}>
-              <Text style={{ fontSize: 20 }}>{a}</Text>
-            </Pressable>
-          ))}
-        </ScrollView>
-        <Text style={styles.fieldLabel}>Name</Text>
-        <TextInput value={s.name} onChangeText={(t) => patchSettings({ name: t })} placeholder="e.g. Alex" placeholderTextColor={C.muted} style={styles.input} />
-        <Text style={styles.fieldLabel}>Role / headline</Text>
-        <TextInput value={s.role} onChangeText={(t) => patchSettings({ role: t })} placeholder="e.g. Creator & Developer" placeholderTextColor={C.muted} style={styles.input} />
-        <SettingRow label="Personalize replies" hint="Use profile & smart cross-session memory">
-          <Switch value={s.personalize} onValueChange={(v) => patchSettings({ personalize: v })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
-        </SettingRow>
-      </View>
-
-      {/* Assistant */}
-      <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>🧠 Assistant</Text>
-        <Text style={styles.mutedSmall}>Gemini API key — stored only on this device. Free at aistudio.google.com.</Text>
-        <TextInput value={s.apiKey} onChangeText={(t) => patchSettings({ apiKey: t })} placeholder="AIza…" placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} style={styles.input} />
+        <Text style={styles.cardTitle}>AI Assistant</Text>
+        <Text style={styles.mutedSmall}>Gemini API key (stored on device).</Text>
+        <TextInput value={s.apiKey} onChangeText={(t) => patchSettings({ apiKey: t })} placeholder="AIza..." placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} style={styles.input} />
         <Text style={styles.fieldLabel}>Model</Text>
         {MODEL_CHOICES.map((m) => (
           <Pressable key={m.id} onPress={() => patchSettings({ model: m.id })} style={[styles.modelRow, s.model === m.id && styles.convoItemOn]}>
@@ -4138,51 +3838,22 @@ function SettingsScreen({
         <View style={styles.segment}>
           {REPLY_LENGTHS.map((r) => (
             <Pressable key={r} onPress={() => patchSettings({ replyLength: r })} style={[styles.segItem, s.replyLength === r && styles.segItemOn]}>
-              <Text style={[styles.segText, s.replyLength === r && styles.segTextOn]}>{r.charAt(0).toUpperCase() + r.slice(1)}</Text>
+              <Text style={[styles.segText, s.replyLength === r && styles.segTextOn]}>{r.toUpperCase()}</Text>
             </Pressable>
           ))}
         </View>
       </View>
 
-      {/* Voice */}
       <View style={styles.settingsCard}>
         <View style={styles.rowBetween}>
-          <Text style={styles.cardTitle}>🔊 Voice Talk & Readout</Text>
-          <Switch
-            value={s.voiceOn}
-            onValueChange={(v) => {
-              patchSettings({ voiceOn: v });
-              if (v) speakWith({ ...s, voiceOn: true }, 'Voice readout on.');
-              else Speech.stop();
-            }}
-            trackColor={{ false: C.border, true: C.accent }}
-            thumbColor="#fff"
-          />
-        </View>
-        <SettingRow label="Speed">
-          <Stepper value={s.voiceRate} onChange={(n) => patchSettings({ voiceRate: n })} step={0.1} min={0.5} max={2} />
-        </SettingRow>
-        <SettingRow label="Pitch">
-          <Stepper value={s.voicePitch} onChange={(n) => patchSettings({ voicePitch: n })} step={0.1} min={0.5} max={2} />
-        </SettingRow>
-        <Text style={styles.fieldLabel}>Language code (e.g. en-IN, te-IN, hi-IN, en-US)</Text>
-        <TextInput value={s.voiceLang} onChangeText={(t) => patchSettings({ voiceLang: t })} placeholder="en-IN" placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} style={styles.input} />
-        <Pressable onPress={() => speakWith(settings, 'Pulse OS voice assistant is active and ready.')} style={styles.secondaryBtn}>
-          <Text style={styles.primaryBtnText}>Preview voice</Text>
-        </Pressable>
-      </View>
-
-      {/* Cloud */}
-      <View style={styles.settingsCard}>
-        <View style={styles.rowBetween}>
-          <Text style={styles.cardTitle}>☁️ Cloud computer</Text>
+          <Text style={styles.cardTitle}>Cloud Server</Text>
           <Switch value={s.cloudMode} onValueChange={(v) => patchSettings({ cloudMode: v && !!s.cloudUrl })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
         </View>
         <Pressable onPress={testCloud} disabled={testing} style={styles.secondaryBtn}>
-          {testing ? <ActivityIndicator color={C.text} /> : <Text style={styles.primaryBtnText}>Check connection</Text>}
+          {testing ? <ActivityIndicator color={C.text} /> : <Text style={styles.primaryBtnText}>Check Connection</Text>}
         </Pressable>
         <Pressable onPress={() => setCloudAdv((v) => !v)}>
-          <Text style={[styles.mutedSmall, { color: C.accent }]}>{cloudAdv ? 'Hide server details ▴' : 'Change server ▾'}</Text>
+          <Text style={[styles.mutedSmall, { color: C.accent }]}>{cloudAdv ? 'Hide server details' : 'Edit server URL'}</Text>
         </Pressable>
         {cloudAdv ? (
           <>
@@ -4192,12 +3863,11 @@ function SettingsScreen({
         ) : null}
       </View>
 
-      {/* Updates */}
       <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>⬇️ App updates</Text>
-        <Text style={styles.mutedSmall}>Version {Application.nativeApplicationVersion || '2.1.0'} (build {cur})</Text>
+        <Text style={styles.cardTitle}>App Updates</Text>
+        <Text style={styles.mutedSmall}>Version {Application.nativeApplicationVersion || '3.1.0'} (build {cur})</Text>
         <Pressable onPress={check} disabled={checking || installing} style={styles.primaryBtn}>
-          {checking ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Check for updates</Text>}
+          {checking ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Check for Updates</Text>}
         </Pressable>
         {checkMsg ? (
           <Text style={[styles.updateResult, checkState === 'ok' && { color: C.good }, checkState === 'error' && { color: C.danger }]}>
@@ -4208,77 +3878,21 @@ function SettingsScreen({
           <View style={styles.updateBox}>
             <Text style={styles.updateHead}>New version ready · build {update.latestBuild}</Text>
             {update.sizeBytes ? <Text style={styles.mutedSmall}>{formatBytes(update.sizeBytes)}</Text> : null}
-            {update.notes ? <Text style={[styles.mutedSmall, { marginTop: 6 }]} numberOfLines={4}>What's new: {update.notes}</Text> : null}
             {installing ? (
               <View style={styles.progressTrack}><View style={[styles.progressFill, { width: (Math.round(progress * 100) + '%') as any }]} /></View>
             ) : null}
             <Pressable onPress={install} disabled={installing} style={[styles.primaryBtn, { marginTop: 10, backgroundColor: C.good }]}>
-              <Text style={styles.primaryBtnText}>{installing ? 'Downloading ' + Math.round(progress * 100) + '%' : 'Update now'}</Text>
+              <Text style={styles.primaryBtnText}>{installing ? 'Downloading ' + Math.round(progress * 100) + '%' : 'Install Update'}</Text>
             </Pressable>
           </View>
         ) : null}
       </View>
-
-      <Modal visible={photoModal} transparent animationType="slide" onRequestClose={() => setPhotoModal(false)}>
-        <View style={styles.modalBackdrop}>
-          <View style={[styles.modalCard, { height: 320, padding: 0, overflow: 'hidden' }]}>
-            <View style={[styles.rowBetween, { paddingHorizontal: 14, paddingTop: 12 }]}>
-              <Text style={styles.cardTitle}>📸 Custom Profile Picture</Text>
-              <Pressable onPress={() => setPhotoModal(false)} style={styles.chip}>
-                <Text style={styles.chipText}>✕ Close</Text>
-              </Pressable>
-            </View>
-            <WebView
-              originWhitelist={['*']}
-              source={{
-                html: `<!DOCTYPE html><html><body style="background:#121826;color:#fff;font-family:sans-serif;padding:20px;text-align:center;">
-                  <p style="color:#8A94A8;font-size:13px;">Select any photo from your phone gallery or camera</p>
-                  <label for="p" style="display:block;padding:15px;background:#7C5CFF;border-radius:12px;font-weight:bold;cursor:pointer;margin-top:14px;">🖼️ Choose Photo from Gallery / Camera</label>
-                  <input id="p" type="file" accept="image/*" style="display:none" />
-                  <script>
-                    document.getElementById('p').onchange = function(e) {
-                      var f = e.target.files[0];
-                      if (!f) return;
-                      var r = new FileReader();
-                      r.onload = function(ev) {
-                        var img = new Image();
-                        img.onload = function() {
-                          var cv = document.createElement('canvas');
-                          cv.width = 240; cv.height = 240;
-                          var ctx = cv.getContext('2d');
-                          var m = Math.min(img.width, img.height);
-                          ctx.drawImage(img, (img.width-m)/2, (img.height-m)/2, m, m, 0, 0, 240, 240);
-                          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'profile_pic', uri: cv.toDataURL('image/jpeg', 0.85) }));
-                        };
-                        img.src = ev.target.result;
-                      };
-                      r.readAsDataURL(f);
-                    };
-                  </script>
-                </body></html>`
-              }}
-              javaScriptEnabled
-              allowFileAccess
-              onMessage={(e) => {
-                try {
-                  const d = JSON.parse(e.nativeEvent.data);
-                  if (d?.type === 'profile_pic' && d.uri) {
-                    patchSettings({ profilePhotoUri: String(d.uri) });
-                    setPhotoModal(false);
-                  }
-                } catch {}
-              }}
-              style={{ flex: 1, backgroundColor: C.panel }}
-            />
-          </View>
-        </View>
-      </Modal>
     </ScrollView>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/* Styles                                                              */
+/* Plain, Clean Styles (No Flashy Rounded Pills or Neon Animations)    */
 /* ------------------------------------------------------------------ */
 
 const styles = StyleSheet.create({
@@ -4293,86 +3907,56 @@ const styles = StyleSheet.create({
   drawerWrap: { ...StyleSheet.absoluteFillObject, zIndex: 50 },
   drawerBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.5)' },
   drawer: {
-    position: 'absolute', top: 0, bottom: 0, left: 0, width: 300, padding: 14,
+    position: 'absolute', top: 0, bottom: 0, left: 0, width: 290, padding: 14,
     backgroundColor: C.panel, borderRightWidth: 1, borderRightColor: C.border,
   },
-  convoItem: { padding: 10, borderRadius: 12, backgroundColor: C.panel2, borderWidth: 1, borderColor: 'transparent', gap: 4 },
+  convoItem: { padding: 10, borderRadius: 6, backgroundColor: C.panel2, borderWidth: 1, borderColor: C.border, gap: 4 },
   convoItemOn: { borderColor: C.accent },
-  convoTitle: { color: C.text, fontWeight: '700', fontSize: 14, flexShrink: 1, marginRight: 8 },
-  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.65)', justifyContent: 'center', padding: 18 },
-  modalCard: { backgroundColor: C.panel, borderRadius: 16, padding: 16, gap: 8, borderWidth: 1, borderColor: C.border },
-  modelRow: { padding: 10, borderRadius: 12, backgroundColor: C.panel2, borderWidth: 1, borderColor: 'transparent', gap: 2 },
-  appGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 14 },
+  convoTitle: { color: C.text, fontWeight: '600', fontSize: 14, flexShrink: 1, marginRight: 8 },
+  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.65)', justifyContent: 'center', padding: 16 },
+  modalCard: { backgroundColor: C.panel, borderRadius: 6, padding: 14, gap: 8, borderWidth: 1, borderColor: C.border },
+  modelRow: { padding: 10, borderRadius: 6, backgroundColor: C.panel2, borderWidth: 1, borderColor: C.border, gap: 2 },
+  appGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 12 },
   appTile: {
-    width: '31%', flexGrow: 0, alignItems: 'center', paddingVertical: 14, paddingHorizontal: 6, borderRadius: 14,
-    backgroundColor: C.panel, borderWidth: 1, borderColor: C.border, gap: 4,
+    width: '31%', flexGrow: 0, alignItems: 'center', paddingVertical: 12, paddingHorizontal: 6, borderRadius: 6,
+    backgroundColor: C.panel, borderWidth: 1, borderColor: C.border, gap: 2,
   },
-  appName: { color: C.text, fontSize: 12, fontWeight: '700' },
+  appName: { color: C.text, fontSize: 13, fontWeight: '600' },
   agentStrip: {
     flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 8, gap: 8,
-    backgroundColor: C.panel, borderBottomWidth: 1, borderBottomColor: C.accent,
+    backgroundColor: C.panel, borderBottomWidth: 1, borderBottomColor: C.border,
   },
-  liveCard: {
-    flexDirection: 'row', alignItems: 'center', marginHorizontal: 10, marginBottom: 6, padding: 8,
-    backgroundColor: C.panel, borderRadius: 14, borderWidth: 1, borderColor: C.accent,
-  },
-  liveThumbWrap: { width: 96, height: 72, borderRadius: 10, overflow: 'hidden', backgroundColor: C.panel2 },
-  liveThumb: { width: 96, height: 72 },
-  liveBadge: {
-    position: 'absolute', top: 4, left: 4, flexDirection: 'row', alignItems: 'center',
-    backgroundColor: 'rgba(0,0,0,0.65)', borderRadius: 6, paddingHorizontal: 5, paddingVertical: 2,
-  },
-  liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: C.danger, marginRight: 4 },
-  liveBadgeText: { color: '#fff', fontSize: 9, fontWeight: '800', letterSpacing: 0.5 },
-  liveTitle: { color: C.text, fontWeight: '700', fontSize: 14 },
-  liveTrack: { height: 3, borderRadius: 2, backgroundColor: C.border, marginTop: 6, overflow: 'hidden' },
-  liveFill: { height: 3, backgroundColor: C.accent },
-  stepsBox: { marginBottom: 8, paddingBottom: 8, borderBottomWidth: 1, borderBottomColor: C.border },
-  stepsHead: { color: C.muted, fontSize: 12, fontWeight: '700' },
-  stepRow: { flexDirection: 'row', alignItems: 'center', marginTop: 6 },
-  stepIcon: { width: 16, color: C.good, fontWeight: '800', textAlign: 'center' },
-  stepText: { flex: 1, color: C.muted, fontSize: 12, marginLeft: 6 },
-  stepMs: { color: C.muted, fontSize: 11, fontVariant: ['tabular-nums'] },
+  liveTitle: { color: C.text, fontWeight: '600', fontSize: 13 },
+  stepsBox: { marginBottom: 6, paddingBottom: 6, borderBottomWidth: 1, borderBottomColor: C.border },
+  stepsHead: { color: C.muted, fontSize: 12, fontWeight: '600' },
+  stepRow: { flexDirection: 'row', alignItems: 'center', marginTop: 4 },
+  stepIcon: { width: 14, color: C.good, fontWeight: '700', textAlign: 'center' },
+  stepText: { flex: 1, color: C.muted, fontSize: 12, marginLeft: 4 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: C.bg },
 
   header: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 16,
+    paddingHorizontal: 14,
     paddingVertical: 10,
-    borderBottomWidth: StyleSheet.hairlineWidth,
+    backgroundColor: C.panel,
+    borderBottomWidth: 1,
     borderBottomColor: C.border,
   },
-  brand: { color: C.text, fontSize: 20, fontWeight: '800', letterSpacing: 0.5 },
+  brand: { color: C.text, fontSize: 17, fontWeight: '700' },
   brandSub: { color: C.muted, fontSize: 12 },
-  voiceBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: C.border,
-    backgroundColor: C.panel,
-  },
-  voiceBtnOn: { borderColor: C.accent, backgroundColor: '#2A1F5C' },
-  voiceIcon: { fontSize: 16 },
-  voiceText: { color: C.muted, fontWeight: '700', fontSize: 11 },
 
   tabBar: {
     flexDirection: 'row',
-    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopWidth: 1,
     borderTopColor: C.border,
     backgroundColor: C.panel,
-    paddingBottom: 6,
   },
-  tabItem: { flex: 1, alignItems: 'center', paddingTop: 8, paddingBottom: 4 },
-  tabIcon: { fontSize: 18 },
-  tabLabel: { color: C.muted, fontSize: 11, fontWeight: '700', letterSpacing: 1, marginTop: 2 },
-  tabLabelActive: { color: C.text },
-  tabDot: { width: 4, height: 4, borderRadius: 2, backgroundColor: C.accent, marginTop: 3 },
+  tabItem: { flex: 1, alignItems: 'center', paddingVertical: 12 },
+  tabItemActive: { borderTopWidth: 2, borderTopColor: C.accent, backgroundColor: C.panel2 },
+  tabLabel: { color: C.muted, fontSize: 11, fontWeight: '600' },
+  tabLabelActive: { color: C.text, fontWeight: '700' },
 
   muted: { color: C.muted, fontSize: 13 },
   mutedSmall: { color: C.muted, fontSize: 12 },
@@ -4382,14 +3966,17 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 12,
+    paddingHorizontal: 10,
     paddingVertical: 8,
-    gap: 8,
+    gap: 6,
+    borderBottomWidth: 1,
+    borderBottomColor: C.border,
+    backgroundColor: C.panel,
   },
   chip: {
     paddingHorizontal: 10,
     paddingVertical: 6,
-    borderRadius: 999,
+    borderRadius: 6,
     backgroundColor: C.panel2,
     borderWidth: 1,
     borderColor: C.border,
@@ -4399,105 +3986,56 @@ const styles = StyleSheet.create({
   input: {
     color: C.text,
     backgroundColor: C.panel2,
-    borderRadius: 10,
+    borderRadius: 6,
     borderWidth: 1,
     borderColor: C.border,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    fontSize: 14,
   },
   primaryBtn: {
     marginTop: 8,
     backgroundColor: C.accent,
-    borderRadius: 10,
-    paddingVertical: 12,
+    borderRadius: 6,
+    paddingVertical: 11,
     alignItems: 'center',
   },
-  primaryBtnText: { color: '#fff', fontWeight: '700' },
+  primaryBtnText: { color: '#fff', fontWeight: '600', fontSize: 14 },
   secondaryBtn: {
+    marginTop: 6,
     backgroundColor: C.panel2,
-    borderRadius: 10,
+    borderRadius: 6,
     borderWidth: 1,
     borderColor: C.border,
-    paddingVertical: 12,
+    paddingVertical: 10,
     alignItems: 'center',
   },
   rowBetween: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   rowCenter: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  sourceTag: { color: C.accent2, fontSize: 11, fontWeight: '700' },
-  cloudBtn: { borderColor: C.accent2 },
-  avatarSmall: {
-    width: 34, height: 34, borderRadius: 17, backgroundColor: C.panel2, borderWidth: 1, borderColor: C.border,
-    alignItems: 'center', justifyContent: 'center', marginRight: 10,
-  },
-  avatarBig: {
-    width: 60, height: 60, borderRadius: 30, backgroundColor: C.panel2, borderWidth: 2, borderColor: C.accent,
-    alignItems: 'center', justifyContent: 'center',
-  },
-  profileRow: { flexDirection: 'row', alignItems: 'center', gap: 14, marginBottom: 4 },
-  profileName: { color: C.text, fontSize: 18, fontWeight: '800' },
-  emojiPick: { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center', backgroundColor: C.panel2, borderWidth: 1, borderColor: C.border },
-  emojiPickOn: { borderColor: C.accent, backgroundColor: '#2A1F5C' },
-  settingsCard: { backgroundColor: C.panel, borderRadius: 16, borderWidth: 1, borderColor: C.border, padding: 14, gap: 8 },
-  cardTitle: { color: C.text, fontSize: 15, fontWeight: '800' },
-  fieldLabel: { color: C.muted, fontSize: 12, fontWeight: '700', marginTop: 4 },
-  settingRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 4 },
-  settingLabel: { color: C.text, fontSize: 14, fontWeight: '600' },
-  stepper: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  stepBtn: { width: 32, height: 32, borderRadius: 8, backgroundColor: C.panel2, borderWidth: 1, borderColor: C.border, alignItems: 'center', justifyContent: 'center' },
-  stepBtnText: { color: C.text, fontSize: 18, fontWeight: '700' },
-  stepValue: { color: C.text, minWidth: 44, textAlign: 'center', fontWeight: '700' },
-  segment: { flexDirection: 'row', backgroundColor: C.panel2, borderRadius: 10, padding: 3, borderWidth: 1, borderColor: C.border },
-  segItem: { flex: 1, paddingVertical: 8, borderRadius: 8, alignItems: 'center' },
+  settingsCard: { backgroundColor: C.panel, borderRadius: 6, borderWidth: 1, borderColor: C.border, padding: 14, gap: 8 },
+  cardTitle: { color: C.text, fontSize: 15, fontWeight: '700' },
+  fieldLabel: { color: C.muted, fontSize: 12, fontWeight: '600', marginTop: 4 },
+  segment: { flexDirection: 'row', backgroundColor: C.panel2, borderRadius: 6, padding: 2, borderWidth: 1, borderColor: C.border },
+  segItem: { flex: 1, paddingVertical: 7, borderRadius: 4, alignItems: 'center' },
   segItemOn: { backgroundColor: C.accent },
-  segText: { color: C.muted, fontWeight: '700', fontSize: 13 },
+  segText: { color: C.muted, fontWeight: '600', fontSize: 12 },
   segTextOn: { color: '#fff' },
-  updateBanner: { backgroundColor: '#123524', borderBottomWidth: 1, borderBottomColor: C.good, paddingHorizontal: 14, paddingVertical: 8 },
+  updateBanner: { backgroundColor: C.panel2, borderBottomWidth: 1, borderBottomColor: C.good, paddingHorizontal: 14, paddingVertical: 8 },
   updateBannerText: { color: C.text, fontSize: 13, fontWeight: '600' },
-  updateResult: { color: C.muted, fontSize: 14, fontWeight: '600', marginTop: 8, textAlign: 'center' },
-  updateBox: { marginTop: 8, padding: 12, borderRadius: 12, backgroundColor: C.panel2, borderWidth: 1, borderColor: C.good },
-  updateHead: { color: C.text, fontWeight: '800', fontSize: 15 },
-  progressTrack: { height: 6, borderRadius: 3, backgroundColor: C.border, marginTop: 10, overflow: 'hidden' },
+  updateResult: { color: C.muted, fontSize: 13, fontWeight: '600', marginTop: 6, textAlign: 'center' },
+  updateBox: { marginTop: 8, padding: 12, borderRadius: 6, backgroundColor: C.panel2, borderWidth: 1, borderColor: C.good },
+  updateHead: { color: C.text, fontWeight: '700', fontSize: 14 },
+  progressTrack: { height: 6, borderRadius: 3, backgroundColor: C.border, marginTop: 8, overflow: 'hidden' },
   progressFill: { height: 6, backgroundColor: C.good },
-  tabBadge: { width: 6, height: 6, borderRadius: 3, backgroundColor: C.good, marginTop: 3 },
 
-  empty: { padding: 24, alignItems: 'center', gap: 10, marginTop: 36 },
-  emptyTitle: { color: C.text, fontSize: 18, fontWeight: '700' },
+  empty: { padding: 24, alignItems: 'center', gap: 10, marginTop: 32 },
+  emptyTitle: { color: C.text, fontSize: 16, fontWeight: '700' },
 
-  bubble: { maxWidth: '90%', borderRadius: 16, paddingHorizontal: 14, paddingVertical: 10, marginBottom: 4 },
-  userBubble: { alignSelf: 'flex-end', backgroundColor: C.accent, borderBottomRightRadius: 4 },
-  botBubble: { alignSelf: 'flex-start', backgroundColor: C.panel2, borderBottomLeftRadius: 4 },
-  errorBubble: { alignSelf: 'flex-start', backgroundColor: '#3B1418', borderWidth: 1, borderColor: C.danger },
-  bubbleText: { color: C.text, fontSize: 15, lineHeight: 21 },
-
-  card: {
-    backgroundColor: C.panel,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: C.border,
-    padding: 14,
-  },
-  cardHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  cardKicker: { color: C.accent2, fontSize: 11, fontWeight: '800', letterSpacing: 1.1, marginBottom: 6 },
-  cardSpeak: { fontSize: 18 },
-  cardSummary: { color: C.text, fontSize: 14, fontWeight: '600', marginBottom: 10 },
-  cardRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-
-  actionBtn: {
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 10,
-    backgroundColor: C.panel2,
-    borderWidth: 1,
-    borderColor: C.border,
-  },
-  actionBtnSmall: { paddingHorizontal: 10, paddingVertical: 6 },
-  actionText: { color: C.text, fontSize: 13, fontWeight: '600' },
-
-  checkRow: { paddingVertical: 8, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: C.border, gap: 6 },
-  checkLine: { flexDirection: 'row', alignItems: 'flex-start', gap: 8 },
-  checkBox: { color: C.accent2, fontSize: 18, lineHeight: 20 },
-  checkText: { color: C.text, fontSize: 14, flex: 1, lineHeight: 20 },
-  checkTextDone: { color: C.muted, textDecorationLine: 'line-through' },
+  bubble: { maxWidth: '92%', borderRadius: 6, paddingHorizontal: 12, paddingVertical: 10, marginBottom: 4, borderWidth: 1 },
+  userBubble: { alignSelf: 'flex-end', backgroundColor: C.accent, borderColor: C.accent },
+  botBubble: { alignSelf: 'flex-start', backgroundColor: C.panel, borderColor: C.border },
+  errorBubble: { alignSelf: 'flex-start', backgroundColor: '#2A1215', borderColor: C.danger },
+  bubbleText: { color: C.text, fontSize: 14, lineHeight: 20 },
 
   attachmentPreviewBar: {
     flexDirection: 'row',
@@ -4506,16 +4044,10 @@ const styles = StyleSheet.create({
     marginHorizontal: 10,
     marginBottom: 6,
     padding: 8,
-    borderRadius: 12,
+    borderRadius: 6,
     backgroundColor: C.panel,
     borderWidth: 1,
-    borderColor: C.accent2,
-  },
-  attachmentThumb: {
-    width: 44,
-    height: 44,
-    borderRadius: 8,
-    backgroundColor: C.panel2,
+    borderColor: C.border,
   },
 
   composer: {
@@ -4523,14 +4055,14 @@ const styles = StyleSheet.create({
     alignItems: 'flex-end',
     padding: 8,
     gap: 6,
-    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopWidth: 1,
     borderTopColor: C.border,
-    backgroundColor: C.bg,
+    backgroundColor: C.panel,
   },
   iconBtn: {
-    width: 42,
-    height: 42,
-    borderRadius: 21,
+    height: 40,
+    paddingHorizontal: 12,
+    borderRadius: 6,
     backgroundColor: C.panel2,
     borderWidth: 1,
     borderColor: C.border,
@@ -4541,52 +4073,46 @@ const styles = StyleSheet.create({
     flex: 1,
     color: C.text,
     backgroundColor: C.panel2,
-    borderRadius: 20,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    maxHeight: 120,
-    fontSize: 15,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: C.border,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    maxHeight: 110,
+    fontSize: 14,
   },
   sendBtn: {
-    width: 42,
-    height: 42,
-    borderRadius: 21,
+    height: 40,
+    paddingHorizontal: 16,
+    borderRadius: 6,
     backgroundColor: C.accent,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  sendText: { color: '#fff', fontSize: 18, fontWeight: '800' },
+  sendText: { color: '#fff', fontSize: 14, fontWeight: '700' },
 
-  urlBar: { flexDirection: 'row', alignItems: 'center', gap: 6, padding: 8, backgroundColor: C.panel },
+  urlBar: { flexDirection: 'row', alignItems: 'center', gap: 6, padding: 8, backgroundColor: C.panel, borderBottomWidth: 1, borderBottomColor: C.border },
   urlInput: {
     flex: 1,
     color: C.text,
     backgroundColor: C.panel2,
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    fontSize: 14,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: C.border,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    fontSize: 13,
   },
   navBtn: {
-    minWidth: 36,
-    height: 36,
-    paddingHorizontal: 8,
-    borderRadius: 10,
+    height: 34,
+    paddingHorizontal: 10,
+    borderRadius: 6,
     backgroundColor: C.panel2,
+    borderWidth: 1,
+    borderColor: C.border,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  navText: { color: C.text, fontSize: 16, fontWeight: '700' },
-  progress: { height: 2, backgroundColor: C.accent2 },
-  completedStrip: { paddingHorizontal: 12, paddingVertical: 6, backgroundColor: C.panel },
-  confirmBar: {
-    flexDirection: 'row',
-    gap: 8,
-    padding: 10,
-    backgroundColor: C.panel,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: C.border,
-  },
-  confirmBtn: { flex: 1, paddingVertical: 12, borderRadius: 12, alignItems: 'center' },
-  confirmText: { color: '#fff', fontWeight: '700' },
+  navText: { color: C.text, fontSize: 13, fontWeight: '600' },
+  progress: { height: 2, backgroundColor: C.accent },
 });
