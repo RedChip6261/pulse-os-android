@@ -1016,6 +1016,27 @@ class HarkBridgePackage : com.facebook.react.ReactPackage {
         'utf8',
       );
 
+      // 1. Optimize gradle-wrapper.properties: use lighter -bin.zip instead of -all.zip
+      const wrapperPropsPath = path.join(androidRoot, "gradle/wrapper/gradle-wrapper.properties");
+      if (fs.existsSync(wrapperPropsPath)) {
+        let props = fs.readFileSync(wrapperPropsPath, "utf8");
+        props = props.replace(/-all\.zip/g, "-bin.zip");
+        fs.writeFileSync(wrapperPropsPath, props, "utf8");
+      }
+
+      // 2. Patch android/gradlew to automatically retry up to 4 times and switch to Gradle Fastly CDN mirror if GitHub Releases returns HTTP 504
+      const gradlewPath = path.join(androidRoot, "gradlew");
+      if (fs.existsSync(gradlewPath)) {
+        let gw = fs.readFileSync(gradlewPath, "utf8");
+        if (gw.includes("exec \"$JAVACMD\" \"$@\"") && !gw.includes("PULSE_GRADLE_RETRY")) {
+          gw = gw.replace(
+            "exec \"$JAVACMD\" \"$@\"",
+            "# PULSE_GRADLE_RETRY\nfor _attempt in 1 2 3 4; do\n  \"$JAVACMD\" \"$@\" && exit 0\n  echo \"[Pulse OS CI] Gradle command failed (attempt $_attempt/4), switching mirror & retrying in 5s...\"\n  sed -i \"s|services.gradle.org/distributions|downloads.gradle-dn.com/distributions|g\" \"$APP_HOME/gradle/wrapper/gradle-wrapper.properties\" 2>/dev/null || true\n  sleep 5\ndone\nexit 1"
+          );
+          fs.writeFileSync(gradlewPath, gw, "utf8");
+        }
+      }
+
       return config;
     },
   ]);
