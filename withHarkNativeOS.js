@@ -1,11 +1,18 @@
 const {
   withAndroidManifest,
+  withStringsXml,
   withMainApplication,
   withDangerousMod,
   withGradleProperties,
 } = require('@expo/config-plugins');
 const fs = require('fs');
 const path = require('path');
+
+const SERVICE_NAME = '.HarkAccessibilityService';
+const SERVICE_LABEL = 'Hark Pro 5.0 OmniCore Bridge';
+const SERVICE_DESC_KEY = 'hark_accessibility_desc';
+const SERVICE_DESC_VALUE =
+  'Hark Pro 5.0 OmniCore Hands-Free Voice (Telugu & English) and Autonomous Screen Assistant';
 
 function ensureDir(dirPath) {
   if (!fs.existsSync(dirPath)) {
@@ -22,7 +29,7 @@ const ACCESSIBILITY_XML = `<?xml version="1.0" encoding="utf-8"?>
     android:canRetrieveWindowContent="true"
     android:canTakeScreenshot="true"
     android:description="@string/hark_accessibility_desc"
-    android:notificationTimeout="80" />
+    android:notificationTimeout="50" />
 `;
 
 const HARK_ACCESSIBILITY_SERVICE_KT = `package __PACKAGE__
@@ -734,7 +741,9 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
             }
             lower.startsWith("search for ") || lower.startsWith("search ") ||
             lower.startsWith("vethuku ") || raw.startsWith("వెతుకు") -> {
-                val q = raw.replace(Regex("^(search for|search|vethuku|వెతుకు)\\s*", RegexOption.IGNORE_CASE), "").trim()
+                val q = raw
+                    .replace(Regex("^(search for|search|vethuku|వెతుకు)[ ]*", RegexOption.IGNORE_CASE), "")
+                    .trim()
                 val ok = if (q.isNotEmpty()) performInAppSearch(q) else clickByText("Search", false)
                 res.put("handled", true)
                 res.put("action", "search")
@@ -742,7 +751,9 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
                 res.put("ok", ok)
             }
             lower.startsWith("click ") || lower.startsWith("tap ") || lower.startsWith("press ") -> {
-                val target = raw.replace(Regex("^(click|tap|press)\\s+", RegexOption.IGNORE_CASE), "").trim()
+                val target = raw
+                    .replace(Regex("^(click|tap|press)[ ]+", RegexOption.IGNORE_CASE), "")
+                    .trim()
                 narrateStep("Clicking \$target", "\$target నొక్కుతున్నాను")
                 val ok = clickByText(target, false)
                 res.put("handled", true)
@@ -797,22 +808,24 @@ class HarkAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
                         val hwBuffer = screenshotResult.hardwareBuffer
                         val colorSpace = screenshotResult.colorSpace
                         val bmp = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
+                        hwBuffer.close()
                         if (bmp != null) {
                             val softBmp = bmp.copy(Bitmap.Config.ARGB_8888, false)
-                            val scaled = Bitmap.createScaledBitmap(
-                                softBmp,
-                                (softBmp.width * 0.45).toInt().coerceAtLeast(320),
-                                (softBmp.height * 0.45).toInt().coerceAtLeast(560),
-                                true
-                            )
-                            val baos = ByteArrayOutputStream()
-                            scaled.compress(Bitmap.CompressFormat.JPEG, 68, baos)
-                            encoded = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-                            scaled.recycle()
-                            softBmp.recycle()
                             bmp.recycle()
+                            if (softBmp != null) {
+                                val scaled = Bitmap.createScaledBitmap(
+                                    softBmp,
+                                    (softBmp.width * 0.45).toInt().coerceAtLeast(320),
+                                    (softBmp.height * 0.45).toInt().coerceAtLeast(560),
+                                    true
+                                )
+                                softBmp.recycle()
+                                val baos = ByteArrayOutputStream()
+                                scaled.compress(Bitmap.CompressFormat.JPEG, 68, baos)
+                                scaled.recycle()
+                                encoded = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+                            }
                         }
-                        hwBuffer.close()
                     } catch (_: Exception) {}
                     latch.countDown()
                 }
@@ -902,8 +915,10 @@ import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.facebook.react.ReactPackage
 import com.facebook.react.bridge.*
 import com.facebook.react.modules.core.DeviceEventManagerModule
+import com.facebook.react.uimanager.ViewManager
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -1051,7 +1066,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                     promise.resolve(false)
                     return@post
                 }
-                val clean = text.replace(Regex("[#*_\`~]+"), " ").trim()
+                val clean = text.replace(Regex("[#*_~]+"), " ").trim()
                 if (clean.isEmpty()) {
                     promise.resolve(false)
                     return@post
@@ -1227,7 +1242,9 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                 val res = svc.executeHandsFreeVoiceAction(spokenText)
                 promise.resolve(res.toString())
             } catch (e: Exception) {
-                promise.resolve("{\\"handled\\":false}")
+                val fallback = JSONObject()
+                fallback.put("handled", false)
+                promise.resolve(fallback.toString())
             }
         }.start()
     }
@@ -1238,12 +1255,19 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
             try {
                 val svc = HarkAccessibilityService.instance
                 if (svc == null) {
-                    promise.resolve("{\\"error\\":\\"Accessibility Service disabled\\",\\"texts\\":[],\\"clickables\\":[],\\"editables\\":[]}")
+                    val emptyObj = JSONObject()
+                    emptyObj.put("error", "Accessibility Service disabled")
+                    emptyObj.put("texts", JSONArray())
+                    emptyObj.put("clickables", JSONArray())
+                    emptyObj.put("editables", JSONArray())
+                    promise.resolve(emptyObj.toString())
                 } else {
                     promise.resolve(svc.dumpScreenSummary())
                 }
             } catch (e: Exception) {
-                promise.resolve("{\\"error\\":\\"\${e.message}\\"}")
+                val errObj = JSONObject()
+                errObj.put("error", e.message ?: "error")
+                promise.resolve(errObj.toString())
             }
         }.start()
     }
@@ -1732,7 +1756,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
         title: String,
         subtitle: String,
         bodyText: String,
-        ShareImmediately: Boolean,
+        shareImmediately: Boolean,
         promise: Promise
     ) {
         Thread {
@@ -1773,7 +1797,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                 }
 
                 val lines = mutableListOf<Pair<String, Boolean>>()
-                val rawParagraphs = bodyText.replace("\\r\\n", "\\n").split("\\n")
+                val rawParagraphs = bodyText.lines()
                 for (rawPara in rawParagraphs) {
                     val trimmed = rawPara.trim()
                     if (trimmed.isEmpty()) {
@@ -1781,7 +1805,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                         continue
                     }
                     val isHeading = trimmed.startsWith("#") || (trimmed.endsWith(":") && trimmed.length < 65)
-                    val cleanPara = trimmed.replace(Regex("^#+\\s*"), "").replace("**", "")
+                    val cleanPara = trimmed.replace(Regex("^#+[ ]*"), "").replace("**", "")
                     val paintToMeasure = if (isHeading) headPaint else bodyPaint
                     val words = cleanPara.split(" ")
                     var currentLine = ""
@@ -1862,14 +1886,6 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
         }.start()
     }
 }
-`;
-
-const HARK_PACKAGE_KT = `package __PACKAGE__
-
-import com.facebook.react.ReactPackage
-import com.facebook.react.bridge.NativeModule
-import com.facebook.react.bridge.ReactApplicationContext
-import com.facebook.react.uimanager.ViewManager
 
 class HarkBridgePackage : ReactPackage {
     override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> {
@@ -1881,6 +1897,28 @@ class HarkBridgePackage : ReactPackage {
     }
 }
 `;
+
+function injectHarkPackageIntoMainApplication(src, pkgName) {
+  let out = src;
+  const importLine = `import ${pkgName}.HarkBridgePackage`;
+  if (!out.includes(importLine) && !out.includes(`package ${pkgName}`)) {
+    out = out.replace(/(package\s+[\w.]+\s*\n)/, `$1\n${importLine}\n`);
+  }
+  if (!out.includes('HarkBridgePackage')) {
+    if (/PackageList\(this\)\.packages\.apply\s*\{/.test(out)) {
+      out = out.replace(
+        /PackageList\(this\)\.packages\.apply\s*\{/,
+        'PackageList(this).packages.apply {\n              add(HarkBridgePackage())'
+      );
+    } else if (/PackageList\(this\)\.packages/.test(out)) {
+      out = out.replace(
+        /PackageList\(this\)\.packages/,
+        'PackageList(this).packages.apply { add(HarkBridgePackage()) }'
+      );
+    }
+  }
+  return out;
+}
 
 module.exports = function withHarkNativeOS(config) {
   config = withGradleProperties(config, (mod) => {
@@ -1897,6 +1935,15 @@ module.exports = function withHarkNativeOS(config) {
     setProp('org.gradle.parallel', 'true');
     setProp('newArchEnabled', 'false');
     mod.modResults = props;
+    return mod;
+  });
+
+  config = withStringsXml(config, (mod) => {
+    const strings = mod.modResults.resources.string || [];
+    if (!strings.some((s) => s?.$?.name === SERVICE_DESC_KEY)) {
+      strings.push({ $: { name: SERVICE_DESC_KEY }, _: SERVICE_DESC_VALUE });
+    }
+    mod.modResults.resources.string = strings;
     return mod;
   });
 
@@ -1954,15 +2001,15 @@ module.exports = function withHarkNativeOS(config) {
     if (app) {
       if (!app.service) app.service = [];
       const hasAcc = app.service.some(
-        (s) => s.$ && s.$['android:name'] === '.HarkAccessibilityService'
+        (s) => s.$ && s.$['android:name'] === SERVICE_NAME
       );
       if (!hasAcc) {
         app.service.push({
           $: {
-            'android:name': '.HarkAccessibilityService',
+            'android:name': SERVICE_NAME,
             'android:permission': 'android.permission.BIND_ACCESSIBILITY_SERVICE',
-            'android:label': 'Hark Pro OmniCore Assistive Bridge',
-            'android:exported': 'false',
+            'android:label': SERVICE_LABEL,
+            'android:exported': 'true',
           },
           'intent-filter': [
             {
@@ -1986,38 +2033,30 @@ module.exports = function withHarkNativeOS(config) {
   });
 
   config = withMainApplication(config, (mod) => {
-    let contents = mod.modResults.contents;
-    const pkg = mod.android?.package || 'com.ismartanji.harkos';
-    const importLine = `import ${pkg}.HarkBridgePackage`;
-    if (!contents.includes(importLine)) {
-      contents = contents.replace(/(package\s+[\w.]+\s*\n)/, `$1\n${importLine}\n`);
-    }
-    if (!contents.includes('HarkBridgePackage()')) {
-      if (contents.includes('PackageList(this).packages.apply {')) {
-        contents = contents.replace(
-          'PackageList(this).packages.apply {',
-          'PackageList(this).packages.apply {\n              add(HarkBridgePackage())'
-        );
-      } else if (contents.includes('PackageList(this).packages')) {
-        contents = contents.replace(
-          'PackageList(this).packages',
-          'PackageList(this).packages.apply { add(HarkBridgePackage()) }'
-        );
-      }
-    }
-    mod.modResults.contents = contents;
+    const pkg = mod.android?.package || 'com.pulseos.app';
+    mod.modResults.contents = injectHarkPackageIntoMainApplication(mod.modResults.contents, pkg);
     return mod;
   });
 
   config = withDangerousMod(config, [
     'android',
     async (mod) => {
-      const projectRoot = mod.modRequest.projectRoot;
-      const androidRoot = path.join(projectRoot, 'android');
-      const pkg = mod.android?.package || 'com.ismartanji.harkos';
+      const androidRoot =
+        mod.modRequest.platformProjectRoot ||
+        path.join(mod.modRequest.projectRoot, 'android');
+      const pkg = mod.android?.package || 'com.pulseos.app';
       const pkgRel = pkg.replace(/\./g, '/');
       const javaDir = path.join(androidRoot, 'app', 'src', 'main', 'java', pkgRel);
       ensureDir(javaDir);
+
+      const mainAppKtPath = path.join(javaDir, 'MainApplication.kt');
+      if (fs.existsSync(mainAppKtPath)) {
+        const mainKt = fs.readFileSync(mainAppKtPath, 'utf8');
+        const updatedMainKt = injectHarkPackageIntoMainApplication(mainKt, pkg);
+        if (updatedMainKt !== mainKt) {
+          fs.writeFileSync(mainAppKtPath, updatedMainKt, 'utf8');
+        }
+      }
 
       fs.writeFileSync(
         path.join(javaDir, 'HarkAccessibilityService.kt'),
@@ -2029,29 +2068,10 @@ module.exports = function withHarkNativeOS(config) {
         HARK_BRIDGE_MODULE_KT.replace(/__PACKAGE__/g, pkg),
         'utf8'
       );
-      fs.writeFileSync(
-        path.join(javaDir, 'HarkBridgePackage.kt'),
-        HARK_PACKAGE_KT.replace(/__PACKAGE__/g, pkg),
-        'utf8'
-      );
 
       const xmlDir = path.join(androidRoot, 'app', 'src', 'main', 'res', 'xml');
       ensureDir(xmlDir);
       fs.writeFileSync(path.join(xmlDir, 'hark_accessibility_config.xml'), ACCESSIBILITY_XML, 'utf8');
-
-      const valuesDir = path.join(androidRoot, 'app', 'src', 'main', 'res', 'values');
-      ensureDir(valuesDir);
-      const stringsPath = path.join(valuesDir, 'strings.xml');
-      if (fs.existsSync(stringsPath)) {
-        let strXml = fs.readFileSync(stringsPath, 'utf8');
-        if (!strXml.includes('hark_accessibility_desc')) {
-          strXml = strXml.replace(
-            '</resources>',
-            '  <string name="hark_accessibility_desc">Hark Pro 5.0 OmniCore Hands-Free Voice &amp; Autonomous Screen Assistant</string>\n</resources>'
-          );
-          fs.writeFileSync(stringsPath, strXml, 'utf8');
-        }
-      }
 
       const wrapperPropPath = path.join(androidRoot, 'gradle', 'wrapper', 'gradle-wrapper.properties');
       if (fs.existsSync(wrapperPropPath)) {
@@ -2060,9 +2080,39 @@ module.exports = function withHarkNativeOS(config) {
         if (wp.includes('networkTimeout=')) {
           wp = wp.replace(/networkTimeout=\d+/g, 'networkTimeout=120000');
         } else {
-          wp += '\nnetworkTimeout=120000\n';
+          wp = wp.trimEnd() + '\nnetworkTimeout=120000\n';
         }
         fs.writeFileSync(wrapperPropPath, wp, 'utf8');
+      }
+
+      const gradlewPath = path.join(androidRoot, 'gradlew');
+      if (fs.existsSync(gradlewPath)) {
+        let gw = fs.readFileSync(gradlewPath, 'utf8');
+        if (gw.includes('exec "$JAVACMD" "$@"') && !gw.includes('PULSE_GRADLE_PREFETCH')) {
+          const prefetchBlock = [
+            '# PULSE_GRADLE_PREFETCH',
+            '_WRAPPER_DIR="$APP_HOME/gradle/wrapper"',
+            '_PROPS="$_WRAPPER_DIR/gradle-wrapper.properties"',
+            'if [ -f "$_PROPS" ] && command -v curl >/dev/null 2>&1; then',
+            '  _RAW_URL=$(grep "^distributionUrl=" "$_PROPS" | head -n 1 | cut -d= -f2- | sed "s|\\\\:|:|g" | tr -d "\\r\\n")',
+            '  _DIST_ZIP=$(basename "$_RAW_URL")',
+            '  _LOCAL_ZIP="$_WRAPPER_DIR/$_DIST_ZIP"',
+            '  if [ -n "$_RAW_URL" ] && [ -n "$_DIST_ZIP" ] && [ ! -s "$_LOCAL_ZIP" ]; then',
+            '    echo "[Pulse OS CI] Prefetching $_DIST_ZIP with curl retry..."',
+            '    if curl --ipv4 -fSL --retry 4 --retry-delay 3 --retry-all-errors --connect-timeout 15 --max-time 120 -o "$_LOCAL_ZIP.tmp" "$_RAW_URL" 2>/dev/null; then',
+            '      mv -f "$_LOCAL_ZIP.tmp" "$_LOCAL_ZIP"',
+            '      sed -i.bak "s|^distributionUrl=.*|distributionUrl=$_DIST_ZIP|" "$_PROPS" 2>/dev/null || true',
+            '      rm -f "$_PROPS.bak"',
+            '    else',
+            '      rm -f "$_LOCAL_ZIP.tmp"',
+            '    fi',
+            '  fi',
+            'fi',
+            'exec "$JAVACMD" "$@"',
+          ].join('\n');
+          gw = gw.replace('exec "$JAVACMD" "$@"', prefetchBlock);
+          fs.writeFileSync(gradlewPath, gw, 'utf8');
+        }
       }
 
       return mod;

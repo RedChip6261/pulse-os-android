@@ -1,45 +1,49 @@
 {
   "expo": {
-    "name": "Hark Pro AI",
-    "slug": "pulse-os-android",
+    "name": "Hark Pro 5.0",
+    "slug": "pulse-os",
     "version": "5.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
+    "backgroundColor": "#04060E",
     "newArchEnabled": false,
+    "plugins": [
+      "./withHarkNativeOS.js"
+    ],
+    "platforms": [
+      "android"
+    ],
     "splash": {
-      "backgroundColor": "#05070F"
-    },
-    "ios": {
-      "supportsTablet": true,
-      "bundleIdentifier": "com.ismartanji.harkos"
+      "image": "./assets/splash-icon.png",
+      "backgroundColor": "#04060E"
     },
     "android": {
-      "package": "com.ismartanji.harkos",
+      "package": "com.pulseos.app",
       "versionCode": 34,
       "newArchEnabled": false,
       "adaptiveIcon": {
-        "backgroundColor": "#05070F"
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#04060E"
       },
       "permissions": [
         "android.permission.INTERNET",
         "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.VIBRATE",
         "android.permission.RECORD_AUDIO",
         "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.QUERY_ALL_PACKAGES",
+        "android.permission.REQUEST_INSTALL_PACKAGES",
         "android.permission.CAMERA",
-        "android.permission.VIBRATE",
+        "android.permission.FLASHLIGHT",
+        "android.permission.CALL_PHONE",
         "android.permission.WAKE_LOCK",
         "android.permission.SYSTEM_ALERT_WINDOW",
         "android.permission.FOREGROUND_SERVICE",
         "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
-        "android.permission.POST_NOTIFICATIONS",
-        "android.permission.QUERY_ALL_PACKAGES",
-        "android.permission.CALL_PHONE",
-        "android.permission.READ_EXTERNAL_STORAGE",
-        "android.permission.WRITE_EXTERNAL_STORAGE"
-      ]
+        "android.permission.POST_NOTIFICATIONS"
+      ],
+      "softwareKeyboardLayoutMode": "resize"
     },
-    "plugins": [
-      "./withHarkNativeOS"
-    ]
+    "icon": "./assets/icon.png"
   }
 }
