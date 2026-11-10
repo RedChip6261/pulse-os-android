@@ -1975,7 +1975,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                     val pMeasure = if (isHead) headPaint else bodyPaint
                     var cur = ""
                     for (w in cleanPara.split(" ")) {
-                        val test = if (cur.isEmpty()) w else "$cur $w"
+                        val test = if (cur.isEmpty()) w else cur + " " + w
                         if (pMeasure.measureText(test) <= contentWidth) {
                             cur = test
                         } else {
@@ -1996,7 +1996,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                 y += 24f
                 for ((lineText, isHead) in lines) {
                     if (y > pageHeight - 56f) {
-                        canvas.drawText("Hark Pro 5.0 OmniCore  •  Page $pageNumber", margin, pageHeight - 24f, footerPaint)
+                        canvas.drawText("Hark Pro 5.0 OmniCore  •  Page " + pageNumber, margin, pageHeight - 24f, footerPaint)
                         pdfDoc.finishPage(page)
                         pageNumber++
                         pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, pageNumber).create()
@@ -2015,12 +2015,12 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                         y += 16f
                     }
                 }
-                canvas.drawText("Hark Pro 5.0 OmniCore  •  Page $pageNumber", margin, pageHeight - 24f, footerPaint)
+                canvas.drawText("Hark Pro 5.0 OmniCore  •  Page " + pageNumber, margin, pageHeight - 24f, footerPaint)
                 pdfDoc.finishPage(page)
                 val outDir = reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: reactContext.cacheDir
                 if (!outDir.exists()) outDir.mkdirs()
                 val safeSlug = title.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(30).ifBlank { "hark_report" }
-                val outFile = File(outDir, "${safeSlug}_${System.currentTimeMillis()}.pdf")
+                val outFile = File(outDir, safeSlug + "_" + System.currentTimeMillis() + ".pdf")
                 FileOutputStream(outFile).use { fos -> pdfDoc.writeTo(fos) }
                 pdfDoc.close()
                 val res = JSONObject()
