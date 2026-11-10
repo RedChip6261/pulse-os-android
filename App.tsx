@@ -18,6 +18,7 @@ import {
   TextInput,
   View,
   NativeModules,
+  DeviceEventEmitter,
   AppState,
   NativeSyntheticEvent,
   NativeScrollEvent,
@@ -1248,6 +1249,10 @@ async function tryDirectDeviceExecution(
   }
 
   // 2. Check if user is asking to log in to an app
+  const isConversationalQuestion =
+    /^(what\s+is|why\s+|how\s+(?:do|does|can|to|are)|who\s+is|explain|tell\s+me|compare|write\s+a|summarize|translate)/i.test(
+      clean,
+    );
   const loginMatch = lower.match(/\b(?:log\s*in|login|sign\s*in)\b/);
   const matchedApp = APPS.find(
     (app) =>
@@ -1258,7 +1263,7 @@ async function tryDirectDeviceExecution(
       }),
   );
 
-  if (loginMatch && matchedApp) {
+  if (!isConversationalQuestion && loginMatch && matchedApp) {
     const saved = userAuth.savedLogins.find(
       (s) =>
         s.app.toLowerCase() === matchedApp.id ||
@@ -1280,10 +1285,15 @@ async function tryDirectDeviceExecution(
     };
   }
 
-  // 3. Check if any known app is mentioned in the user message
-  if (matchedApp) {
+  // 3. Check if any known app is mentioned with an explicit action intent (not a general question)
+  const hasAppActionIntent =
+    /\b(open|launch|start|run|play|watch|listen|search|order|buy|book|find|send|message|call|dial|go\s+to|lo|ఓపెన్|ప్లే|ఆర్డర్|పెట్టు|వెతుకు)\b/i.test(
+      clean,
+    ) ||
+    (matchedApp && lower.startsWith(matchedApp.name.toLowerCase()));
+
+  if (!isConversationalQuestion && matchedApp && hasAppActionIntent) {
     let query = extractCleanAppQuery(clean, matchedApp);
-    // If query refers to "my address", "my office", "usual", etc., replace with RAG-resolved value!
     if (ragCtx.resolvedHintQuery && (!query || /\b(my\s+address|my\s+home|my\s+office|usual|saved)\b/i.test(clean))) {
       query = ragCtx.resolvedHintQuery;
     } else if (/\b(my\s+address|my\s+home|my\s+office)\b/i.test(clean) && userAuth.address) {
@@ -2841,20 +2851,26 @@ const DEFAULT_SETTINGS: Settings = {
 };
 
 async function loadSettings(): Promise<Settings> {
-  const raw = await AsyncStorage.getItem(STORAGE_SETTINGS);
+  const [raw, v5Key] = await Promise.all([
+    AsyncStorage.getItem(STORAGE_SETTINGS),
+    AsyncStorage.getItem('hark_v5_api_key'),
+  ]);
   if (raw) {
     try {
       const saved: any = JSON.parse(raw);
       const merged: Settings = { ...DEFAULT_SETTINGS, ...saved };
-      if (!saved.rev || saved.rev < 6) {
+      if (!merged.apiKey && v5Key) {
+        merged.apiKey = v5Key;
+      }
+      if (!saved.rev || saved.rev < 7) {
         merged.speed = 'fast';
         merged.fastModel = FAST_MODEL;
         merged.model = DEFAULT_MODEL;
-        merged.cloudMode = false;
         merged.ragEnabled = true;
         merged.autoIndexAttachments = true;
+        merged.voiceOn = true;
         if (!merged.cloudUrl) merged.cloudUrl = DEFAULT_CLOUD_URL;
-        merged.rev = 6;
+        merged.rev = 7;
         await AsyncStorage.setItem(STORAGE_SETTINGS, JSON.stringify(merged));
       }
       return merged;
@@ -2870,13 +2886,13 @@ async function loadSettings(): Promise<Settings> {
   ]);
   const s: Settings = {
     ...DEFAULT_SETTINGS,
-    apiKey: k || '',
+    apiKey: k || v5Key || '',
     model: m || DEFAULT_MODEL,
-    voiceOn: false,
+    voiceOn: true,
     cloudUrl: cu || DEFAULT_CLOUD_URL,
     cloudToken: ct || '',
     cloudMode: false,
-    rev: 6,
+    rev: 7,
   };
   await AsyncStorage.setItem(STORAGE_SETTINGS, JSON.stringify(s));
   return s;
@@ -2911,6 +2927,7 @@ type UpdateInfo = {
   publishedAt: string;
   sizeBytes: number;
   assetApiUrl: string;
+  browserDownloadUrl: string;
   htmlUrl: string;
 };
 
@@ -2951,7 +2968,8 @@ async function checkForUpdate(repo: string, token: string): Promise<UpdateInfo> 
     notes: String(rel.body || '').trim(),
     publishedAt: String(rel.published_at || ''),
     sizeBytes: Number(asset.size) || 0,
-    assetApiUrl: String(asset.url),
+    assetApiUrl: String(asset.url || ''),
+    browserDownloadUrl: String(asset.browser_download_url || asset.url || ''),
     htmlUrl: String(rel.html_url || ''),
   };
 }
@@ -2964,25 +2982,42 @@ async function downloadAndInstall(
   if (Platform.OS !== 'android') throw new Error('Updates install on Android only.');
   const dest = (FileSystem.cacheDirectory || FileSystem.documentDirectory || '') + 'pulse-os-' + info.latestBuild + '.apk';
   await FileSystem.deleteAsync(dest, { idempotent: true });
-  const headers: Record<string, string> = { Accept: 'application/octet-stream' };
-  if (token.trim()) headers.Authorization = 'Bearer ' + token.trim();
-  const task = FileSystem.createDownloadResumable(info.assetApiUrl, dest, { headers }, (p) => {
+  const useApiUrl = Boolean(token.trim() && info.assetApiUrl);
+  const downloadUrl = useApiUrl ? info.assetApiUrl : (info.browserDownloadUrl || info.assetApiUrl);
+  const headers: Record<string, string> = useApiUrl
+    ? { Accept: 'application/octet-stream', Authorization: 'Bearer ' + token.trim() }
+    : {};
+  const task = FileSystem.createDownloadResumable(downloadUrl, dest, { headers }, (p) => {
     const total = p.totalBytesExpectedToWrite > 0 ? p.totalBytesExpectedToWrite : info.sizeBytes;
     if (total > 0) onProgress(Math.min(1, p.totalBytesWritten / total));
   });
   const result = await task.downloadAsync();
   if (!result || (result.status && result.status >= 400)) {
+    if (info.browserDownloadUrl) {
+      await Linking.openURL(info.browserDownloadUrl);
+      return;
+    }
     throw new Error('Download failed (HTTP ' + (result?.status ?? '?') + ').');
   }
   const stat = await FileSystem.getInfoAsync(dest);
   if (!stat.exists || (stat.size ?? 0) < 1024 * 1024) throw new Error('Downloaded file incomplete.');
   onProgress(1);
-  const contentUri = await FileSystem.getContentUriAsync(dest);
-  await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
-    data: contentUri,
-    flags: 1,
-    type: 'application/vnd.android.package-archive',
-  });
+  try {
+    const contentUri = await FileSystem.getContentUriAsync(dest);
+    await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
+      data: contentUri,
+      flags: 1,
+      type: 'application/vnd.android.package-archive',
+    });
+  } catch {
+    if (HarkBridge?.installApk) {
+      const ok = await HarkBridge.installApk(dest);
+      if (ok) return;
+    }
+    if (info.browserDownloadUrl) {
+      await Linking.openURL(info.browserDownloadUrl);
+    }
+  }
 }
 
 function formatBytes(n: number) {
@@ -3092,16 +3127,16 @@ export default function App() {
   }
 
   const tabs: { id: Tab; label: string; emoji: string; desc: string }[] = [
-    { id: 'CHAT', label: '✨ Chat', emoji: '✨', desc: 'Omni Assistant, Own Thoughts & Telugu/EN Voice' },
-    { id: 'VOICE', label: '🎙️ Voice Orb', emoji: '🎙️', desc: 'Hands-Free Control: Scroll Down, Select It, Search, Proceed' },
-    { id: 'OMNICORE', label: '🧠 5 Engines', emoji: '🧠', desc: 'Processing, Reply, Agentic, Self-Dev & GitHub Integrations' },
-    { id: 'MEDIA', label: '🎨 Media Gen', emoji: '🎨', desc: 'Flux 8K Image Gen, AI Video Storyboard & Native PDF' },
-    { id: 'RAG', label: '📚 RAG AI', emoji: '📚', desc: 'Hybrid BM25 + Vector Knowledge Vault & Playbooks' },
+    { id: 'CHAT', label: '✨ Chat', emoji: '✨', desc: 'Omni Assistant, Media/Link Upload & Telugu/EN Voice' },
+    { id: 'VOICE', label: '🎙️ Hands-Free', emoji: '🎙️', desc: 'Natural Human Voice AI + Screen/App Hands-Free Control' },
+    { id: 'SETTINGS', label: '⚙️ Settings', emoji: '⚙️', desc: 'Inbuilt OTA APK Update, API Key, Speed & Self-Test' },
     { id: 'APPS', label: '📱 Apps & OS', emoji: '📱', desc: '28+ App Workflows, Installed Apps & Hardware Deck' },
+    { id: 'MEDIA', label: '🎨 Media Gen', emoji: '🎨', desc: 'Flux 8K Image Gen, AI Video Storyboard & Native PDF' },
+    { id: 'OMNICORE', label: '🧠 5 Engines', emoji: '🧠', desc: 'Processing, Reply, Agentic, Self-Dev & GitHub Integrations' },
+    { id: 'RAG', label: '📚 RAG AI', emoji: '📚', desc: 'Hybrid BM25 + Vector Knowledge Vault & Playbooks' },
     { id: 'LOGIN', label: '🔐 Vault', emoji: '🔐', desc: 'Personal Identity, Address & Auto-Login Credentials' },
     { id: 'LIVE', label: '🌐 Studio', emoji: '🌐', desc: 'Agentic Browser, OS Bridge Inspector, Timer & Notes' },
     { id: 'CLOUD', label: '☁️ Cloud', emoji: '☁️', desc: 'Remote Cloud Server & Codespace Task Runner' },
-    { id: 'SETTINGS', label: '⚙️ Setup', emoji: '⚙️', desc: 'API Key, Speed Mode, Self-Test & OTA APK Updater' },
   ];
 
   const displayUser = userAuth.name.trim() || settings.name.trim();
@@ -3109,45 +3144,60 @@ export default function App() {
   return (
     <SafeAreaView style={styles.root}>
       <StatusBar style="light" backgroundColor={C.bg} />
-      <View style={[styles.header, { backgroundColor: 'rgba(15, 23, 42, 0.88)', borderBottomColor: 'rgba(99, 102, 241, 0.35)' }]}>
-        <View style={[styles.rowCenter, { gap: 10, flexShrink: 1 }]}>
+      <View style={[styles.header, { backgroundColor: 'rgba(15, 23, 42, 0.92)', borderBottomColor: 'rgba(99, 102, 241, 0.35)' }]}>
+        <View style={[styles.rowCenter, { gap: 8, flexShrink: 1 }]}>
           <Pressable
             onPress={() => setNavDrawerOpen(true)}
-            style={[styles.chip, { paddingHorizontal: 11, paddingVertical: 7, backgroundColor: 'rgba(79, 70, 229, 0.28)', borderColor: '#818CF8' }]}
+            style={[styles.chip, { paddingHorizontal: 10, paddingVertical: 6, backgroundColor: 'rgba(79, 70, 229, 0.28)', borderColor: '#818CF8' }]}
           >
             <Text style={[styles.chipText, { fontSize: 15, color: '#FFFFFF' }]}>☰</Text>
           </Pressable>
           <View style={{ flexShrink: 1 }}>
-            <Text style={styles.brand}>✨ Hark Pro 5.0 · OmniCore</Text>
+            <Text style={styles.brand} numberOfLines={1}>✨ Hark Pro 5.1 · OmniCore</Text>
             <Text style={styles.brandSub} numberOfLines={1}>
-              {displayUser ? `${displayUser} · ` : ''}🇮🇳 తెలుగు/EN · ⚡-{omniProcessingEngine.getMetrics().compressionRatioPct}% Tok · RAG ({ragIndex.length})
+              {displayUser ? `${displayUser} · ` : ''}🇮🇳 తెలుగు/EN · RAG ({ragIndex.length})
             </Text>
           </View>
         </View>
-        <View style={styles.rowCenter}>
+        <View style={[styles.rowCenter, { gap: 5 }]}>
           <Pressable
             onPress={() => setTab('VOICE')}
-            style={[styles.chip, { borderColor: '#38BDF8', backgroundColor: 'rgba(56, 189, 248, 0.16)' }]}
+            style={[styles.chip, { paddingHorizontal: 8, borderColor: '#38BDF8', backgroundColor: tab === 'VOICE' ? 'rgba(56, 189, 248, 0.32)' : 'rgba(56, 189, 248, 0.14)' }]}
           >
-            <Text style={[styles.chipText, { color: '#BAE6FD' }]}>🎙️ Live</Text>
+            <Text style={[styles.chipText, { color: '#BAE6FD', fontSize: 11 }]}>🎙️ Voice</Text>
           </Pressable>
           <Pressable
-            onPress={() => setTab('MEDIA')}
-            style={[styles.chip, { borderColor: '#C084FC', backgroundColor: 'rgba(192, 132, 252, 0.16)' }]}
+            onPress={() => setTab('SETTINGS')}
+            style={[
+              styles.chip,
+              {
+                paddingHorizontal: 8,
+                borderColor: update?.available ? C.good : '#A855F7',
+                backgroundColor: update?.available ? 'rgba(16, 185, 129, 0.26)' : 'rgba(168, 85, 247, 0.16)',
+              },
+            ]}
           >
-            <Text style={[styles.chipText, { color: '#E9D5FF' }]}>🎨 Media</Text>
+            <Text style={[styles.chipText, { color: update?.available ? '#6EE7B7' : '#E9D5FF', fontSize: 11 }]}>
+              {update?.available ? `🔄 Update (${update.latestBuild})` : '🔄 Update'}
+            </Text>
+          </Pressable>
+          <Pressable
+            onPress={() => setTab('SETTINGS')}
+            style={[styles.chip, { paddingHorizontal: 8, borderColor: tab === 'SETTINGS' ? '#818CF8' : C.border, backgroundColor: tab === 'SETTINGS' ? 'rgba(79, 70, 229, 0.3)' : C.panel2 }]}
+          >
+            <Text style={[styles.chipText, { fontSize: 11 }]}>⚙️ Settings</Text>
           </Pressable>
           <Pressable
             onPress={() => openAppWithStatus('accessibility')}
             style={[
               styles.chip,
-              { borderColor: bridgeActive ? C.good : C.warn },
+              { paddingHorizontal: 8, borderColor: bridgeActive ? C.good : C.warn },
             ]}
           >
             <Text
               style={[
                 styles.chipText,
-                { color: bridgeActive ? '#4ADE80' : '#FBBF24' },
+                { fontSize: 11, color: bridgeActive ? '#4ADE80' : '#FBBF24' },
               ]}
             >
               {bridgeActive ? '🟢 OS' : '⚠️ OS'}
@@ -3162,7 +3212,7 @@ export default function App() {
           style={[styles.updateBanner, { borderBottomColor: C.warn }]}
         >
           <Text style={[styles.updateBannerText, { color: '#FBBF24' }]}>
-            ⚠️ Accessibility Bridge is OFF. Tap here to enable "Pulse OS Assistive Bridge" so app search & clicks work!
+            ⚠️ Accessibility Bridge is OFF. Tap here to enable "Pulse OS Assistive Bridge" so hands-free app search & clicks work!
           </Text>
         </Pressable>
       ) : null}
@@ -3170,7 +3220,7 @@ export default function App() {
       {update && tab !== 'SETTINGS' ? (
         <Pressable onPress={() => setTab('SETTINGS')} style={styles.updateBanner}>
           <Text style={styles.updateBannerText}>
-            Update available: build {update.latestBuild} (current: {update.currentBuild}). Tap to install.
+            🔄 Inbuilt Update Ready: Build {update.latestBuild} (current: {update.currentBuild}). Tap here to Download & Install!
           </Text>
         </Pressable>
       ) : null}
@@ -3236,7 +3286,11 @@ export default function App() {
           <HandsFreeVoiceOrbScreen
             langMode={voiceLangMode}
             setLangMode={setVoiceLangMode}
+            settings={settings}
+            userAuth={userAuth}
+            ragIndex={ragIndex}
             onRunCommand={triggerAgentTaskFromAnywhere}
+            openSettings={() => setTab('SETTINGS')}
           />
         </View>
         <View style={[styles.fill, tab !== 'OMNICORE' && styles.hidden]}>
@@ -3245,6 +3299,33 @@ export default function App() {
         <View style={[styles.fill, tab !== 'MEDIA' && styles.hidden]}>
           <MediaGenStudioScreen />
         </View>
+      </View>
+
+      {/* Always-Visible Frosted Glass Bottom Navigation Bar */}
+      <View style={[styles.tabBar, { backgroundColor: 'rgba(10, 15, 29, 0.96)', borderTopColor: 'rgba(99, 102, 241, 0.35)', paddingVertical: 4 }]}>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 8, gap: 6, alignItems: 'center' }}>
+          {tabs.map(({ id, label }) => (
+            <Pressable
+              key={id}
+              onPress={() => setTab(id)}
+              style={[
+                styles.chip,
+                {
+                  paddingHorizontal: 12,
+                  paddingVertical: 7,
+                  backgroundColor: tab === id ? 'rgba(79, 70, 229, 0.35)' : 'rgba(30, 41, 59, 0.65)',
+                  borderColor: tab === id ? '#818CF8' : 'rgba(148, 163, 184, 0.22)',
+                },
+              ]}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: tab === id }}
+            >
+              <Text style={[styles.chipText, { fontSize: 12, color: tab === id ? '#FFFFFF' : '#CBD5E1', fontWeight: tab === id ? '700' : '600' }]}>
+                {label}
+              </Text>
+            </Pressable>
+          ))}
+        </ScrollView>
       </View>
 
       {/* Slide-Out Pure Glass Workspace Drawer (Separates all 10 workspaces cleanly!) */}
@@ -3533,6 +3614,8 @@ function ChatScreen({
   };
 
   const pendingVoiceAutoSendRef = useRef<string>('');
+  const [linkUrlInput, setLinkUrlInput] = useState('');
+  const [attachingBusy, setAttachingBusy] = useState(false);
 
   const startVoiceInput = async () => {
     if (busy) return;
@@ -3546,10 +3629,81 @@ function ChatScreen({
         if (cleanSpoken) {
           setInput(cleanSpoken);
           pendingVoiceAutoSendRef.current = cleanSpoken;
+        } else if (handsFreeRef.current) {
+          setHandsFree(false);
+          handsFreeRef.current = false;
         }
       } catch {
         setListening(false);
       }
+    }
+  };
+
+  const pickNativeMediaOrFile = async (kind: 'image' | 'video' | 'document') => {
+    if (Platform.OS === 'android' && HarkBridge?.pickMediaFile) {
+      try {
+        setAttachingBusy(true);
+        const res = await HarkBridge.pickMediaFile(kind);
+        setAttachingBusy(false);
+        if (res && res.uri) {
+          setAttachModal(false);
+          const item: AttachmentItem = {
+            uri: String(res.uri),
+            name: String(res.name || `${kind}_upload`),
+            mimeType: String(res.mimeType || (kind === 'image' ? 'image/jpeg' : kind === 'video' ? 'video/mp4' : 'application/pdf')),
+            kind: (res.kind as AttachmentItem['kind']) || kind,
+            base64: res.base64 ? String(res.base64) : undefined,
+            textContent: res.textContent ? String(res.textContent) : undefined,
+            sizeBytes: Number(res.sizeBytes) || 0,
+          };
+          setPendingAttachment(item);
+          if (settings.autoIndexAttachments && item.textContent) {
+            ingestDocumentIntoRag(`File: ${item.name}`, item.textContent, 'document', {
+              apiKey: apiKey || undefined,
+            })
+              .then(setRagIndex)
+              .catch(() => undefined);
+          }
+          return;
+        }
+      } catch (e: any) {
+        setAttachingBusy(false);
+        Alert.alert('Upload Notice', e?.message || 'Could not pick file.');
+      }
+    } else {
+      setAttachModal(true);
+    }
+  };
+
+  const attachDirectLinkUrl = async (rawUrl?: string) => {
+    const u = (rawUrl ?? linkUrlInput).trim();
+    if (!u) {
+      Alert.alert('Link Needed', 'Paste a YouTube link, video link, or website URL first.');
+      return;
+    }
+    const normalized = /^https?:\/\//i.test(u) ? u : `https://${u}`;
+    setAttachingBusy(true);
+    try {
+      const videoCtx = await fetchVideoLinkContext(normalized);
+      setPendingAttachment({
+        uri: normalized,
+        name: normalized,
+        mimeType: 'text/uri-list',
+        kind: 'video_link',
+        textContent: videoCtx,
+      });
+      setLinkUrlInput('');
+      setAttachModal(false);
+      if (settings.autoIndexAttachments && videoCtx.trim()) {
+        ingestDocumentIntoRag(`Link: ${normalized}`, videoCtx, 'web_clip', {
+          sourceUrl: normalized,
+          apiKey: apiKey || undefined,
+        })
+          .then(setRagIndex)
+          .catch(() => undefined);
+      }
+    } finally {
+      setAttachingBusy(false);
     }
   };
 
@@ -3559,22 +3713,7 @@ function ChatScreen({
       if (d?.type === 'attachment') {
         setAttachModal(false);
         if (d.kind === 'video_link' && d.uri) {
-          const videoCtx = await fetchVideoLinkContext(String(d.uri));
-          setPendingAttachment({
-            uri: String(d.uri),
-            name: String(d.name || d.uri),
-            mimeType: 'text/uri-list',
-            kind: 'video_link',
-            textContent: videoCtx,
-          });
-          if (settings.autoIndexAttachments && videoCtx.trim()) {
-            ingestDocumentIntoRag(`Video: ${d.name || d.uri}`, videoCtx, 'web_clip', {
-              sourceUrl: String(d.uri),
-              apiKey: apiKey || undefined,
-            })
-              .then(setRagIndex)
-              .catch(() => undefined);
-          }
+          await attachDirectLinkUrl(String(d.uri));
         } else {
           const item: AttachmentItem = {
             uri: String(d.uri || ''),
@@ -4143,34 +4282,55 @@ function ChatScreen({
 
       {pendingAttachment ? (
         <View style={styles.attachmentPreviewBar}>
+          {pendingAttachment.kind === 'image' && pendingAttachment.uri ? (
+            <Image source={{ uri: pendingAttachment.uri }} style={{ width: 42, height: 42, borderRadius: 6, marginRight: 8 }} />
+          ) : null}
           <View style={{ flex: 1 }}>
             <Text style={styles.convoTitle} numberOfLines={1}>{pendingAttachment.name}</Text>
-            <Text style={styles.mutedSmall}>{pendingAttachment.kind.toUpperCase()} attached · Auto-indexed to RAG</Text>
+            <Text style={styles.mutedSmall}>{pendingAttachment.kind.toUpperCase()} attached · Ready to analyze & index to RAG</Text>
           </View>
           <Pressable onPress={() => setPendingAttachment(null)} style={styles.chip}>
-            <Text style={styles.chipText}>Remove</Text>
+            <Text style={styles.chipText}>✕ Remove</Text>
           </Pressable>
         </View>
       ) : null}
+
+      {/* Always-Visible Media (Photos, Videos, Docs) & Links Quick Upload Bar */}
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 10, paddingVertical: 6, backgroundColor: 'rgba(15, 23, 42, 0.92)', borderTopWidth: 1, borderTopColor: C.border }}>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 6, alignItems: 'center' }}>
+          <Pressable onPress={() => pickNativeMediaOrFile('image')} style={[styles.chip, { borderColor: '#38BDF8', backgroundColor: 'rgba(56, 189, 248, 0.14)' }]}>
+            <Text style={[styles.chipText, { color: '#BAE6FD', fontSize: 11 }]}>🖼️ Upload Photo</Text>
+          </Pressable>
+          <Pressable onPress={() => pickNativeMediaOrFile('video')} style={[styles.chip, { borderColor: '#C084FC', backgroundColor: 'rgba(192, 132, 252, 0.14)' }]}>
+            <Text style={[styles.chipText, { color: '#E9D5FF', fontSize: 11 }]}>🎬 Upload Video</Text>
+          </Pressable>
+          <Pressable onPress={() => setAttachModal(true)} style={[styles.chip, { borderColor: '#34D399', backgroundColor: 'rgba(52, 211, 153, 0.14)' }]}>
+            <Text style={[styles.chipText, { color: '#A7F3D0', fontSize: 11 }]}>🔗 Add Link / URL</Text>
+          </Pressable>
+          <Pressable onPress={() => pickNativeMediaOrFile('document')} style={[styles.chip, { borderColor: '#FBBF24', backgroundColor: 'rgba(251, 191, 36, 0.14)' }]}>
+            <Text style={[styles.chipText, { color: '#FDE68A', fontSize: 11 }]}>📄 PDF / File</Text>
+          </Pressable>
+        </ScrollView>
+      </View>
 
       <View style={styles.composer}>
         <Pressable
           onPress={() => setAttachModal(true)}
           disabled={busy}
-          style={styles.iconBtn}
-          accessibilityLabel="Attach file"
+          style={[styles.iconBtn, { borderColor: '#38BDF8' }]}
+          accessibilityLabel="Upload media, photos, videos or links"
         >
-          <Text style={styles.chipText}>+ File</Text>
+          <Text style={[styles.chipText, { color: '#BAE6FD' }]}>📎 Upload</Text>
         </Pressable>
 
         {Platform.OS === 'android' ? (
           <Pressable
             onPress={startVoiceInput}
             disabled={busy}
-            style={[styles.iconBtn, listening && { borderColor: C.danger }]}
-            accessibilityLabel="Dictate command"
+            style={[styles.iconBtn, listening && { borderColor: C.danger, backgroundColor: 'rgba(239, 68, 68, 0.22)' }]}
+            accessibilityLabel="Speak naturally"
           >
-            <Text style={styles.chipText}>{listening ? 'Stop' : '🎙️ Mic'}</Text>
+            <Text style={styles.chipText}>{listening ? '🔴 Stop' : '🎙️ Voice'}</Text>
           </Pressable>
         ) : null}
 
@@ -4178,7 +4338,7 @@ function ChatScreen({
           ref={inputRef}
           value={input}
           onChangeText={setInput}
-          placeholder="Type agentic command or RAG question..."
+          placeholder="Speak or type naturally, or upload photo/video/link..."
           placeholderTextColor={C.muted}
           style={styles.composerInput}
           multiline
@@ -4186,30 +4346,76 @@ function ChatScreen({
           onSubmitEditing={() => send()}
         />
         <Pressable onPress={() => send()} disabled={busy} style={[styles.sendBtn, busy && { opacity: 0.6 }]}>
-          {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.sendText}>Run</Text>}
+          {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.sendText}>Send</Text>}
         </Pressable>
       </View>
 
-      {/* Multimodal Attachment Modal */}
-      <Modal visible={attachModal} transparent animationType="none" onRequestClose={() => setAttachModal(false)}>
+      {/* Native Multimodal Upload Modal (Photos, Videos, PDFs/Files & Links/YouTube) */}
+      <Modal visible={attachModal} transparent animationType="fade" onRequestClose={() => setAttachModal(false)}>
         <View style={styles.modalBackdrop}>
-          <View style={[styles.modalCard, { height: 390, padding: 0, overflow: 'hidden' }]}>
-            <View style={[styles.rowBetween, { paddingHorizontal: 14, paddingTop: 12 }]}>
-              <Text style={styles.cardTitle}>Attach File or Video Link</Text>
+          <View style={[styles.modalCard, { width: '92%', maxHeight: '88%', gap: 12 }]}>
+            <View style={styles.rowBetween}>
+              <View>
+                <Text style={styles.cardTitle}>📎 Upload Photos, Videos, Files & Links</Text>
+                <Text style={styles.mutedSmall}>Native Android Media Picker & Link Analyzer (Auto-indexed to RAG)</Text>
+              </View>
               <Pressable onPress={() => setAttachModal(false)} style={styles.chip}>
-                <Text style={styles.chipText}>Close</Text>
+                <Text style={styles.chipText}>✕ Close</Text>
               </Pressable>
             </View>
-            <WebView
-              originWhitelist={['*']}
-              source={{ html: MULTIMODAL_PICKER_HTML }}
-              javaScriptEnabled
-              domStorageEnabled
-              allowFileAccess
-              allowUniversalAccessFromFileURLs
-              onMessage={onPickerMessage}
-              style={{ flex: 1, backgroundColor: C.panel }}
-            />
+
+            {attachingBusy ? (
+              <View style={[styles.rowCenter, { paddingVertical: 10, gap: 8 }]}>
+                <ActivityIndicator color={C.accent2} />
+                <Text style={styles.mutedSmall}>Reading & attaching media...</Text>
+              </View>
+            ) : null}
+
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10 }}>
+              <Pressable
+                onPress={() => pickNativeMediaOrFile('image')}
+                style={[styles.settingsCard, { flexBasis: '47%', flexGrow: 1, alignItems: 'center', paddingVertical: 14, borderColor: '#38BDF8' }]}
+              >
+                <Text style={{ fontSize: 26 }}>🖼️</Text>
+                <Text style={[styles.convoTitle, { marginTop: 4 }]}>Upload Photo</Text>
+                <Text style={styles.mutedSmall}>Gallery / Camera Image</Text>
+              </Pressable>
+
+              <Pressable
+                onPress={() => pickNativeMediaOrFile('video')}
+                style={[styles.settingsCard, { flexBasis: '47%', flexGrow: 1, alignItems: 'center', paddingVertical: 14, borderColor: '#C084FC' }]}
+              >
+                <Text style={{ fontSize: 26 }}>🎬</Text>
+                <Text style={[styles.convoTitle, { marginTop: 4 }]}>Upload Video</Text>
+                <Text style={styles.mutedSmall}>MP4 / Device Video</Text>
+              </Pressable>
+
+              <Pressable
+                onPress={() => pickNativeMediaOrFile('document')}
+                style={[styles.settingsCard, { flexBasis: '96%', flexGrow: 1, alignItems: 'center', paddingVertical: 12, borderColor: '#FBBF24' }]}
+              >
+                <Text style={{ fontSize: 24 }}>📄</Text>
+                <Text style={[styles.convoTitle, { marginTop: 2 }]}>Upload Document / PDF / Code / Text</Text>
+                <Text style={styles.mutedSmall}>PDF, TXT, CSV, JSON, Markdown, or Docs</Text>
+              </Pressable>
+            </View>
+
+            <View style={[styles.settingsCard, { borderColor: '#34D399', gap: 8 }]}>
+              <Text style={styles.convoTitle}>🔗 Upload Website Link or YouTube Video URL</Text>
+              <TextInput
+                value={linkUrlInput}
+                onChangeText={setLinkUrlInput}
+                placeholder="https://www.youtube.com/watch?v=... or any web link"
+                placeholderTextColor={C.muted}
+                autoCapitalize="none"
+                autoCorrect={false}
+                keyboardType="url"
+                style={styles.input}
+              />
+              <Pressable onPress={() => attachDirectLinkUrl()} disabled={attachingBusy} style={[styles.primaryBtn, { backgroundColor: C.rag }]}>
+                <Text style={styles.primaryBtnText}>🔗 Attach Link & Fetch Context</Text>
+              </Pressable>
+            </View>
           </View>
         </View>
       </Modal>
@@ -5166,53 +5372,50 @@ function SettingsScreen({
 
   return (
     <ScrollView contentContainerStyle={{ padding: 16, gap: 14, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
-      <Text style={styles.sectionTitle}>Setup & System Diagnostics</Text>
+      <Text style={styles.sectionTitle}>⚙️ Settings, Inbuilt Updates & Diagnostics</Text>
 
-      {/* 1. System Self-Test & Health Scorecard */}
-      <View style={styles.settingsCard}>
+      {/* 1. Inbuilt OTA App Updates (Moved to #1 Top Priority!) */}
+      <View style={[styles.settingsCard, { borderColor: update?.available ? C.good : '#818CF8', borderWidth: 1.5 }]}>
         <View style={styles.rowBetween}>
-          <Text style={styles.cardTitle}>System Self-Test & Bridge Health</Text>
-          <Pressable onPress={runSystemDiagnostics} style={styles.chip}>
-            <Text style={styles.chipText}>{runningDiag ? 'Testing...' : 'Re-Test'}</Text>
-          </Pressable>
-        </View>
-        {diagResults.map((d, idx) => (
-          <View key={idx} style={[styles.rowBetween, { paddingVertical: 6, borderTopWidth: idx > 0 ? 1 : 0, borderTopColor: C.border }]}>
-            <View style={{ flex: 1, marginRight: 8 }}>
-              <Text style={{ color: C.text, fontSize: 13, fontWeight: '600' }}>{d.label}</Text>
-              <Text style={styles.mutedSmall}>{d.detail}</Text>
-            </View>
-            <Text style={{ color: d.ok ? C.good : C.warn, fontWeight: '700', fontSize: 12 }}>
-              {d.ok ? '✓ PASS' : '⚠️ ACTION'}
+          <View>
+            <Text style={styles.cardTitle}>🔄 Inbuilt App Update (OTA APK Installer)</Text>
+            <Text style={styles.mutedSmall}>
+              Version {Application.nativeApplicationVersion || '5.1.0'} · Build {cur} · Repo: {DEFAULT_UPDATE_REPO}
             </Text>
           </View>
-        ))}
-        <Pressable onPress={() => openAppWithStatus('accessibility')} style={styles.primaryBtn}>
-          <Text style={styles.primaryBtnText}>Open Android Accessibility Settings</Text>
+          <Switch
+            value={s.autoCheckUpdates}
+            onValueChange={(v) => patchSettings({ autoCheckUpdates: v })}
+            trackColor={{ false: C.border, true: C.good }}
+            thumbColor="#fff"
+          />
+        </View>
+        <Pressable onPress={check} disabled={checking || installing} style={styles.primaryBtn}>
+          {checking ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>🔍 Check for Updates Now</Text>}
         </Pressable>
+        {checkMsg ? (
+          <Text style={[styles.updateResult, checkState === 'ok' && { color: C.good }, checkState === 'error' && { color: C.danger }]}>
+            {checkMsg}
+          </Text>
+        ) : null}
+        {update ? (
+          <View style={styles.updateBox}>
+            <Text style={styles.updateHead}>✨ New Version Ready · Build {update.latestBuild}</Text>
+            {update.sizeBytes ? <Text style={styles.mutedSmall}>APK Size: {formatBytes(update.sizeBytes)}</Text> : null}
+            {installing ? (
+              <View style={styles.progressTrack}><View style={[styles.progressFill, { width: (Math.round(progress * 100) + '%') as any }]} /></View>
+            ) : null}
+            <Pressable onPress={install} disabled={installing} style={[styles.primaryBtn, { marginTop: 10, backgroundColor: C.good }]}>
+              <Text style={styles.primaryBtnText}>{installing ? 'Downloading ' + Math.round(progress * 100) + '%' : '⬇️ Download & Install Update'}</Text>
+            </Pressable>
+          </View>
+        ) : null}
       </View>
 
-      {/* 2. Agentic RAG & Voice Settings */}
+      {/* 2. Gemini API & Model Configuration */}
       <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>Agentic RAG & Voice Preferences</Text>
-        <View style={styles.rowBetween}>
-          <Text style={{ color: C.text, fontSize: 14 }}>Enable Agentic RAG Grounding</Text>
-          <Switch value={s.ragEnabled} onValueChange={(v) => patchSettings({ ragEnabled: v })} trackColor={{ false: C.border, true: C.rag }} thumbColor="#fff" />
-        </View>
-        <View style={styles.rowBetween}>
-          <Text style={{ color: C.text, fontSize: 14 }}>Auto-Index Attached Files & Links into RAG</Text>
-          <Switch value={s.autoIndexAttachments} onValueChange={(v) => patchSettings({ autoIndexAttachments: v })} trackColor={{ false: C.border, true: C.rag }} thumbColor="#fff" />
-        </View>
-        <View style={styles.rowBetween}>
-          <Text style={{ color: C.text, fontSize: 14 }}>Speak AI Replies Aloud (TTS)</Text>
-          <Switch value={s.voiceOn} onValueChange={(v) => patchSettings({ voiceOn: v })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
-        </View>
-      </View>
-
-      {/* 3. Gemini API & Model Configuration */}
-      <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>AI Assistant & Model Engine</Text>
-        <Text style={styles.mutedSmall}>Gemini API key (stored locally on device).</Text>
+        <Text style={styles.cardTitle}>🤖 AI Assistant & Gemini API Key</Text>
+        <Text style={styles.mutedSmall}>Gemini API key (stored locally on device for Chat & Natural Voice AI).</Text>
         <TextInput value={s.apiKey} onChangeText={(t) => patchSettings({ apiKey: t })} placeholder="AIza..." placeholderTextColor={C.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} style={styles.input} />
         <Text style={styles.fieldLabel}>Model</Text>
         {MODEL_CHOICES.map((m) => (
@@ -5239,10 +5442,51 @@ function SettingsScreen({
         </View>
       </View>
 
-      {/* 4. Cloud Server */}
+      {/* 3. Agentic RAG & Natural Voice Preferences */}
+      <View style={styles.settingsCard}>
+        <Text style={styles.cardTitle}>🎙️ Natural Voice & Agentic RAG Preferences</Text>
+        <View style={styles.rowBetween}>
+          <Text style={{ color: C.text, fontSize: 14 }}>Enable Agentic RAG Grounding</Text>
+          <Switch value={s.ragEnabled} onValueChange={(v) => patchSettings({ ragEnabled: v })} trackColor={{ false: C.border, true: C.rag }} thumbColor="#fff" />
+        </View>
+        <View style={styles.rowBetween}>
+          <Text style={{ color: C.text, fontSize: 14 }}>Auto-Index Uploaded Media & Links into RAG</Text>
+          <Switch value={s.autoIndexAttachments} onValueChange={(v) => patchSettings({ autoIndexAttachments: v })} trackColor={{ false: C.border, true: C.rag }} thumbColor="#fff" />
+        </View>
+        <View style={styles.rowBetween}>
+          <Text style={{ color: C.text, fontSize: 14 }}>Speak AI Replies Aloud (Telugu & English TTS)</Text>
+          <Switch value={s.voiceOn} onValueChange={(v) => patchSettings({ voiceOn: v })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
+        </View>
+      </View>
+
+      {/* 4. System Self-Test & Health Scorecard */}
       <View style={styles.settingsCard}>
         <View style={styles.rowBetween}>
-          <Text style={styles.cardTitle}>Cloud Server</Text>
+          <Text style={styles.cardTitle}>🩺 System Self-Test & Bridge Health</Text>
+          <Pressable onPress={runSystemDiagnostics} style={styles.chip}>
+            <Text style={styles.chipText}>{runningDiag ? 'Testing...' : 'Re-Test'}</Text>
+          </Pressable>
+        </View>
+        {diagResults.map((d, idx) => (
+          <View key={idx} style={[styles.rowBetween, { paddingVertical: 6, borderTopWidth: idx > 0 ? 1 : 0, borderTopColor: C.border }]}>
+            <View style={{ flex: 1, marginRight: 8 }}>
+              <Text style={{ color: C.text, fontSize: 13, fontWeight: '600' }}>{d.label}</Text>
+              <Text style={styles.mutedSmall}>{d.detail}</Text>
+            </View>
+            <Text style={{ color: d.ok ? C.good : C.warn, fontWeight: '700', fontSize: 12 }}>
+              {d.ok ? '✓ PASS' : '⚠️ ACTION'}
+            </Text>
+          </View>
+        ))}
+        <Pressable onPress={() => openAppWithStatus('accessibility')} style={styles.primaryBtn}>
+          <Text style={styles.primaryBtnText}>Open Android Accessibility Settings</Text>
+        </Pressable>
+      </View>
+
+      {/* 5. Cloud Server */}
+      <View style={styles.settingsCard}>
+        <View style={styles.rowBetween}>
+          <Text style={styles.cardTitle}>☁️ Cloud Server</Text>
           <Switch value={s.cloudMode} onValueChange={(v) => patchSettings({ cloudMode: v && !!s.cloudUrl })} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
         </View>
         <Pressable onPress={testCloud} disabled={testing} style={styles.secondaryBtn}>
@@ -5258,91 +5502,133 @@ function SettingsScreen({
           </>
         ) : null}
       </View>
-
-      {/* 5. In-App OTA Updates */}
-      <View style={styles.settingsCard}>
-        <Text style={styles.cardTitle}>App Updates</Text>
-        <Text style={styles.mutedSmall}>Version {Application.nativeApplicationVersion || '4.0.0'} (build {cur})</Text>
-        <Pressable onPress={check} disabled={checking || installing} style={styles.primaryBtn}>
-          {checking ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Check for Updates</Text>}
-        </Pressable>
-        {checkMsg ? (
-          <Text style={[styles.updateResult, checkState === 'ok' && { color: C.good }, checkState === 'error' && { color: C.danger }]}>
-            {checkMsg}
-          </Text>
-        ) : null}
-        {update ? (
-          <View style={styles.updateBox}>
-            <Text style={styles.updateHead}>New version ready · build {update.latestBuild}</Text>
-            {update.sizeBytes ? <Text style={styles.mutedSmall}>{formatBytes(update.sizeBytes)}</Text> : null}
-            {installing ? (
-              <View style={styles.progressTrack}><View style={[styles.progressFill, { width: (Math.round(progress * 100) + '%') as any }]} /></View>
-            ) : null}
-            <Pressable onPress={install} disabled={installing} style={[styles.primaryBtn, { marginTop: 10, backgroundColor: C.good }]}>
-              <Text style={styles.primaryBtnText}>{installing ? 'Downloading ' + Math.round(progress * 100) + '%' : 'Install Update'}</Text>
-            </Pressable>
-          </View>
-        ) : null}
-      </View>
     </ScrollView>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/* Styles                                                              */
-/* ------------------------------------------------------------------ */
-
-
-/* ------------------------------------------------------------------ */
-/* HARK PRO 5.0: HANDS-FREE VOICE ORB & TELUGU/EN REALTIME COMMANDER  */
+/* HARK PRO 5.1: HANDS-FREE NATURAL HUMAN VOICE AI & OS COMMANDER     */
 /* ------------------------------------------------------------------ */
 
 function HandsFreeVoiceOrbScreen({
   langMode,
   setLangMode,
+  settings,
+  userAuth,
+  ragIndex,
   onRunCommand,
+  openSettings,
 }: {
   langMode: VoiceLanguageMode;
   setLangMode: (m: VoiceLanguageMode) => void;
+  settings: Settings;
+  userAuth: UserAuthData;
+  ragIndex: RagChunk[];
   onRunCommand: (cmd: string) => void;
+  openSettings: () => void;
 }) {
   const [listeningLoop, setListeningLoop] = useState(false);
+  const [voiceBusy, setVoiceBusy] = useState(false);
+  const [partialText, setPartialText] = useState('');
   const [lastSpoken, setLastSpoken] = useState('');
-  const [statusLine, setStatusLine] = useState('Tap the Voice Orb or any command pill below. Speaks Telugu & English while working!');
+  const [voiceInputBox, setVoiceInputBox] = useState('');
   const [customQuery, setCustomQuery] = useState('Telugu hit songs');
+  const [statusLine, setStatusLine] = useState(
+    'Speak naturally like a normal human in Telugu, Telugish, or English! I understand any conversation, screen question, or phone task.'
+  );
+  const [voiceHistory, setVoiceHistory] = useState<Array<{ id: string; user: string; ai: string; ts: string }>>([]);
   const loopRef = useRef(false);
-  loopRef.current = listeningLoop;
 
-  const triggerVoiceListenOnce = async () => {
-    if (Platform.OS !== 'android' || !HarkBridge?.startVoiceRecognition) {
+  // Subscribe to native continuous SpeechRecognizer events
+  useEffect(() => {
+    const subStatus = DeviceEventEmitter.addListener('HarkVoiceStatus', (evt) => {
+      if (evt?.status === 'listening') {
+        setStatusLine('🔴 Listening hands-free... Speak anything naturally in Telugu or English!');
+      } else if (evt?.status === 'permission_requested') {
+        setStatusLine('⚠️ Please allow Microphone permission and tap the Voice Orb again.');
+      }
+    });
+    const subPartial = DeviceEventEmitter.addListener('HarkVoicePartial', (evt) => {
+      if (evt?.partial) setPartialText(String(evt.partial));
+    });
+    const subResult = DeviceEventEmitter.addListener('HarkVoiceResult', (evt) => {
+      const transcript = String(evt?.transcript || '').trim();
+      setPartialText('');
+      if (transcript) {
+        setLastSpoken(transcript);
+        handleNaturalHumanVoice(transcript);
+      }
+    });
+    return () => {
+      subStatus.remove();
+      subPartial.remove();
+      subResult.remove();
+    };
+  }, [langMode, settings.apiKey, ragIndex]);
+
+  const startHandsFreeEngine = async () => {
+    Speech.stop();
+    const recLang = langMode === 'te-IN' ? 'te-IN' : 'en-IN';
+    if (Platform.OS === 'android' && HarkBridge) {
+      try {
+        // First try continuous background SpeechRecognizer
+        if (HarkBridge.startHandsFreeListening) {
+          const started = await HarkBridge.startHandsFreeListening(recLang);
+          if (started) {
+            setStatusLine('🔴 Continuous Hands-Free Active — Speak naturally anytime!');
+            return;
+          }
+        }
+        // Fallback to RecognizerIntent loop
+        if (HarkBridge.startVoiceRecognition) {
+          setStatusLine('🔴 Listening... Speak any normal sentence or command!');
+          const transcript = await HarkBridge.startVoiceRecognition(recLang);
+          if (transcript && String(transcript).trim()) {
+            const clean = String(transcript).trim();
+            setLastSpoken(clean);
+            await handleNaturalHumanVoice(clean);
+          } else {
+            loopRef.current = false;
+            setListeningLoop(false);
+            setStatusLine('Hands-free paused. Tap the Voice Orb to speak again.');
+            return;
+          }
+          if (loopRef.current) {
+            setTimeout(() => {
+              if (loopRef.current) startHandsFreeEngine();
+            }, 900);
+          }
+          return;
+        }
+      } catch {
+        setStatusLine('Voice listener ready. Tap the Voice Orb or type below.');
+      }
+    } else {
       speakBilingualProgress(
-        'Hands free voice ready. Tap any action below.',
-        'హ్యాండ్స్ ఫ్రీ వాయిస్ సిద్ధంగా ఉంది. కింది బటన్లను నొక్కండి లేదా మాట్లాడండి!',
+        'Hands free natural voice intelligence ready. Speak or type any natural sentence.',
+        'హ్యాండ్స్ ఫ్రీ వాయిస్ సిద్ధంగా ఉంది. మీరు సాధారణంగా మాట్లాడినా నేను అర్థం చేసుకుని పని చేస్తాను!',
         langMode
       );
-      return;
-    }
-    try {
-      setStatusLine('🔴 Listening in Telugu & English... Speak "scroll down", "select it", "search", "proceed"');
-      const recLang = langMode === 'en-IN' ? 'en-IN' : 'te-IN';
-      const transcript = await HarkBridge.startVoiceRecognition(recLang);
-      if (transcript && String(transcript).trim()) {
-        const clean = String(transcript).trim();
-        setLastSpoken(clean);
-        await runInstantVoiceCmd(clean);
-      }
-      if (loopRef.current) {
-        setTimeout(() => {
-          if (loopRef.current) triggerVoiceListenOnce();
-        }, 700);
-      }
-    } catch {
-      setStatusLine('Voice listener idle. Tap Orb to speak again.');
     }
   };
 
-  const runInstantVoiceCmd = async (spoken: string) => {
-    const parsed = omniAgenticEngine.parseHandsFreeVoiceInput(spoken);
+  const stopHandsFreeEngine = async () => {
+    loopRef.current = false;
+    setListeningLoop(false);
+    setPartialText('');
+    if (Platform.OS === 'android' && HarkBridge?.stopHandsFreeListening) {
+      await HarkBridge.stopHandsFreeListening().catch(() => false);
+    }
+    setStatusLine('Hands-free paused. Tap the Voice Orb anytime to talk.');
+  };
+
+  const handleNaturalHumanVoice = async (spoken: string) => {
+    const clean = spoken.trim();
+    if (!clean) return;
+    setLastSpoken(clean);
+
+    // 1. Check if it is an instant screen/OS gesture (scroll, select, proceed, search, back, home)
+    const parsed = omniAgenticEngine.parseHandsFreeVoiceInput(clean);
     if (parsed.isDirectOSCommand && parsed.actionType !== 'app_workflow') {
       const narr = omniReplyEngine.getInstantHandsFreeNarration(
         parsed.actionType,
@@ -5358,52 +5644,211 @@ function HandsFreeVoiceOrbScreen({
           else if (parsed.actionType === 'select_item' && HarkBridge.selectBestVisibleNode) await HarkBridge.selectBestVisibleNode(parsed.targetText || '');
           else if (parsed.actionType === 'proceed' && HarkBridge.proceedAction) await HarkBridge.proceedAction();
           else if (parsed.actionType === 'search' && HarkBridge.performInAppSearch) await HarkBridge.performInAppSearch(parsed.searchQuery || customQuery);
+          else if (parsed.actionType === 'click_text') await HarkBridge.clickByText(parsed.targetText || '');
           else if (parsed.actionType === 'back') await HarkBridge.globalAction('back');
           else if (parsed.actionType === 'home') await HarkBridge.globalAction('home');
-          else if (HarkBridge.executeVoiceCommand) await HarkBridge.executeVoiceCommand(spoken);
+          else if (parsed.actionType === 'read_screen' && HarkBridge.dumpScreenNodes) {
+            const dump = await HarkBridge.dumpScreenNodes();
+            const summary = dump ? `On screen: ${ String(dump).slice(0, 220) }` : 'Screen read complete.';
+            setStatusLine(summary);
+            speakBilingualProgress(summary, 'స్క్రీన్ పై ఉన్న వివరాలు చదువుతున్నాను చూడండి!', langMode);
+          } else if (HarkBridge.executeVoiceCommand) {
+            await HarkBridge.executeVoiceCommand(clean);
+          }
         } catch {}
       }
+      setVoiceHistory((prev) => [
+        { id: uid(), user: clean, ai: narr.display, ts: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) },
+        ...prev.slice(0, 14),
+      ]);
       return;
     }
-    onRunCommand(spoken);
+
+    // 2. Check if it is a direct or implicit app workflow (e.g. "play nice Telugu songs", "order biryani", "open blinkit and order milk")
+    const directExec = await tryDirectDeviceExecution(clean, userAuth, ragIndex);
+    if (directExec.handled) {
+      setStatusLine(directExec.statusMessage);
+      speakBilingualProgress(
+        directExec.statusMessage,
+        `${directExec.appName || 'యాప్'} ఓపెన్ చేసి మీ పని చేస్తున్నాను, చూడండి!`,
+        langMode
+      );
+      setVoiceHistory((prev) => [
+        { id: uid(), user: clean, ai: directExec.statusMessage, ts: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) },
+        ...prev.slice(0, 14),
+      ]);
+      return;
+    }
+
+    // 3. Natural Human Conversational Voice AI + Live Screen Context Brain!
+    // Understands ANY normal human question, conversation, or multi-step screen instruction!
+    const hasKey = Boolean(settings.apiKey.trim());
+    const hasCloud = Boolean(settings.cloudMode && settings.cloudUrl.trim());
+    if (!hasKey && !hasCloud) {
+      setStatusLine('⚠️ Add your Gemini API key in ⚙️ Settings so I can answer any conversational voice question!');
+      speakBilingualProgress(
+        'Please add your Gemini API key in Settings so I can answer normal conversational questions.',
+        'దయచేసి సెట్టింగ్స్‌లో మీ జెమిని API కీని జత చేయండి, అప్పుడు మీరు ఏది మాట్లాడినా నేను సమాధానం చెప్తాను!',
+        langMode
+      );
+      return;
+    }
+
+    setVoiceBusy(true);
+    setStatusLine(`🧠 Understanding your natural voice: "${clean}"...`);
+    try {
+      let liveScreenDump = '';
+      if (Platform.OS === 'android' && HarkBridge?.dumpScreenNodes) {
+        liveScreenDump = await HarkBridge.dumpScreenNodes().catch(() => '');
+      }
+      const ragCtx = buildAgenticRagContext(clean, ragIndex, 4);
+      const voicePromptContext = [
+        profileContext(settings, userAuth),
+        liveScreenDump ? `Current Live Phone Screen Nodes:\n${liveScreenDump.slice(0, 1800)}` : '',
+        langMode === 'te-IN' || langMode === 'BILINGUAL_AUTO'
+          ? 'IMPORTANT: The user is speaking via Natural Hands-Free Voice. Reply naturally like a warm human friend (in natural Telugu or English matching the user) in 1-3 clear spoken sentences, and if the user wants to perform any action on the phone or current screen, include the exact automation_script steps!'
+          : 'IMPORTANT: The user is speaking via Natural Hands-Free Voice. Reply naturally like a helpful human assistant in 1-3 clear spoken sentences, and if they want any phone/screen action, include automation_script steps!',
+      ]
+        .filter(Boolean)
+        .join('\n\n');
+
+      const convoMsgs: ChatMessage[] = [{ id: uid(), role: 'user', text: clean, ts: Date.now() }];
+      let replyObj: PulseReply | null = null;
+      if (hasKey) {
+        const res = await streamGemini(
+          settings.apiKey,
+          settings.model || FAST_MODEL,
+          convoMsgs,
+          voicePromptContext,
+          [],
+          ragCtx.contextBlock,
+          settings.temperature,
+          'fast',
+          (partial) => setStatusLine(partial.slice(0, 180)),
+        );
+        replyObj = res.reply;
+      } else if (hasCloud) {
+        const res = await callCloudChat(
+          settings.cloudUrl,
+          settings.cloudToken,
+          undefined,
+          convoMsgs,
+          [voicePromptContext, ragCtx.contextBlock].filter(Boolean).join('\n\n'),
+          [],
+        );
+        replyObj = res.reply;
+      }
+
+      if (replyObj) {
+        if (replyObj.automation_script && replyObj.automation_script.length > 0) {
+          await executeOsAutomationScript(replyObj.automation_script, (stepMsg) => setStatusLine(stepMsg));
+        }
+        const spokenReply = (replyObj.direct_response || 'Done!').trim();
+        setStatusLine(spokenReply);
+        setVoiceHistory((prev) => [
+          { id: uid(), user: clean, ai: spokenReply, ts: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) },
+          ...prev.slice(0, 14),
+        ]);
+        const containsTelugu = /[\u0C00-\u0C7F]/.test(spokenReply);
+        Speech.stop();
+        Speech.speak(spokenReply.slice(0, 420), {
+          language: containsTelugu ? 'te-IN' : 'en-IN',
+          rate: 0.98,
+          pitch: 1.02,
+        });
+      }
+    } catch (e: any) {
+      setStatusLine('Voice AI Error: ' + (e?.message || String(e)));
+    } finally {
+      setVoiceBusy(false);
+    }
   };
 
   return (
-    <ScrollView style={styles.fill} contentContainerStyle={{ padding: 14, gap: 12, paddingBottom: 32 }}>
+    <ScrollView style={styles.fill} contentContainerStyle={{ padding: 14, gap: 12, paddingBottom: 32 }} keyboardShouldPersistTaps="handled">
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>🎙️ Hands-Free Telugu & English Voice Intelligence</Text>
+        <View style={styles.rowBetween}>
+          <Text style={styles.cardTitle}>🎙️ Hands-Free Natural Human Voice AI</Text>
+          <Pressable onPress={openSettings} style={styles.chip}>
+            <Text style={styles.chipText}>⚙️ Settings</Text>
+          </Pressable>
+        </View>
         <Text style={styles.mutedSmall}>{statusLine}</Text>
+        {partialText ? (
+          <Text style={{ color: '#38BDF8', fontSize: 13, fontWeight: '600', marginTop: 4 }}>
+            🗣️ Hearing live: "{partialText}..."
+          </Text>
+        ) : null}
 
         <Pressable
           onPress={() => {
             const next = !listeningLoop;
+            loopRef.current = next;
             setListeningLoop(next);
-            if (next) triggerVoiceListenOnce();
+            if (next) {
+              startHandsFreeEngine();
+            } else {
+              stopHandsFreeEngine();
+            }
           }}
           style={{
             alignSelf: 'center',
-            width: 190,
-            height: 190,
+            width: 185,
+            height: 185,
             borderRadius: 95,
             backgroundColor: listeningLoop ? 'rgba(239, 68, 68, 0.28)' : 'rgba(56, 189, 248, 0.18)',
-            borderWidth: 2,
+            borderWidth: 2.5,
             borderColor: listeningLoop ? '#F87171' : '#38BDF8',
             alignItems: 'center',
             justifyContent: 'center',
-            marginVertical: 14,
+            marginVertical: 12,
             padding: 14,
           }}
         >
-          <Text style={{ fontSize: 42 }}>{listeningLoop ? '🔴' : '🎙️'}</Text>
+          {voiceBusy ? (
+            <ActivityIndicator size="large" color="#38BDF8" />
+          ) : (
+            <Text style={{ fontSize: 42 }}>{listeningLoop ? '🔴' : '🎙️'}</Text>
+          )}
           <Text style={[styles.convoTitle, { marginTop: 8, textAlign: 'center' }]}>
-            {listeningLoop ? 'HANDS-FREE LOOP ON' : 'TAP TO SPEAK HANDS-FREE'}
+            {listeningLoop ? 'HANDS-FREE ON (TAP TO STOP)' : 'TAP FOR HANDS-FREE VOICE'}
           </Text>
-          <Text style={[styles.mutedSmall, { textAlign: 'center', marginTop: 4 }]}>
-            {lastSpoken ? `Heard: "${lastSpoken}"` : '"Scroll down" · "Select it" · "Proceed"'}
+          <Text style={[styles.mutedSmall, { textAlign: 'center', marginTop: 4 }]} numberOfLines={2}>
+            {lastSpoken ? `Heard: "${lastSpoken}"` : 'Understands normal Telugu & English conversation + OS commands'}
           </Text>
         </Pressable>
 
-        <View style={[styles.rowWrap, { justifyContent: 'center' }]}>
+        {/* Type or test any natural voice sentence directly */}
+        <View style={[styles.rowCenter, { gap: 8 }]}>
+          <TextInput
+            value={voiceInputBox}
+            onChangeText={setVoiceInputBox}
+            placeholder="Or type any natural sentence here to test Voice AI..."
+            placeholderTextColor={C.muted}
+            style={[styles.input, { flex: 1 }]}
+            onSubmitEditing={() => {
+              if (voiceInputBox.trim()) {
+                const q = voiceInputBox.trim();
+                setVoiceInputBox('');
+                handleNaturalHumanVoice(q);
+              }
+            }}
+          />
+          <Pressable
+            onPress={() => {
+              if (voiceInputBox.trim()) {
+                const q = voiceInputBox.trim();
+                setVoiceInputBox('');
+                handleNaturalHumanVoice(q);
+              }
+            }}
+            style={[styles.primaryBtn, { paddingHorizontal: 14, paddingVertical: 10 }]}
+          >
+            <Text style={styles.primaryBtnText}>Speak / Run</Text>
+          </Pressable>
+        </View>
+
+        <View style={[styles.rowWrap, { justifyContent: 'center', marginTop: 6 }]}>
           {(
             [
               { id: 'BILINGUAL_AUTO', label: '🇮🇳 తెలుగు + EN Auto' },
@@ -5423,8 +5868,21 @@ function HandsFreeVoiceOrbScreen({
         </View>
       </View>
 
+      {/* Live Hands-Free Conversation Log */}
+      {voiceHistory.length > 0 ? (
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>💬 Recent Hands-Free Voice Conversation</Text>
+          {voiceHistory.slice(0, 6).map((item) => (
+            <View key={item.id} style={{ paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: C.border }}>
+              <Text style={{ color: '#38BDF8', fontSize: 12, fontWeight: '700' }}>🗣️ You ({item.ts}): "{item.user}"</Text>
+              <Text style={{ color: C.text, fontSize: 13, marginTop: 2 }}>🤖 Hark Pro: {item.ai}</Text>
+            </View>
+          ))}
+        </View>
+      ) : null}
+
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>⚡ Instant 0-Token Hands-Free Actions (Speaks While Working)</Text>
+        <Text style={styles.cardTitle}>⚡ Quick Hands-Free Screen & App Actions</Text>
         <TextInput
           value={customQuery}
           onChangeText={setCustomQuery}
@@ -5436,15 +5894,17 @@ function HandsFreeVoiceOrbScreen({
           {[
             { label: '⬇️ Scroll Down (కిందికి)', cmd: 'scroll down' },
             { label: '⬆️ Scroll Up (పైకి)', cmd: 'scroll up' },
-            { label: '🎯 Select It (సెలెక్ట్ చేయి)', cmd: 'select it' },
+            { label: '🎯 Select 1st (మొదటిది)', cmd: 'select the first one' },
+            { label: '🎯 Select 2nd (రెండవది)', cmd: 'select the second one' },
             { label: '✅ Proceed (ముందుకు వెళ్ళు)', cmd: 'proceed' },
             { label: `🔎 Search "${customQuery.slice(0, 16)}"`, cmd: `search ${customQuery}` },
+            { label: '👁️ Read Screen (స్క్రీన్ చదువు)', cmd: 'what is on my screen' },
             { label: '🔙 Go Back (వెనక్కి)', cmd: 'go back' },
             { label: '🏠 Go Home (హోమ్)', cmd: 'go home' },
           ].map((item) => (
             <Pressable
               key={item.label}
-              onPress={() => runInstantVoiceCmd(item.cmd)}
+              onPress={() => handleNaturalHumanVoice(item.cmd)}
               style={[styles.chip, { paddingVertical: 9, paddingHorizontal: 12 }]}
             >
               <Text style={styles.chipText}>{item.label}</Text>

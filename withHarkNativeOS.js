@@ -28,6 +28,9 @@ function withHarkAccessibilityManifest(config) {
     ensurePerm('android.permission.FLASHLIGHT');
     ensurePerm('android.permission.CALL_PHONE');
     ensurePerm('android.permission.WAKE_LOCK');
+    ensurePerm('android.permission.READ_EXTERNAL_STORAGE');
+    ensurePerm('android.permission.READ_MEDIA_IMAGES');
+    ensurePerm('android.permission.READ_MEDIA_VIDEO');
 
     if (!manifest.queries) manifest.queries = [];
     const queriesBlock = manifest.queries[0] || { package: [], intent: [] };
@@ -73,6 +76,8 @@ function withHarkAccessibilityManifest(config) {
       'com.snapchat.android',
       'com.twitter.android',
       'com.facebook.katana',
+      'com.google.android.googlequicksearchbox',
+      'com.google.android.tts',
     ];
 
     for (const pkg of requiredPackages) {
@@ -102,7 +107,10 @@ function withHarkAccessibilityManifest(config) {
 
     ensureQueryIntent('android.intent.action.MAIN', 'android.intent.category.LAUNCHER');
     ensureQueryIntent('android.speech.RecognitionService');
+    ensureQueryIntent('android.speech.action.RECOGNIZE_SPEECH');
     ensureQueryIntent('android.intent.action.TTS_SERVICE');
+    ensureQueryIntent('android.intent.action.GET_CONTENT');
+    ensureQueryIntent('android.intent.action.OPEN_DOCUMENT');
     ensureQueryIntent('android.intent.action.VIEW', null, 'https');
     ensureQueryIntent('android.intent.action.VIEW', null, 'http');
 
@@ -1208,42 +1216,66 @@ class HarkAccessibilityService : AccessibilityService() {
 
 
     fun selectPrimaryVisibleItem(hintText: String = ""): Boolean {
-        if (hintText.isNotBlank() && clickNodeByText(hintText)) {
-            recordStatus("Selected " + hintText, false)
+        val cleanHint = hintText.trim()
+        val lowerHint = cleanHint.lowercase()
+
+        // Determine if user asked for a specific ordinal item (first, second, third, fourth, last)
+        val ordinalIndex = when {
+            lowerHint.contains("second") || lowerHint.contains("2nd") || lowerHint == "2" || lowerHint.contains("rendava") || cleanHint.contains("రెండవ") -> 1
+            lowerHint.contains("third") || lowerHint.contains("3rd") || lowerHint == "3" || lowerHint.contains("moodava") || cleanHint.contains("మూడవ") -> 2
+            lowerHint.contains("fourth") || lowerHint.contains("4th") || lowerHint == "4" || cleanHint.contains("నాలుగవ") -> 3
+            lowerHint.contains("first") || lowerHint.contains("1st") || lowerHint == "1" || lowerHint.contains("modati") || cleanHint.contains("మొదటి") -> 0
+            else -> -1
+        }
+
+        if (cleanHint.isNotBlank() && ordinalIndex < 0 && clickNodeByText(cleanHint)) {
+            recordStatus("Selected " + cleanHint, false)
             return true
         }
+
         val root = getActiveRoot() ?: return false
         val w = screenWidth()
         val h = screenHeight()
         val ignoreSet = setOf("back", "navigate up", "close", "cancel", "search", "clear", "home", "menu")
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
-        var bestNode: AccessibilityNodeInfo? = null
-        var bestScore = -1
+        val candidates = mutableListOf<Triple<AccessibilityNodeInfo, Int, Int>>() // node, score, centerY
         while (queue.isNotEmpty()) {
             val n = queue.removeFirst()
             if (n.isVisibleToUser && !n.isEditable) {
                 val label = (n.text?.toString() ?: n.contentDescription?.toString() ?: "").trim()
                 val rect = Rect()
                 n.getBoundsInScreen(rect)
-                val inZone = rect.centerY() in (h * 0.16).toInt()..(h * 0.86).toInt()
+                val inZone = rect.centerY() in (h * 0.15).toInt()..(h * 0.88).toInt()
                 val lower = label.lowercase()
-                if (inZone && rect.width() > 60 && rect.height() > 36 && label.length >= 3 && !ignoreSet.contains(lower)) {
+                if (inZone && rect.width() > 60 && rect.height() > 34 && label.length >= 3 && !ignoreSet.contains(lower)) {
                     var score = 10
                     if (n.isClickable || n.parent?.isClickable == true) score += 45
-                    if (label.length in 6..90) score += 25
+                    if (label.length in 6..110) score += 25
                     if (lower.contains("add") || lower.contains("buy") || lower.contains("play") || lower.contains("open")) score += 20
-                    if (score > bestScore) {
-                        bestScore = score
-                        bestNode = n
+                    if (cleanHint.isNotBlank() && ordinalIndex < 0) {
+                        for (word in lowerHint.split(" ")) {
+                            if (word.length >= 3 && lower.contains(word)) score += 40
+                        }
                     }
+                    candidates.add(Triple(n, score, rect.centerY()))
                 }
             }
             for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
         }
-        if (bestNode != null && performClickOrTap(bestNode)) {
-            recordStatus("Selected primary visible item", false)
-            return true
+
+        if (candidates.isNotEmpty()) {
+            val chosen = if (ordinalIndex >= 0) {
+                val sortedByY = candidates.filter { it.second >= 45 }.sortedBy { it.third }
+                val listToUse = if (sortedByY.isNotEmpty()) sortedByY else candidates.sortedBy { it.third }
+                listToUse[ordinalIndex.coerceAtMost(listToUse.size - 1)].first
+            } else {
+                candidates.maxByOrNull { it.second }?.first
+            }
+            if (chosen != null && performClickOrTap(chosen)) {
+                recordStatus("Selected visible item", false)
+                return true
+            }
         }
         return tapCoordinate(w * 0.5f, h * 0.36f)
     }
@@ -1345,12 +1377,17 @@ class HarkAccessibilityService : AccessibilityService() {
         path.join(kotlinDir, 'HarkBridgeModule.kt'),
         `package ${packageName}
 
+import android.Manifest
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Typeface
 import android.graphics.pdf.PdfDocument
+import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.provider.OpenableColumns
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -1370,18 +1407,41 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.provider.Settings
+import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.util.Base64
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import com.facebook.react.bridge.*
+import com.facebook.react.modules.core.DeviceEventManagerModule
 
 class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext), ActivityEventListener {
 
     private var voicePromise: Promise? = null
+    private var mediaPromise: Promise? = null
+    private var mediaPickerKind: String = "document"
     private val VOICE_REQ_CODE = 9412
+    private val PICK_MEDIA_REQ_CODE = 9413
     private var torchEnabled: Boolean = false
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var speechRecognizer: SpeechRecognizer? = null
+    private var continuousHandsFree: Boolean = false
+    private var currentVoiceLang: String = "en-IN"
 
     init {
         reactContext.addActivityEventListener(this)
+    }
+
+    private fun emitVoiceEvent(eventName: String, params: WritableMap) {
+        try {
+            if (reactContext.hasActiveReactInstance()) {
+                reactContext
+                    .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                    .emit(eventName, params)
+            }
+        } catch (_: Exception) {}
     }
 
     override fun getName(): String = "HarkBridge"
@@ -1674,6 +1734,124 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun startHandsFreeListening(lang: String?, promise: Promise) {
+        currentVoiceLang = if (lang.isNullOrBlank()) "en-IN" else lang
+        continuousHandsFree = true
+
+        val perm = ContextCompat.checkSelfPermission(reactContext, Manifest.permission.RECORD_AUDIO)
+        if (perm != PackageManager.PERMISSION_GRANTED) {
+            currentActivity?.let { act ->
+                ActivityCompat.requestPermissions(act, arrayOf(Manifest.permission.RECORD_AUDIO), 9415)
+            }
+            val map = Arguments.createMap()
+            map.putString("status", "permission_requested")
+            map.putBoolean("handsFree", true)
+            emitVoiceEvent("HarkVoiceStatus", map)
+            promise.resolve(false)
+            return
+        }
+
+        mainHandler.post {
+            try {
+                if (!SpeechRecognizer.isRecognitionAvailable(reactContext)) {
+                    promise.resolve(false)
+                    return@post
+                }
+                startContinuousRecognizerInternal()
+                promise.resolve(true)
+            } catch (e: Exception) {
+                promise.resolve(false)
+            }
+        }
+    }
+
+    private fun startContinuousRecognizerInternal() {
+        try {
+            if (speechRecognizer == null) {
+                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(reactContext.applicationContext)
+                speechRecognizer?.setRecognitionListener(object : RecognitionListener {
+                    override fun onReadyForSpeech(params: Bundle?) {
+                        val map = Arguments.createMap()
+                        map.putString("status", "listening")
+                        map.putBoolean("handsFree", continuousHandsFree)
+                        emitVoiceEvent("HarkVoiceStatus", map)
+                    }
+                    override fun onBeginningOfSpeech() {}
+                    override fun onRmsChanged(rmsdB: Float) {}
+                    override fun onBufferReceived(buffer: ByteArray?) {}
+                    override fun onEndOfSpeech() {}
+                    override fun onError(error: Int) {
+                        val map = Arguments.createMap()
+                        map.putString("status", "idle")
+                        map.putInt("errorCode", error)
+                        map.putBoolean("handsFree", continuousHandsFree)
+                        emitVoiceEvent("HarkVoiceStatus", map)
+                        // If continuous hands-free is on and error is not fatal permission denial, restart listening
+                        if (continuousHandsFree && error != SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                            mainHandler.postDelayed({
+                                if (continuousHandsFree) startContinuousRecognizerInternal()
+                            }, 900L)
+                        }
+                    }
+                    override fun onResults(results: Bundle?) {
+                        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        val best = matches?.firstOrNull()?.trim() ?: ""
+                        if (best.isNotEmpty()) {
+                            val map = Arguments.createMap()
+                            map.putString("transcript", best)
+                            map.putBoolean("handsFree", continuousHandsFree)
+                            emitVoiceEvent("HarkVoiceResult", map)
+                        }
+                        if (continuousHandsFree) {
+                            mainHandler.postDelayed({
+                                if (continuousHandsFree) startContinuousRecognizerInternal()
+                            }, 1200L)
+                        }
+                    }
+                    override fun onPartialResults(partialResults: Bundle?) {
+                        val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        val part = matches?.firstOrNull()?.trim() ?: ""
+                        if (part.isNotEmpty()) {
+                            val map = Arguments.createMap()
+                            map.putString("partial", part)
+                            emitVoiceEvent("HarkVoicePartial", map)
+                        }
+                    }
+                    override fun onEvent(eventType: Int, params: Bundle?) {}
+                })
+            }
+
+            val recIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, currentVoiceLang)
+                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2200L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L)
+            }
+            speechRecognizer?.startListening(recIntent)
+        } catch (_: Exception) {}
+    }
+
+    @ReactMethod
+    fun stopHandsFreeListening(promise: Promise) {
+        continuousHandsFree = false
+        mainHandler.post {
+            try {
+                speechRecognizer?.stopListening()
+                speechRecognizer?.cancel()
+                val map = Arguments.createMap()
+                map.putString("status", "stopped")
+                map.putBoolean("handsFree", false)
+                emitVoiceEvent("HarkVoiceStatus", map)
+                promise.resolve(true)
+            } catch (_: Exception) {
+                promise.resolve(false)
+            }
+        }
+    }
+
+    @ReactMethod
     fun startVoiceRecognition(lang: String?, promise: Promise) {
         val activity = currentActivity
         if (activity == null) {
@@ -1685,12 +1863,59 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (lang.isNullOrBlank()) "en-IN" else lang)
-                putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak command…")
+                putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak naturally in Telugu or English…")
             }
             activity.startActivityForResult(intent, VOICE_REQ_CODE)
         } catch (e: Exception) {
             voicePromise = null
             promise.reject("VOICE_ERR", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun pickMediaFile(pickerType: String?, promise: Promise) {
+        val activity = currentActivity
+        if (activity == null) {
+            promise.reject("NO_ACTIVITY", "Activity not available")
+            return
+        }
+        mediaPromise = promise
+        val kind = (pickerType ?: "document").lowercase().trim()
+        mediaPickerKind = kind
+        try {
+            val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                when (kind) {
+                    "image", "photo" -> type = "image/*"
+                    "video" -> type = "video/*"
+                    else -> type = "*/*"
+                }
+            }
+            activity.startActivityForResult(Intent.createChooser(intent, "Select Media or File"), PICK_MEDIA_REQ_CODE)
+        } catch (e: Exception) {
+            mediaPromise = null
+            promise.reject("PICK_ERR", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun installApk(filePath: String, promise: Promise) {
+        try {
+            val cleanPath = filePath.removePrefix("file://")
+            val apkFile = File(cleanPath)
+            if (!apkFile.exists()) {
+                promise.resolve(false)
+                return
+            }
+            val uri = Uri.fromFile(apkFile)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            reactContext.startActivity(intent)
+            promise.resolve(true)
+        } catch (_: Exception) {
+            promise.resolve(false)
         }
     }
 
@@ -1706,6 +1931,89 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                     p.resolve("")
                 }
             }
+            return
+        }
+
+        if (requestCode == PICK_MEDIA_REQ_CODE) {
+            val p = mediaPromise
+            mediaPromise = null
+            if (p == null) return
+            if (resultCode != Activity.RESULT_OK || data?.data == null) {
+                p.resolve(null)
+                return
+            }
+            val uri = data.data!!
+            Thread {
+                try {
+                    val cr = reactContext.contentResolver
+                    val mime = cr.getType(uri) ?: when (mediaPickerKind) {
+                        "image", "photo" -> "image/jpeg"
+                        "video" -> "video/mp4"
+                        else -> "application/octet-stream"
+                    }
+                    var displayName = "attachment_" + System.currentTimeMillis()
+                    var sizeBytes = 0L
+                    cr.query(uri, null, null, null, null)?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            if (nameIdx >= 0) {
+                                val n = cursor.getString(nameIdx)
+                                if (!n.isNullOrBlank()) displayName = n
+                            }
+                            val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                            if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
+                                sizeBytes = cursor.getLong(sizeIdx)
+                            }
+                        }
+                    }
+
+                    val safeFileName = displayName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+                    val cacheFile = File(reactContext.cacheDir, "upload_" + System.currentTimeMillis() + "_" + safeFileName)
+                    var rawBytes = ByteArray(0)
+                    cr.openInputStream(uri)?.use { input ->
+                        FileOutputStream(cacheFile).use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                    if (cacheFile.exists()) {
+                        sizeBytes = cacheFile.length()
+                        if (sizeBytes <= 10L * 1024L * 1024L) {
+                            rawBytes = cacheFile.readBytes()
+                        }
+                    }
+
+                    val resolvedKind = when {
+                        mime.startsWith("image/") || mediaPickerKind == "image" -> "image"
+                        mime.startsWith("video/") || mediaPickerKind == "video" -> "video"
+                        else -> "document"
+                    }
+
+                    val isTextLike = mime.startsWith("text/") ||
+                        displayName.endsWith(".txt", true) ||
+                        displayName.endsWith(".md", true) ||
+                        displayName.endsWith(".csv", true) ||
+                        displayName.endsWith(".json", true) ||
+                        displayName.endsWith(".xml", true) ||
+                        displayName.endsWith(".html", true)
+
+                    val outMap = Arguments.createMap()
+                    outMap.putString("uri", "file://" + cacheFile.absolutePath)
+                    outMap.putString("name", displayName)
+                    outMap.putString("mimeType", mime)
+                    outMap.putString("kind", resolvedKind)
+                    outMap.putDouble("sizeBytes", sizeBytes.toDouble())
+                    if (isTextLike && rawBytes.isNotEmpty()) {
+                        val txt = String(rawBytes, Charsets.UTF_8).take(45000)
+                        outMap.putString("textContent", txt)
+                    } else if (rawBytes.isNotEmpty()) {
+                        val b64 = Base64.encodeToString(rawBytes, Base64.NO_WRAP)
+                        outMap.putString("base64", b64)
+                    }
+                    p.resolve(outMap)
+                } catch (e: Exception) {
+                    p.reject("READ_MEDIA_ERR", e.message)
+                }
+            }.start()
         }
     }
 

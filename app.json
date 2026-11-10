@@ -1,8 +1,8 @@
 {
   "expo": {
-    "name": "Hark Pro 5.0",
+    "name": "Hark Pro 5.1",
     "slug": "pulse-os",
-    "version": "5.0.0",
+    "version": "5.1.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "backgroundColor": "#04060E",
@@ -19,7 +19,7 @@
     },
     "android": {
       "package": "com.pulseos.app",
-      "versionCode": 34,
+      "versionCode": 35,
       "newArchEnabled": false,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
@@ -37,6 +37,9 @@
         "android.permission.FLASHLIGHT",
         "android.permission.CALL_PHONE",
         "android.permission.WAKE_LOCK",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
         "android.permission.SYSTEM_ALERT_WINDOW",
         "android.permission.FOREGROUND_SERVICE",
         "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",

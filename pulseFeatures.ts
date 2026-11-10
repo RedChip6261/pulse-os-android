@@ -1661,75 +1661,120 @@ export class AgenticEngine {
     const clean = rawInput.trim();
     const lower = clean.toLowerCase();
 
+    // Never force rigid OS commands on conversational questions, explanations, or general chat
+    if (
+      /^(what\s+is\s+(?!on\s+(?:my\s+)?screen)|why\s+|how\s+(?:do|does|can|to|are)|who\s+is|explain|tell\s+me\s+about|write\s+a|translate|summarize|hi\b|hello\b|hey\b\s*$|namaste|నమస్తే|ఎలా ఉన్నావ్|ఏం చేస్తున్నావ్)/i.test(
+        clean
+      )
+    ) {
+      return { isDirectOSCommand: false, actionType: 'none' };
+    }
+
+    // 1. Natural Scroll Down (English, Telugu script, Telugish/Hinglish)
     if (
       /^(scroll\s*down|go\s*down|down|move\s*down|kindiki|క్రిందికి|కిందికి)/i.test(clean) ||
-      lower.includes('scroll down') ||
-      clean.includes('కిందికి స్క్రోల్')
+      /\b(scroll\s+down|go\s+down\s+a\s+bit|move\s+down|show\s+(?:me\s+)?what\s+is\s+below|show\s+more\s+below|koncham\s+kindiki|inkoncham\s+kindiki|kindiki\s+vellu|kindiki\s+chupinchu)\b/i.test(
+        lower
+      ) ||
+      clean.includes('కిందికి స్క్రోల్') ||
+      clean.includes('కిందికి వెళ్ళు') ||
+      clean.includes('కిందికి చూపించు')
     ) {
       return { isDirectOSCommand: true, actionType: 'scroll_down' };
     }
 
+    // 2. Natural Scroll Up
     if (
       /^(scroll\s*up|go\s*up|up|move\s*up|paiki|పైకి)/i.test(clean) ||
-      lower.includes('scroll up') ||
-      clean.includes('పైకి స్క్రోల్')
+      /\b(scroll\s+up|go\s+back\s+up|go\s+up\s+a\s+bit|move\s+up|show\s+top|koncham\s+paiki|paiki\s+vellu|paiki\s+chupinchu)\b/i.test(
+        lower
+      ) ||
+      clean.includes('పైకి స్క్రోల్') ||
+      clean.includes('పైకి వెళ్ళు') ||
+      clean.includes('పైకి చూపించు')
     ) {
       return { isDirectOSCommand: true, actionType: 'scroll_up' };
     }
 
+    // 3. Natural Item Selection (including ordinals: "first one", "second video", "open that", "idi select chey", "మొదటిది ఓపెన్ చేయి")
     if (
-      /^(select\s*it|select\s*this|select|click\s*it|open\s*it|choose\s*it|first\s*one|ఇది\s*సెలెక్ట్|సెలెక్ట్\s*చేయి|ఎంచుకో)/i.test(
+      /^(?:please\s+|can\s+you\s+|just\s+)?(select\s*it|select\s*this|select|click\s*it|open\s*it|choose\s*it|pick\s*it|first\s*one|second\s*one|third\s*one|open\s+the\s+first|open\s+the\s+second|open\s+the\s+third|click\s+the\s+first|click\s+the\s+second|select\s+the\s+first|select\s+the\s+second|idi\s+select|idi\s+open|modati\s+di|rendava\s+di|ఇది\s*సెలెక్ట్|సెలెక్ట్\s*చేయి|ఇది\s*ఓపెన్|మొదటిది|రెండవది|ఎంచుకో)/i.test(
         clean
       )
     ) {
       const hint = clean
-        .replace(/^(select\s*it|select\s*this|select|click\s*it|open\s*it|choose\s*it|ఇది\s*సెలెక్ట్|సెలెక్ట్\s*చేయి|ఎంచుకో)\s*/i, '')
+        .replace(
+          /^(?:please\s+|can\s+you\s+|just\s+)?(select\s*it|select\s*this|select|click\s*it|open\s*it|choose\s*it|pick\s*it|idi\s+select\s*chey|idi\s+open\s*chey|ఇది\s*సెలెక్ట్\s*చేయి|ఇది\s*సెలెక్ట్|సెలెక్ట్\s*చేయి|ఇది\s*ఓపెన్\s*చేయి|ఎంచుకో)\s*/i,
+          ''
+        )
         .trim();
       return { isDirectOSCommand: true, actionType: 'select_item', targetText: hint };
     }
 
+    // 4. Natural Proceed / Checkout / Add to Cart / Confirm
     if (
-      /^(proceed|continue|next\s*step|next|checkout|buy\s*now|add\s*to\s*cart|place\s*order|confirm|submit|munduku|ముందుకు\s*వెళ్ళు|కొనసాగించు)/i.test(
+      /^(?:please\s+|can\s+you\s+|let's\s+)?(proceed|continue|next\s*step|next|checkout|go\s+to\s+checkout|buy\s*now|add\s*to\s*cart|add\s+it\s+to\s+cart|place\s*order|complete\s+order|confirm|submit|go\s+ahead|munduku\s*vellu|munduku|ముందుకు\s*వెళ్ళు|కొనసాగించు|ఆర్డర్\s*పెట్టు)/i.test(
         clean
       )
     ) {
       return { isDirectOSCommand: true, actionType: 'proceed' };
     }
 
-    if (/^(search\s+for|search|find|vethuku|వెతుకు)\s+/i.test(clean)) {
-      const q = clean.replace(/^(search\s+for|search|find|vethuku|వెతుకు)\s+/i, '').trim();
+    // 5. Natural In-App Search
+    if (
+      /^(?:please\s+|can\s+you\s+)?(search\s+for|search|look\s+for|find\s+me|find|vethuku|వెతుకు)\s+/i.test(
+        clean
+      )
+    ) {
+      const q = clean
+        .replace(/^(?:please\s+|can\s+you\s+)?(search\s+for|search|look\s+for|find\s+me|find|vethuku|వెతుకు)\s+/i, '')
+        .trim();
       return { isDirectOSCommand: true, actionType: 'search', searchQuery: q };
     }
 
-    if (/^(click|tap|press)\s+/i.test(clean)) {
-      const t = clean.replace(/^(click|tap|press)\s+/i, '').trim();
+    // 6. Natural Click Specific Text on Screen
+    if (/^(?:please\s+|can\s+you\s+)?(click\s+on|click|tap\s+on|tap|press)\s+/i.test(clean)) {
+      const t = clean
+        .replace(/^(?:please\s+|can\s+you\s+)?(click\s+on|click|tap\s+on|tap|press)\s+/i, '')
+        .trim();
       return { isDirectOSCommand: true, actionType: 'click_text', targetText: t };
     }
 
-    if (/^(go\s*back|back|venakki|వెనక్కి)/i.test(clean)) {
+    // 7. Natural Back / Home / Read Screen
+    if (
+      /^(?:please\s+|can\s+you\s+)?(go\s*back|take\s+me\s+back|back|venakki\s*vellu|venakki|వెనక్కి)/i.test(clean)
+    ) {
       return { isDirectOSCommand: true, actionType: 'back' };
     }
 
-    if (/^(go\s*home|home\s*screen|home|హోమ్)/i.test(clean)) {
+    if (
+      /^(?:please\s+|can\s+you\s+)?(go\s*home|go\s+to\s+home\s*screen|home\s*screen|home|హోమ్)/i.test(clean)
+    ) {
       return { isDirectOSCommand: true, actionType: 'home' };
     }
 
-    if (/^(read\s*screen|what\s*is\s*on\s*screen|స్క్రీన్\s*చదువు)/i.test(clean)) {
+    if (
+      /^(?:please\s+|can\s+you\s+)?(read\s*(?:the\s+|my\s+)?screen|what\s*is\s*on\s*(?:my\s+|the\s+)?screen|em\s+undi\s+screen\s+meeda|స్క్రీన్\s*చదువు|స్క్రీన్\s*మీద\s*ఏముంది)/i.test(
+        clean
+      )
+    ) {
       return { isDirectOSCommand: true, actionType: 'read_screen' };
     }
 
-    // Check multi-step app workflow e.g. "open youtube and play telugu songs" or "open blinkit and order milk"
+    // 8. Explicit App Workflow e.g. "open youtube and play telugu songs" or "blinkit lo milk order pettu"
     const appMatch = lower.match(
       /\b(youtube|whatsapp|instagram|chrome|maps|gmail|spotify|flipkart|amazon|meesho|blinkit|zepto|swiggy|zomato|uber|ola|rapido|phonepe|gpay|paytm|telegram)\b/i
     );
     if (
       appMatch &&
-      /\b(open|launch|play|search|order|buy|book|find|send|ఓపెన్|ప్లే|ఆర్డర్)\b/i.test(clean)
+      /\b(open|launch|play|watch|listen|search|order|buy|book|find|send|message|lo|ఓపెన్|ప్లే|ఆర్డర్|పెట్టు|వెతుకు)\b/i.test(
+        clean
+      )
     ) {
       const appName = appMatch[1];
       let query = clean
         .replace(new RegExp(`.*\\b${appName}\\b`, 'i'), '')
-        .replace(/^\s*(and|to|for|lo|లో)?\s*(search\s+for|search|play|order|buy|find|book|open)?\s*/i, '')
+        .replace(/^\s*(and|to|for|lo|లో)?\s*(search\s+for|search|play|watch|order|buy|find|book|open)?\s*/i, '')
         .trim();
       const autoProceed = /\b(proceed|checkout|buy\s+now|order\s+now|add\s+to\s+cart)\b/i.test(lower);
       return {
@@ -1738,6 +1783,43 @@ export class AgenticEngine {
         targetApp: appName,
         searchQuery: query,
         autoProceed,
+      };
+    }
+
+    // 9. Implicit Natural Human Voice Intent (Even when user does NOT name the app!)
+    // e.g. "play some nice telugu songs" -> YouTube
+    if (
+      /\b(play\s+(?:some\s+)?(?:nice\s+)?|put\s+on\s+|patalu\s+pettu|songs\s+pettu|పాటలు\s+పెట్టు|వీడియో\s+పెట్టు)/i.test(
+        clean
+      ) &&
+      /\b(song|songs|music|video|movie|trailer|melody|hit|telugu|hindi|patalu|పాటలు|వీడియో)\b/i.test(clean)
+    ) {
+      const q = clean
+        .replace(/^(?:please\s+|can\s+you\s+|anna\s+|hey\s+)?(?:play\s+(?:some\s+)?|put\s+on\s+)?/i, '')
+        .replace(/\b(patalu\s+pettu|songs\s+pettu|on\s+youtube|పాటలు\s+పెట్టు)\b/gi, '')
+        .trim() || 'Telugu hit songs';
+      return {
+        isDirectOSCommand: true,
+        actionType: 'app_workflow',
+        targetApp: 'youtube',
+        searchQuery: q,
+      };
+    }
+
+    // e.g. "I'm hungry order chicken biryani" -> Swiggy
+    if (
+      /\b(order\s+food|order\s+biryani|order\s+pizza|order\s+burger|hungry.*order|biryani\s+order|బిర్యానీ\s+ఆర్డర్|ఫుడ్\s+ఆర్డర్)\b/i.test(
+        clean
+      )
+    ) {
+      const q = clean
+        .replace(/^(?:i\s+am\s+hungry\s*|naaku\s+aakali\s+esthundi\s*|please\s+|can\s+you\s+)?(?:order\s+)/i, '')
+        .trim() || 'chicken biryani';
+      return {
+        isDirectOSCommand: true,
+        actionType: 'app_workflow',
+        targetApp: 'swiggy',
+        searchQuery: q,
       };
     }
 
