@@ -2996,6 +2996,8 @@ function formatBytes(n: number) {
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('CHAT');
+  const [navDrawerOpen, setNavDrawerOpen] = useState(false);
+  const [voiceLangMode, setVoiceLangMode] = useState<VoiceLanguageMode>('BILINGUAL_AUTO');
   const [settings, setSettings] = useState<Settings | null>(null);
   const settingsRef = useRef<Settings>(DEFAULT_SETTINGS);
   const [userAuth, setUserAuth] = useState<UserAuthData>(DEFAULT_USER_AUTH);
@@ -3089,8 +3091,6 @@ export default function App() {
     );
   }
 
-  const [navDrawerOpen, setNavDrawerOpen] = useState(false);
-  const [voiceLangMode, setVoiceLangMode] = useState<VoiceLanguageMode>('BILINGUAL_AUTO');
   const tabs: { id: Tab; label: string; emoji: string; desc: string }[] = [
     { id: 'CHAT', label: '✨ Chat', emoji: '✨', desc: 'Omni Assistant, Own Thoughts & Telugu/EN Voice' },
     { id: 'VOICE', label: '🎙️ Voice Orb', emoji: '🎙️', desc: 'Hands-Free Control: Scroll Down, Select It, Search, Proceed' },
@@ -3725,7 +3725,7 @@ function ChatScreen({
             if (pdfRes.ok) savedPath = pdfRes.filePath;
           } catch {}
         }
-        mediaSummary = `📄 **Native Android PDF Generated**\n\n- **File Path:** `${savedPath}`\n- **Own Thoughts:** ${omniPreThought.thoughtEn}`;
+        mediaSummary = `📄 **Native Android PDF Generated**\n\n- **File Path:** ${savedPath}\n- **Own Thoughts:** ${omniPreThought.thoughtEn}`;
       }
       omniSelfDevEngine.reflectAndEvolve(rawInput, omniPacket.primaryIntent, true, omniPacket.tokensSaved);
       const botMsg: ChatMessage = {
