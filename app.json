@@ -1,44 +1,45 @@
 {
   "expo": {
-    "name": "Pulse OS Max",
-    "slug": "pulse-os",
-    "version": "4.0.0",
+    "name": "Hark Pro AI",
+    "slug": "pulse-os-android",
+    "version": "5.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
-    "backgroundColor": "#0B0F17",
     "newArchEnabled": false,
-    "plugins": [
-      "./withHarkNativeOS.js"
-    ],
-    "platforms": [
-      "android"
-    ],
     "splash": {
-      "image": "./assets/splash-icon.png",
-      "backgroundColor": "#0B0F17"
+      "backgroundColor": "#05070F"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.ismartanji.harkos"
     },
     "android": {
-      "package": "com.pulseos.app",
-      "versionCode": 33,
+      "package": "com.ismartanji.harkos",
+      "versionCode": 34,
       "newArchEnabled": false,
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#0B0F17"
+        "backgroundColor": "#05070F"
       },
       "permissions": [
         "android.permission.INTERNET",
-        "android.permission.VIBRATE",
+        "android.permission.ACCESS_NETWORK_STATE",
         "android.permission.RECORD_AUDIO",
         "android.permission.MODIFY_AUDIO_SETTINGS",
-        "android.permission.QUERY_ALL_PACKAGES",
-        "android.permission.REQUEST_INSTALL_PACKAGES",
         "android.permission.CAMERA",
-        "android.permission.FLASHLIGHT",
+        "android.permission.VIBRATE",
+        "android.permission.WAKE_LOCK",
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.QUERY_ALL_PACKAGES",
         "android.permission.CALL_PHONE",
-        "android.permission.WAKE_LOCK"
-      ],
-      "softwareKeyboardLayoutMode": "resize"
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
+      ]
     },
-    "icon": "./assets/icon.png"
+    "plugins": [
+      "./withHarkNativeOS"
+    ]
   }
 }
