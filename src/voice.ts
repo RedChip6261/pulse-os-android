@@ -2,7 +2,7 @@
  * Pulse OS — voice: speech recognition (expo-speech-recognition, Android SpeechRecognizer) and text-to-speech (expo-speech).
  * Only one screen owns the microphone at a time; events for other owners are ignored.
  */
-import { Platform } from 'react-native';
+import { PermissionsAndroid, Platform } from 'react-native';
 import * as Speech from 'expo-speech';
 import { ExpoSpeechRecognitionModule } from 'expo-speech-recognition';
 import type { VoiceLanguageMode } from '../pulseFeatures';
@@ -22,6 +22,32 @@ export type MicCheck = { ok: boolean; reason?: 'permission' | 'blocked' | 'unava
 
 export async function ensureMic(): Promise<MicCheck> {
   try {
+    if (Platform.OS === 'android') {
+      const hasNative = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
+      if (!hasNative) {
+        const res = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO, {
+          title: 'Microphone Permission',
+          message: 'Pulse OS needs microphone access for voice commands and Hands-Free mode.',
+          buttonPositive: 'Allow',
+          buttonNegative: 'Deny',
+        });
+        if (res === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN) {
+          return {
+            ok: false,
+            reason: 'blocked',
+            message: 'Microphone permission is blocked. Open Settings > Permissions > Microphone and allow it.',
+          };
+        }
+        if (res !== PermissionsAndroid.RESULTS.GRANTED) {
+          return {
+            ok: false,
+            reason: 'permission',
+            message: 'Pulse needs the microphone to hear you. Tap again and choose Allow.',
+          };
+        }
+      }
+    }
+
     if (!ExpoSpeechRecognitionModule.isRecognitionAvailable()) {
       return {
         ok: false,

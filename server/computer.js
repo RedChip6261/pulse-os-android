@@ -475,7 +475,7 @@ const AGENT_PROMPT = [
 // goto that survives racing with another navigation (e.g. the home page still loading after wake-up).
 async function gotoSafe(p, url) {
   try {
-    return await gotoSafe(p, url);
+    return await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
   } catch (e) {
     if (!/interrupted by another navigation|net::ERR_ABORTED/i.test(String(e && e.message))) throw e;
     await p.waitForTimeout(150);
@@ -667,6 +667,80 @@ async function runAgent(goal, apiKey) {
   }
 }
 
+/** Proprietary zero-API-key fast browser task runner for direct navigation, search, scroll, click & read. */
+async function runLocalBrowserTask(goal) {
+  stopFlag = false;
+  state.goal = goal;
+  state.status = 'running';
+  state.question = '';
+  state.answer = '';
+  state.error = '';
+  state.model = 'pulse-local-computer';
+  log('goal', goal);
+  try {
+    const p = await ensureBrowser();
+    const clauses = goal.split(/\s*(?:;|,|\bthen\b|\band\s+then\b)\s*/i).map((s) => s.trim()).filter(Boolean);
+    for (const clause of clauses) {
+      if (stopFlag) return;
+      const lower = clause.toLowerCase();
+      if (/^(?:open|go\s+to|visit|navigate\s+to)\s+(.+)$/i.test(clause)) {
+        const target = clause.replace(/^(?:open|go\s+to|visit|navigate\s+to)\s+/i, '').trim();
+        const url = /^https?:\/\//i.test(target) ? target : /\./.test(target) && !/\s/.test(target) ? `https://${target}` : `https://www.google.com/search?q=${encodeURIComponent(target)}`;
+        log('open', url);
+        await gotoSafe(p, url);
+        await settle(p);
+      } else if (/^(?:search(?:\s+for)?|google|find)\s+(.+)$/i.test(clause)) {
+        const q = clause.replace(/^(?:search(?:\s+for)?|google|find)\s+/i, '').trim();
+        const url = `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+        log('search', q);
+        await gotoSafe(p, url);
+        await settle(p);
+      } else if (/^scroll\s+up/i.test(lower)) {
+        log('scroll', 'up');
+        await p.mouse.wheel(0, -650);
+        await p.waitForTimeout(200);
+      } else if (/^scroll\s+down/i.test(lower)) {
+        log('scroll', 'down');
+        await p.mouse.wheel(0, 650);
+        await p.waitForTimeout(200);
+      } else if (/^(?:go\s+)?back$/i.test(lower)) {
+        log('back', '');
+        await p.goBack({ timeout: 10000, waitUntil: 'domcontentloaded' }).catch(() => undefined);
+      } else if (/^(?:reload|refresh)$/i.test(lower)) {
+        log('reload', '');
+        await p.reload({ timeout: 15000, waitUntil: 'domcontentloaded' }).catch(() => undefined);
+      } else if (/^(?:click|tap|press)\s+(.+)$/i.test(clause)) {
+        const target = clause.replace(/^(?:click|tap|press)\s+/i, '').trim().toLowerCase();
+        const snap = await snapshot();
+        const match = snap.elements.find((e) => (e.label || '').toLowerCase().includes(target));
+        if (match) {
+          log('click', match.label || `#${match.id}`);
+          await clickId(p, match.id);
+          await settle(p);
+        } else {
+          log('miss', `No element matching "${target}"`);
+        }
+      } else {
+        const url = `https://www.google.com/search?q=${encodeURIComponent(clause)}`;
+        log('search', clause);
+        await gotoSafe(p, url);
+        await settle(p);
+      }
+    }
+    await refreshMeta();
+    const snap = await snapshot();
+    state.status = 'done';
+    state.answer = `${state.title || state.url}\n${snap.text.slice(0, 500)}`.trim();
+    log('done', state.title || 'Completed');
+    touch();
+  } catch (e) {
+    if (stopFlag) return;
+    state.status = 'error';
+    state.error = e.message || String(e);
+    log('error', state.error);
+  }
+}
+
 /* ------------------------------ Router ------------------------------ */
 
 function router({ keyFor, token }) {
@@ -757,6 +831,17 @@ function router({ keyFor, token }) {
     }
   });
 
+  r.post('/keepalive', async (req, res, next) => {
+    try {
+      await ensureBrowser();
+      await refreshMeta();
+      touch();
+      res.json({ ok: true, browser: Boolean(page && !page.isClosed()), status: state.status });
+    } catch (e) {
+      next(e);
+    }
+  });
+
   r.post('/task', async (req, res, next) => {
     try {
       const goal = String((req.body && req.body.goal) || '').trim().slice(0, 1000);
@@ -764,9 +849,18 @@ function router({ keyFor, token }) {
       if (state.status === 'running' || state.status === 'waiting') {
         return res.status(409).json({ ok: false, error: 'Already working on a task. Stop it first.' });
       }
-      const apiKey = keyFor(req);
+      let apiKey = '';
+      try {
+        apiKey = keyFor(req);
+      } catch {
+        apiKey = '';
+      }
       await ensureBrowser();
-      runAgent(goal, apiKey); // runs in the background; the phone follows /events
+      if (!apiKey) {
+        runLocalBrowserTask(goal);
+      } else {
+        runAgent(goal, apiKey); // runs in the background; the phone follows /events
+      }
       res.json({ ok: true, status: 'running' });
     } catch (e) {
       next(e);

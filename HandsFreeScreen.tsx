@@ -7,11 +7,13 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Animated, Easing, Linking, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSpeechRecognitionEvent } from 'expo-speech-recognition';
-import type { VoiceLanguageMode } from './pulseFeatures';
+import type { RagChunk, VoiceLanguageMode } from './pulseFeatures';
 import { buildContents, buildSystemPrompt, ChatMessage, uid, UserProfile } from './src/assistant';
-import { runLocalCommand, MemoryOps } from './src/commands';
+import { AutomationWorkflow } from './src/automation';
+import { MemoryOps } from './src/commands';
 import { looksTimeSensitive, streamChat } from './src/gemini';
-import { describeWhen, ReminderDraft, scheduleReminder } from './src/reminders';
+import { runLocalAgent } from './src/localAgent';
+import { describeWhen, Reminder, ReminderDraft, scheduleReminder } from './src/reminders';
 import { ensureMic, micOwner, MIC_ERRORS, releaseMic, speak, speakable, startListening, stopListening, stopSpeaking } from './src/voice';
 
 const C = {
@@ -35,11 +37,15 @@ export default function HandsFreeScreen(props: {
   active: boolean;
   apiKey: string;
   model: string;
+  useLocalAgent?: boolean;
   voiceLang: VoiceLanguageMode;
   setVoiceLang: (l: VoiceLanguageMode) => void;
   profile: UserProfile;
   memorySummary: string;
   memory: MemoryOps;
+  reminders: Reminder[];
+  knowledge: RagChunk[];
+  workflows: AutomationWorkflow[];
   onReminderSet: () => void;
   onAfterTurn: (userText: string) => void;
   openSettings: () => void;
@@ -158,10 +164,57 @@ export default function HandsFreeScreen(props: {
         }
       }
 
-      const local = await runLocalCommand(spoken, { apiKey: p.apiKey, memory: p.memory }).catch(() => null);
+      const lower = spoken.trim().toLowerCase();
+
+      // Voice control commands (stop, repeat, clear, language switch)
+      if (/^(?:stop|stop\s+listening|pause|exit|bye|goodbye)$/i.test(lower)) {
+        stopAll('Hands-Free paused');
+        return;
+      }
+      if (/^(?:repeat|say\s+that\s+again|repeat\s+that)$/i.test(lower)) {
+        const lastBot = [...turnsRef.current].reverse().find((t) => t.role === 'assistant');
+        const msg = lastBot?.text || 'Nothing to repeat yet.';
+        setReply(msg);
+        speakThenListen(msg, gen);
+        return;
+      }
+      if (/^(?:clear|new\s+chat|reset\s+chat)$/i.test(lower)) {
+        turnsRef.current = [];
+        setTurns([]);
+        const msg = 'Conversation cleared. What next?';
+        setReply(msg);
+        speakThenListen(msg, gen);
+        return;
+      }
+      if (/^(?:switch\s+to\s+telugu|telugu\s+mode)$/i.test(lower)) {
+        p.setVoiceLang('te-IN');
+        const msg = 'Switched to Telugu voice mode.';
+        setReply(msg);
+        speakThenListen(msg, gen);
+        return;
+      }
+      if (/^(?:switch\s+to\s+english|english\s+mode)$/i.test(lower)) {
+        p.setVoiceLang('en-IN');
+        const msg = 'Switched to English voice mode.';
+        setReply(msg);
+        speakThenListen(msg, gen);
+        return;
+      }
+
+      // Custom API-key-free Pulse Local Agent (multi-step workflows, commands, notes, math, reminders)
+      const strictLocal = Boolean(p.useLocalAgent) || !p.apiKey.trim();
+      const local = await runLocalAgent(spoken, {
+        profile: p.profile,
+        memory: p.memory,
+        reminders: p.reminders,
+        knowledge: p.knowledge,
+        workflows: p.workflows,
+        strictLocal,
+      }).catch(() => null);
+
       if (gen !== genRef.current) return;
-      if (local) {
-        let msg = local.reply;
+      if (local?.handled) {
+        let msg = local.text;
         if (local.reminder) {
           pendingReminderRef.current = local.reminder;
           msg = `Set a reminder for ${describeWhen(local.reminder)}: ${local.reminder.title}? Say yes or no.`;

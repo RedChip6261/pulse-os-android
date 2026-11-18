@@ -57,7 +57,7 @@
         {
           "photosPermission": "Pulse OS uses your photos only when you attach one to a chat.",
           "cameraPermission": "Pulse OS uses the camera only when you take a photo to attach to a chat.",
-          "microphonePermission": false
+          "microphonePermission": "Pulse OS uses the microphone for voice input and Hands-Free mode."
         }
       ],
       [

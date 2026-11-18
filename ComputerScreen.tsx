@@ -113,7 +113,9 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
   const [busy, setBusy] = useState(false);
   const [tapFx, setTapFx] = useState<{ x: number; y: number; k: number } | null>(null);
   const [screenTouch, setScreenTouch] = useState(false); // stops the page ScrollView stealing swipes from the live screen
+  const [alwaysOn, setAlwaysOn] = useState(true);
   const boxRef = useRef({ w: 1, h: 1 });
+  const wakingRef = useRef(false);
 
   useEffect(() => {
     AsyncStorage.getItem(STORAGE)
@@ -193,7 +195,7 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
   // State via Server-Sent Events over XHR streaming (EventSource can't send headers in RN).
   useEffect(() => {
     if (mode !== 'stream' || !cfg.token) return;
-    if (!active && !running) return;
+    if (!alwaysOn && !active && !running) return;
     let alive = true;
     let xhr: XMLHttpRequest | null = null;
     let retry: any = null;
@@ -262,7 +264,7 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
 
   // Legacy servers: poll /state and screenshots like before.
   useEffect(() => {
-    if (mode !== 'legacy' || !cfg.token || (!active && !running)) return;
+    if (mode !== 'legacy' || !cfg.token || (!alwaysOn && !active && !running)) return;
     let alive = true;
     const tick = async () => {
       try {
@@ -278,14 +280,31 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
       }
     };
     tick();
-    const id = setInterval(tick, 1500);
+    const id = setInterval(tick, alwaysOn && !active ? 8000 : 1500);
     const id2 = active ? setInterval(() => setFrame((f) => f + 1), 1000) : null;
     return () => {
       alive = false;
       clearInterval(id);
       if (id2) clearInterval(id2);
     };
-  }, [mode, active, running, cfg.token, call]);
+  }, [mode, alwaysOn, active, running, cfg.token, call]);
+
+  // Always-On keepalive & auto-wake: keeps the remote browser warm and connected.
+  useEffect(() => {
+    if (!alwaysOn || !cfg.token || conn === 'error') return;
+    if (st && !st.browser && !wakingRef.current) {
+      wakingRef.current = true;
+      call(mode === 'stream' ? '/wake' : '/act', mode === 'stream' ? {} : { type: 'reload' })
+        .catch(() => undefined)
+        .finally(() => {
+          wakingRef.current = false;
+        });
+    }
+    const id = setInterval(() => {
+      call('/keepalive', {}).catch(() => call('/state').catch(() => undefined));
+    }, 180000);
+    return () => clearInterval(id);
+  }, [alwaysOn, cfg.token, conn, st?.browser, mode, call]);
 
   const run = useCallback(async (fn: () => Promise<any>, quiet = false) => {
     if (!quiet) setBusy(true);
@@ -369,12 +388,17 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
         <View style={s.rowBetween}>
           <View style={s.row}>
             <View style={[s.dot, { backgroundColor: statusColor }]} />
-            <Text style={s.title}>Cloud computer</Text>
-            <Text style={s.muted}>  {statusText}</Text>
+            <Text style={s.title}>AI Computer</Text>
+            <Text style={s.muted}>  {statusText}{alwaysOn && conn === 'ok' ? ' · Always-On' : ''}</Text>
           </View>
-          <Pressable onPress={() => setSetupOpen((v) => !v)} style={s.pill}>
-            <Text style={s.pillText}>{setupOpen ? 'Close' : 'Setup'}</Text>
-          </Pressable>
+          <View style={[s.row, { gap: 6 }]}>
+            <Pressable onPress={() => setAlwaysOn((v) => !v)} style={[s.pill, alwaysOn && { borderColor: C.good }]}>
+              <Text style={s.pillText}>{alwaysOn ? '● Always-On' : '○ On-Demand'}</Text>
+            </Pressable>
+            <Pressable onPress={() => setSetupOpen((v) => !v)} style={s.pill}>
+              <Text style={s.pillText}>{setupOpen ? 'Close' : 'Setup'}</Text>
+            </Pressable>
+          </View>
         </View>
 
         {setupOpen && (

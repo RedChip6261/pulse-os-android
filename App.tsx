@@ -30,8 +30,10 @@ import { StatusBar } from 'expo-status-bar';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { useSpeechRecognitionEvent } from 'expo-speech-recognition';
+import AuthScreen from './AuthScreen';
 import ComputerScreen from './ComputerScreen';
 import HandsFreeScreen from './HandsFreeScreen';
+import ProfileScreen, { AgentMode } from './ProfileScreen';
 import {
   buildAgenticRagContext,
   DEFAULT_RAG_PLAYBOOKS,
@@ -46,8 +48,11 @@ import {
 import { ActionLink, actionLabel, openAction, openApp, splitActions, visibleWhileStreaming } from './src/actions';
 import { buildContents, buildSystemPrompt, ChatMessage, cleanLegacyText, forStorage, uid, UserProfile } from './src/assistant';
 import { Attachment, AttachmentError, pickDocument, pickImage, prettySize, takePhoto } from './src/attachments';
-import { MemoryOps, runLocalCommand } from './src/commands';
+import { loadSessionUser, logoutUser, PublicUser, userToProfile } from './src/auth';
+import { AutomationWorkflow, loadWorkflows, saveWorkflows } from './src/automation';
+import { MemoryOps } from './src/commands';
 import { DEFAULT_MODEL, looksTimeSensitive, MODEL_CHOICES, sanitizeModel, Source, streamChat } from './src/gemini';
+import { runLocalAgent } from './src/localAgent';
 import { extractMemories, loadMemories, makeMemory, memorySummary, MemoryItem, mergeMemories, saveMemories, worthExtracting } from './src/memory';
 import { cancelReminder, configureNotifications, describeWhen, loadReminders, Reminder, ReminderDraft, scheduleReminder } from './src/reminders';
 import { cancelDownload, checkForUpdate, downloadApk, installApk, installedBuild, openInstallPermissionSettings, openReleasePage, UpdateInfo } from './src/updates';
@@ -83,6 +88,7 @@ type WebSearchMode = 'auto' | 'on' | 'off';
 type Settings = {
   apiKey: string;
   model: string;
+  agentMode: AgentMode;
   voiceOn: boolean; // speak chat replies aloud (OFF by default; Hands-Free always speaks)
   voiceLang: VoiceLanguageMode;
   ragEnabled: boolean;
@@ -95,6 +101,7 @@ type Settings = {
 const DEFAULT_SETTINGS: Settings = {
   apiKey: '',
   model: DEFAULT_MODEL,
+  agentMode: 'auto',
   voiceOn: false,
   voiceLang: 'BILINGUAL_AUTO',
   ragEnabled: true,
@@ -112,6 +119,7 @@ function migrateSettings(raw: any): Settings {
     s.memoryAuto = raw?.memoryAuto ?? true;
     s.settingsVersion = SETTINGS_VERSION;
   }
+  if (!['auto', 'local', 'cloud'].includes(s.agentMode)) s.agentMode = 'auto';
   s.model = sanitizeModel(s.model); // drops gemini-pro / 2.x / 2.5 / unknown names
   if (!['auto', 'on', 'off'].includes(s.webSearch)) s.webSearch = 'auto';
   return s;
@@ -128,11 +136,15 @@ const APP_JSON_BUILD = Number(appConfig?.expo?.android?.versionCode ?? 36) || 36
 export default function App() {
   const [tab, setTabState] = useState<Tab>('PULSE');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [user, setUser] = useState<PublicUser | null>(null);
+  const [guestMode, setGuestMode] = useState(false);
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [profile, setProfile] = useState<UserProfile>(DEFAULT_PROFILE);
   const [ragIndex, setRagIndex] = useState<RagChunk[]>(DEFAULT_RAG_PLAYBOOKS);
   const [memories, setMemories] = useState<MemoryItem[]>([]);
   const [reminders, setReminders] = useState<Reminder[]>([]);
+  const [workflows, setWorkflows] = useState<AutomationWorkflow[]>([]);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [appActive, setAppActive] = useState(true);
   const [ready, setReady] = useState(false);
@@ -141,31 +153,41 @@ export default function App() {
   useEffect(() => {
     stopSpeaking();
     configureNotifications();
-    Promise.all([AsyncStorage.getItem(STORAGE_SETTINGS), AsyncStorage.getItem(STORAGE_USER_AUTH), loadRagIndex(), loadMemories(), loadReminders()]).then(
-      ([sRaw, pRaw, loadedRag, mem, rem]) => {
-        let s = DEFAULT_SETTINGS;
+    Promise.all([
+      AsyncStorage.getItem(STORAGE_SETTINGS),
+      AsyncStorage.getItem(STORAGE_USER_AUTH),
+      loadRagIndex(),
+      loadMemories(),
+      loadReminders(),
+      loadSessionUser(),
+      loadWorkflows(),
+    ]).then(([sRaw, pRaw, loadedRag, mem, rem, sessionUser, wf]) => {
+      let s = DEFAULT_SETTINGS;
+      try {
+        s = migrateSettings(sRaw ? JSON.parse(sRaw) : null);
+      } catch {}
+      setSettings(s);
+      AsyncStorage.setItem(STORAGE_SETTINGS, JSON.stringify(s)).catch(() => undefined);
+      if (sessionUser) {
+        setUser(sessionUser);
+        setProfile(userToProfile(sessionUser));
+      } else if (pRaw) {
         try {
-          s = migrateSettings(sRaw ? JSON.parse(sRaw) : null);
+          setProfile({ ...DEFAULT_PROFILE, ...JSON.parse(pRaw) });
         } catch {}
-        setSettings(s);
-        AsyncStorage.setItem(STORAGE_SETTINGS, JSON.stringify(s)).catch(() => undefined);
-        if (pRaw) {
-          try {
-            setProfile({ ...DEFAULT_PROFILE, ...JSON.parse(pRaw) });
-          } catch {}
-        }
-        setRagIndex(loadedRag);
-        memoriesRef.current = mem;
-        setMemories(mem);
-        setReminders(rem);
-        setReady(true);
-        if (s.autoCheckUpdates) {
-          checkForUpdate(APP_JSON_BUILD)
-            .then((u) => u.available && setUpdateInfo(u))
-            .catch(() => undefined);
-        }
-      },
-    );
+      }
+      setRagIndex(loadedRag);
+      memoriesRef.current = mem;
+      setMemories(mem);
+      setReminders(rem);
+      setWorkflows(wf);
+      setReady(true);
+      if (s.autoCheckUpdates) {
+        checkForUpdate(APP_JSON_BUILD)
+          .then((u) => u.available && setUpdateInfo(u))
+          .catch(() => undefined);
+      }
+    });
     // Voice must never keep talking in the background.
     const sub = AppState.addEventListener('change', (st) => {
       const on = st === 'active';
@@ -258,6 +280,19 @@ export default function App() {
     );
   }
 
+  if (!user && !guestMode) {
+    return (
+      <AuthScreen
+        onAuthenticated={(u) => {
+          setUser(u);
+          saveProfile(userToProfile(u));
+          setGuestMode(false);
+        }}
+        onContinueGuest={() => setGuestMode(true)}
+      />
+    );
+  }
+
   return (
     <SafeAreaView style={styles.root}>
       <StatusBar style="light" backgroundColor={C.bg} />
@@ -273,6 +308,9 @@ export default function App() {
               <Text style={styles.pillText}>Update</Text>
             </Pressable>
           ) : null}
+          <Pressable onPress={() => setProfileOpen(true)} style={styles.pillBtn}>
+            <Text style={styles.pillText}>{profile.name ? profile.name.split(' ')[0] : 'Profile'}</Text>
+          </Pressable>
           <Pressable onPress={() => setSettingsOpen(true)} style={styles.pillBtn}>
             <Text style={styles.pillText}>Settings</Text>
           </Pressable>
@@ -287,6 +325,8 @@ export default function App() {
             patchSettings={patchSettings}
             profile={profile}
             knowledge={knowledge}
+            reminders={reminders}
+            workflows={workflows}
             memSummary={memSummary}
             memory={memoryOps}
             learnFrom={learnFrom}
@@ -299,11 +339,15 @@ export default function App() {
             active={tab === 'VOICE' && appActive}
             apiKey={settings.apiKey}
             model={settings.model}
+            useLocalAgent={settings.agentMode === 'local'}
             voiceLang={settings.voiceLang}
             setVoiceLang={(l) => patchSettings({ voiceLang: l })}
             profile={profile}
             memorySummary={memSummary}
             memory={memoryOps}
+            reminders={reminders}
+            knowledge={knowledge}
+            workflows={workflows}
             onReminderSet={refreshReminders}
             onAfterTurn={learnFrom}
             openSettings={() => setSettingsOpen(true)}
@@ -334,6 +378,43 @@ export default function App() {
           );
         })}
       </View>
+
+      <Modal visible={profileOpen} animationType="slide" onRequestClose={() => setProfileOpen(false)}>
+        <SafeAreaView style={styles.root}>
+          <ProfileScreen
+            user={user}
+            profile={profile}
+            onSaveProfile={saveProfile}
+            onUserUpdated={(u) => setUser(u)}
+            onLogout={async () => {
+              await logoutUser();
+              setUser(null);
+              setGuestMode(false);
+              setProfileOpen(false);
+            }}
+            onOpenAuth={() => {
+              setProfileOpen(false);
+              setGuestMode(false);
+            }}
+            agentMode={settings.agentMode}
+            setAgentMode={(m) => patchSettings({ agentMode: m })}
+            voiceLang={settings.voiceLang}
+            setVoiceLang={(l) => patchSettings({ voiceLang: l })}
+            voiceOn={settings.voiceOn}
+            setVoiceOn={(v) => {
+              if (!v) stopSpeaking();
+              patchSettings({ voiceOn: v });
+            }}
+            stats={{
+              memories: memories.length,
+              reminders: reminders.length,
+              workflows: workflows.length,
+              notes: knowledge.length,
+            }}
+            onClose={() => setProfileOpen(false)}
+          />
+        </SafeAreaView>
+      </Modal>
 
       <Modal visible={settingsOpen} animationType="slide" onRequestClose={() => setSettingsOpen(false)}>
         <SafeAreaView style={styles.root}>
@@ -369,6 +450,8 @@ function ChatScreen({
   patchSettings,
   profile,
   knowledge,
+  reminders,
+  workflows,
   memSummary,
   memory,
   learnFrom,
@@ -380,6 +463,8 @@ function ChatScreen({
   patchSettings: (p: Partial<Settings>) => void;
   profile: UserProfile;
   knowledge: RagChunk[];
+  reminders: Reminder[];
+  workflows: AutomationWorkflow[];
   memSummary: string;
   memory: MemoryOps;
   learnFrom: (t: string) => void;
@@ -470,28 +555,45 @@ function ChatScreen({
     nearBottom.current = true;
     commit((prev) => [...prev, userMsg]);
 
-    // 1. Instant on-device commands (memory, reminders, open an app)
-    if (!att) {
-      const local = await runLocalCommand(text, { apiKey: settings.apiKey, memory }).catch(() => null);
-      if (local) {
+    // 1. Pulse Local Agent (API-key-free: multi-step workflows, commands, notes, math, reminders)
+    if (!att && settings.agentMode !== 'cloud') {
+      const strictLocal = settings.agentMode === 'local' || !settings.apiKey.trim();
+      const local = await runLocalAgent(text, {
+        profile,
+        memory,
+        reminders,
+        knowledge,
+        workflows,
+        strictLocal,
+      }).catch(() => null);
+      if (local?.handled) {
         commit((prev) => [
           ...prev,
           {
             id: uid(),
             role: 'assistant',
-            text: local.reply,
+            text: local.text,
+            actions: local.actions,
             ts: Date.now(),
             card: local.reminder ? { kind: 'reminder', draft: local.reminder, status: 'pending' } : undefined,
           },
         ]);
-        if (!local.reminder) speakReply(local.reply);
+        if (!local.reminder) speakReply(local.text);
         return;
       }
     }
 
     // 2. Gemini
     if (!settings.apiKey.trim()) {
-      commit((prev) => [...prev, { id: uid(), role: 'assistant', text: 'Add a Gemini API key in Settings and I can answer anything.', ts: Date.now() }]);
+      commit((prev) => [
+        ...prev,
+        {
+          id: uid(),
+          role: 'assistant',
+          text: 'Pulse Local Agent handled your device & offline tasks. Add a Gemini API key in Settings if you also want open-ended Cloud AI answers.',
+          ts: Date.now(),
+        },
+      ]);
       return;
     }
     const botId = uid();
@@ -697,6 +799,14 @@ function ChatScreen({
       ) : null}
 
       <View style={styles.chipRow}>
+        <Pressable
+          onPress={() => patchSettings({ agentMode: settings.agentMode === 'auto' ? 'local' : settings.agentMode === 'local' ? 'cloud' : 'auto' })}
+          style={[styles.chip, settings.agentMode === 'local' && styles.chipOn]}
+        >
+          <Text style={styles.chipText}>
+            {settings.agentMode === 'local' ? '⚡ Local Agent' : settings.agentMode === 'cloud' ? '☁️ Cloud' : '🤖 Auto'}
+          </Text>
+        </Pressable>
         <Pressable
           onPress={() => patchSettings({ webSearch: settings.webSearch === 'auto' ? 'on' : settings.webSearch === 'on' ? 'off' : 'auto' })}
           style={[styles.chip, settings.webSearch === 'on' && styles.chipOn]}
