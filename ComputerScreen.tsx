@@ -56,6 +56,7 @@ type ComputerState = {
 };
 type Cfg = { url: string; token: string };
 type Mode = 'unknown' | 'stream' | 'legacy';
+type EngineMode = 'local' | 'cloud';
 
 function normalizeUrl(raw: string): string {
   const s = raw.trim().replace(/\/+$/, '');
@@ -63,6 +64,14 @@ function normalizeUrl(raw: string): string {
   if (/^https?:\/\//i.test(s)) return s;
   if (/^[a-z0-9-]+$/i.test(s)) return `https://${s}-3000.app.github.dev`; // bare codespace name
   return `https://${s}`;
+}
+
+function toBrowserUrl(raw: string): string {
+  const s = raw.trim();
+  if (!s) return 'https://www.google.com';
+  if (/^https?:\/\//i.test(s)) return s;
+  if (/\./.test(s) && !/\s/.test(s)) return `https://${s}`;
+  return `https://www.google.com/search?q=${encodeURIComponent(s)}`;
 }
 
 /** The live screen page inside the WebView: one <img> fed by the MJPEG stream, plus tap/swipe capture. */
@@ -94,7 +103,15 @@ img{position:absolute;inset:0;width:100%;height:100%;object-fit:fill;display:blo
 </script></body></html>`;
 }
 
-export default function ComputerScreen({ active, geminiKey }: { active: boolean; geminiKey: string }) {
+export default function ComputerScreen({ active, geminiKey }: { active: boolean; geminiKey?: string }) {
+  const [engine, setEngine] = useState<EngineMode>('local');
+  const [localUrl, setLocalUrl] = useState('https://www.google.com');
+  const [localTitle, setLocalTitle] = useState('Google');
+  const [localLoading, setLocalLoading] = useState(false);
+  const [localAnswer, setLocalAnswer] = useState('');
+  const [localSteps, setLocalSteps] = useState<Step[]>([]);
+  const localWebRef = useRef<WebView>(null);
+
   const [cfg, setCfg] = useState<Cfg>({ url: DEFAULT_COMPUTER_URL, token: '' });
   const [setupOpen, setSetupOpen] = useState(false);
   const [loaded, setLoaded] = useState(false);
@@ -318,9 +335,71 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
     }
   }, []);
 
+  const addLocalStep = (action: string, detail: string) => {
+    setLocalSteps((prev) => [...prev.slice(-14), { n: prev.length + 1, at: new Date().toISOString(), action, detail }]);
+  };
+
+  const runLocalComputerTask = (rawGoal: string) => {
+    const clauses = rawGoal
+      .split(/\s*(?:;|,|\bthen\b|\band\s+then\b)\s*/i)
+      .map((c) => c.trim())
+      .filter(Boolean);
+    setLocalAnswer('');
+    for (const clause of clauses) {
+      const lower = clause.toLowerCase();
+      if (/^(?:open|go\s+to|visit|navigate\s+to)\s+(.+)$/i.test(clause)) {
+        const target = clause.replace(/^(?:open|go\s+to|visit|navigate\s+to)\s+/i, '').trim();
+        const url = toBrowserUrl(target);
+        setLocalUrl(url);
+        addLocalStep('open', url);
+      } else if (/^(?:search(?:\s+for)?|google|find)\s+(.+)$/i.test(clause)) {
+        const q = clause.replace(/^(?:search(?:\s+for)?|google|find)\s+/i, '').trim();
+        const url = `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+        setLocalUrl(url);
+        addLocalStep('search', q);
+      } else if (/^scroll\s+up/i.test(lower)) {
+        localWebRef.current?.injectJavaScript('window.scrollBy({top:-500,behavior:"smooth"});true;');
+        addLocalStep('scroll', 'up');
+      } else if (/^scroll\s+down/i.test(lower)) {
+        localWebRef.current?.injectJavaScript('window.scrollBy({top:500,behavior:"smooth"});true;');
+        addLocalStep('scroll', 'down');
+      } else if (/^(?:go\s+)?back$/i.test(lower)) {
+        localWebRef.current?.goBack();
+        addLocalStep('back', '');
+      } else if (/^(?:reload|refresh)$/i.test(lower)) {
+        localWebRef.current?.reload();
+        addLocalStep('reload', '');
+      } else if (/^(?:read|summari[sz]e)(?:\s+page)?$/i.test(lower)) {
+        localWebRef.current?.injectJavaScript(
+          'window.ReactNativeWebView.postMessage(JSON.stringify({t:"read",title:document.title,text:(document.body?document.body.innerText:"").slice(0,900)}));true;',
+        );
+        addLocalStep('read', 'Extracting page text');
+      } else if (/^(?:click|tap|press)\s+(.+)$/i.test(clause)) {
+        const target = clause.replace(/^(?:click|tap|press)\s+/i, '').trim().toLowerCase();
+        localWebRef.current?.injectJavaScript(`
+          (function(){
+            var els = Array.from(document.querySelectorAll('a,button,input[type=submit],[role=button]'));
+            var m = els.find(function(e){ return (e.innerText||e.value||e.getAttribute('aria-label')||'').toLowerCase().includes(${JSON.stringify(target)}); });
+            if(m){ m.click(); window.ReactNativeWebView.postMessage(JSON.stringify({t:'clicked',label:m.innerText||${JSON.stringify(target)}})); }
+          })(); true;
+        `);
+        addLocalStep('click', target);
+      } else {
+        const url = toBrowserUrl(clause);
+        setLocalUrl(url);
+        addLocalStep('open', url);
+      }
+    }
+  };
+
   const startTask = () => {
     const g = goal.trim();
     if (!g) return;
+    if (engine === 'local') {
+      runLocalComputerTask(g);
+      setGoal('');
+      return;
+    }
     run(async () => {
       await call('/task', { goal: g });
       setGoal('');
@@ -345,6 +424,14 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
     else if (m.t === 'scroll') run(() => call('/act', { type: 'scroll', dy: Number(m.dy) }), true);
   };
 
+  const onLocalMessage = (e: WebViewMessageEvent) => {
+    try {
+      const m = JSON.parse(e.nativeEvent.data);
+      if (m.t === 'read') setLocalAnswer(`${m.title}\n\n${m.text}`.trim());
+      else if (m.t === 'clicked') addLocalStep('clicked', m.label || 'element');
+    } catch {}
+  };
+
   const streamSrc = `${cfg.url}/api/computer/stream?token=${encodeURIComponent(cfg.token)}&w=${STREAM_WIDTH}&q=${STREAM_QUALITY}`;
   const html = useMemo(() => streamHtml(streamSrc), [streamSrc]);
 
@@ -362,46 +449,58 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
     );
   }
 
-  const statusColor = conn === 'error' ? C.danger : st?.status === 'running' ? C.accent : st?.status === 'waiting' ? C.warn : conn === 'ok' ? C.good : C.muted;
+  const statusColor = engine === 'local' ? C.good : conn === 'error' ? C.danger : st?.status === 'running' ? C.accent : st?.status === 'waiting' ? C.warn : conn === 'ok' ? C.good : C.muted;
   const statusText =
-    conn === 'error'
-      ? 'Not connected'
-      : !st
-        ? 'Connecting…'
-        : st.status === 'running'
-          ? 'Working'
-          : st.status === 'waiting'
-            ? 'Needs you'
-            : st.status === 'done'
-              ? 'Done'
-              : st.status === 'error'
-                ? 'Error'
-                : st.browser
-                  ? 'Ready'
-                  : 'Asleep';
-  const showScreen = !!cfg.token && conn === 'ok' && !!st?.browser;
+    engine === 'local'
+      ? localLoading
+        ? 'Loading…'
+        : 'Active · On-Device'
+      : conn === 'error'
+        ? 'Offline'
+        : !st
+          ? 'Connecting…'
+          : st.status === 'running'
+            ? 'Working'
+            : st.status === 'waiting'
+              ? 'Needs you'
+              : st.status === 'done'
+                ? 'Done'
+                : st.status === 'error'
+                  ? 'Error'
+                  : st.browser
+                    ? 'Ready'
+                    : 'Asleep';
+  const showScreen = engine === 'cloud' && !!cfg.token && conn === 'ok' && !!st?.browser;
   const legacyUri = `${cfg.url}/api/computer/screen.jpg?f=${frame}`;
 
   return (
     <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
       <ScrollView contentContainerStyle={s.wrap} keyboardShouldPersistTaps="handled" scrollEnabled={!screenTouch}>
-        <View style={s.rowBetween}>
+        <View style={[s.rowBetween, { flexWrap: 'wrap', gap: 8 }]}>
           <View style={s.row}>
             <View style={[s.dot, { backgroundColor: statusColor }]} />
             <Text style={s.title}>AI Computer</Text>
-            <Text style={s.muted}>  {statusText}{alwaysOn && conn === 'ok' ? ' · Always-On' : ''}</Text>
+            <Text style={s.muted}> · {statusText}</Text>
           </View>
           <View style={[s.row, { gap: 6 }]}>
-            <Pressable onPress={() => setAlwaysOn((v) => !v)} style={[s.pill, alwaysOn && { borderColor: C.good }]}>
-              <Text style={s.pillText}>{alwaysOn ? '● Always-On' : '○ On-Demand'}</Text>
+            <Pressable
+              onPress={() => {
+                setConnMsg('');
+                setEngine((e) => (e === 'local' ? 'cloud' : 'local'));
+              }}
+              style={[s.pill, engine === 'local' && { borderColor: C.good }]}
+            >
+              <Text style={s.pillText}>{engine === 'local' ? '📱 On-Device' : '☁️ Cloud'}</Text>
             </Pressable>
-            <Pressable onPress={() => setSetupOpen((v) => !v)} style={s.pill}>
-              <Text style={s.pillText}>{setupOpen ? 'Close' : 'Setup'}</Text>
-            </Pressable>
+            {engine === 'cloud' && (
+              <Pressable onPress={() => setSetupOpen((v) => !v)} style={s.pill}>
+                <Text style={s.pillText}>{setupOpen ? 'Close' : 'Setup'}</Text>
+              </Pressable>
+            )}
           </View>
         </View>
 
-        {setupOpen && (
+        {engine === 'cloud' && setupOpen && (
           <SetupCard
             cfg={cfg}
             onSave={(c) => {
@@ -412,32 +511,50 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
           />
         )}
 
-        {!!connMsg && <Text style={s.error}>{connMsg}</Text>}
+        {engine === 'cloud' && !!connMsg && <Text style={s.error}>{connMsg}</Text>}
 
         <View style={s.card}>
           <TextInput
             value={goal}
             onChangeText={setGoal}
-            placeholder="Tell the computer what to do…"
+            placeholder='Command (e.g. "Open Google.com", "Search Hyderabad news", "Read page")…'
             placeholderTextColor={C.muted}
             style={s.input}
             multiline
             onSubmitEditing={startTask}
           />
           <View style={[s.row, { gap: 8, marginTop: 8 }]}>
-            <Pressable onPress={startTask} disabled={busy || !cfg.token || running} style={[s.btn, { flex: 1 }, (busy || running) && { opacity: 0.5 }]}>
+            <Pressable onPress={startTask} disabled={busy || (engine === 'cloud' && (!cfg.token || running))} style={[s.btn, { flex: 1 }, (busy || (engine === 'cloud' && running)) && { opacity: 0.5 }]}>
               <Text style={s.btnText}>Run task</Text>
             </Pressable>
-            {running && (
+            {engine === 'local' && (
+              <Pressable onPress={() => runLocalComputerTask('read page')} style={[s.btn, { backgroundColor: C.surface2, borderWidth: 1, borderColor: C.border }]}>
+                <Text style={s.btnText}>Read page</Text>
+              </Pressable>
+            )}
+            {engine === 'cloud' && running && (
               <Pressable onPress={() => run(() => call('/stop', {}))} style={[s.btn, { backgroundColor: C.danger }]}>
                 <Text style={s.btnText}>Stop</Text>
               </Pressable>
             )}
           </View>
-          <Text style={s.mutedSmall}>The agent never types passwords, OTPs, PINs or card numbers, and asks before any pay / order / book / send / delete.</Text>
         </View>
 
-        {st?.status === 'waiting' && !!st.question && (
+        {engine === 'local' && !!localAnswer && (
+          <View style={[s.card, { borderColor: C.good }]}>
+            <View style={s.rowBetween}>
+              <Text style={s.cardTitle}>Page Summary</Text>
+              <Pressable onPress={() => setLocalAnswer('')}>
+                <Text style={{ color: C.muted, fontSize: 12 }}>Dismiss</Text>
+              </Pressable>
+            </View>
+            <Text selectable style={s.body}>
+              {localAnswer}
+            </Text>
+          </View>
+        )}
+
+        {engine === 'cloud' && st?.status === 'waiting' && !!st.question && (
           <View style={[s.card, { borderColor: C.warn }]}>
             <Text style={s.body}>{st.question}</Text>
             <TextInput value={reply} onChangeText={setReply} placeholder="Your answer" placeholderTextColor={C.muted} style={[s.input, { marginTop: 8 }]} />
@@ -468,27 +585,54 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
           </View>
         )}
 
-        {st?.status === 'done' && !!st.answer && (
+        {engine === 'cloud' && st?.status === 'done' && !!st.answer && (
           <View style={[s.card, { borderColor: C.good }]}>
             <Text selectable style={s.body}>
               {st.answer}
             </Text>
           </View>
         )}
-        {st?.status === 'error' && !!st.error && (
+        {engine === 'cloud' && st?.status === 'error' && !!st.error && (
           <View style={[s.card, { borderColor: C.danger }]}>
             <Text style={s.body}>{st.error}</Text>
           </View>
         )}
 
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 6 }}>
+          {[
+            { label: 'Google', url: 'https://www.google.com' },
+            { label: 'YouTube', url: 'https://m.youtube.com' },
+            { label: 'Wikipedia', url: 'https://en.m.wikipedia.org' },
+            { label: 'News', url: 'https://news.google.com' },
+          ].map((q) => (
+            <Pressable
+              key={q.label}
+              onPress={() => {
+                if (engine === 'local') {
+                  setLocalUrl(q.url);
+                  addLocalStep('open', q.url);
+                } else {
+                  run(() => call('/act', { type: 'navigate', url: q.url }), true);
+                }
+              }}
+              style={s.pill}
+            >
+              <Text style={s.pillText}>{q.label}</Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+
         <View style={[s.row, { gap: 6 }]}>
-          <Pressable onPress={() => run(() => call('/act', { type: 'back' }), true)} style={s.iconBtn}>
+          <Pressable
+            onPress={() => (engine === 'local' ? localWebRef.current?.goBack() : run(() => call('/act', { type: 'back' }), true))}
+            style={s.iconBtn}
+          >
             <Text style={s.iconText}>‹</Text>
           </Pressable>
           <TextInput
             value={addr}
             onChangeText={setAddr}
-            placeholder={st?.url || 'Search or type a URL'}
+            placeholder={(engine === 'local' ? localUrl : st?.url) || 'Search or type a URL'}
             placeholderTextColor={C.muted}
             style={[s.input, { flex: 1, paddingVertical: 8 }]}
             autoCapitalize="none"
@@ -497,13 +641,23 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
             onSubmitEditing={() => {
               const u = addr.trim();
               if (!u) return;
-              run(async () => {
-                await call('/act', { type: 'navigate', url: u });
+              if (engine === 'local') {
+                const target = toBrowserUrl(u);
+                setLocalUrl(target);
+                addLocalStep('open', target);
                 setAddr('');
-              });
+              } else {
+                run(async () => {
+                  await call('/act', { type: 'navigate', url: u });
+                  setAddr('');
+                });
+              }
             }}
           />
-          <Pressable onPress={() => run(() => call('/act', { type: 'reload' }), true)} style={s.iconBtn}>
+          <Pressable
+            onPress={() => (engine === 'local' ? localWebRef.current?.reload() : run(() => call('/act', { type: 'reload' }), true))}
+            style={s.iconBtn}
+          >
             <Text style={s.iconText}>↻</Text>
           </Pressable>
         </View>
@@ -517,7 +671,23 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
             boxRef.current = { w: e.nativeEvent.layout.width, h: e.nativeEvent.layout.height };
           }}
         >
-          {showScreen && mode === 'stream' && active ? (
+          {engine === 'local' ? (
+            <WebView
+              ref={localWebRef}
+              source={{ uri: localUrl }}
+              onMessage={onLocalMessage}
+              onLoadStart={() => setLocalLoading(true)}
+              onLoadEnd={() => setLocalLoading(false)}
+              onNavigationStateChange={(nav) => {
+                if (nav.url) setLocalUrl(nav.url);
+                if (nav.title) setLocalTitle(nav.title);
+              }}
+              style={{ flex: 1, backgroundColor: '#fff' }}
+              javaScriptEnabled
+              domStorageEnabled
+              allowsBackForwardNavigationGestures
+            />
+          ) : showScreen && mode === 'stream' && active ? (
             <WebView
               key={`${streamKey}-${cfg.url}`}
               source={{ html, baseUrl: cfg.url }}
@@ -551,7 +721,7 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
           ) : (
             <View style={s.center}>
               <Text style={[s.muted, { textAlign: 'center' }]}>
-                {!cfg.token ? 'Add your server token in Setup.' : conn === 'error' ? 'Start your Codespace, then come back.' : conn === 'unknown' ? 'Connecting…' : 'The browser is asleep.'}
+                {!cfg.token ? 'Add your server token in Setup, or tap 📱 On-Device above.' : conn === 'error' ? 'Cloud server unreachable. Tap 📱 On-Device above to browse immediately.' : 'Connecting…'}
               </Text>
               {!!cfg.token && conn === 'ok' && !st?.browser && (
                 <Pressable onPress={() => run(() => call(mode === 'stream' ? '/wake' : '/act', mode === 'stream' ? {} : { type: 'reload' }))} style={[s.btn, { marginTop: 12 }]}>
@@ -560,44 +730,46 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
               )}
             </View>
           )}
-          {showScreen && mode === 'stream' && !streamLive && <ActivityIndicator style={s.busy} color={C.accent} />}
-          {busy && <ActivityIndicator style={s.busy} color={C.accent} />}
+          {((engine === 'local' && localLoading) || (engine === 'cloud' && ((showScreen && mode === 'stream' && !streamLive) || busy))) && (
+            <ActivityIndicator style={s.busy} color={C.accent} />
+          )}
           {tapFx && <View pointerEvents="none" style={[s.tapFx, { left: tapFx.x * boxRef.current.w - 14, top: tapFx.y * boxRef.current.h - 14 }]} />}
         </View>
-        {!!st?.title && (
+        {!!(engine === 'local' ? localTitle : st?.title) && (
           <Text style={s.muted} numberOfLines={1}>
-            {st.title}
+            {engine === 'local' ? localTitle : st?.title}
           </Text>
         )}
 
-        <View style={[s.row, { gap: 6 }]}>
-          <TextInput
-            value={typed}
-            onChangeText={setTyped}
-            placeholder="Type into the page (tap a field first)"
-            placeholderTextColor={C.muted}
-            style={[s.input, { flex: 1, paddingVertical: 8 }]}
-            autoCapitalize="none"
-            onSubmitEditing={() =>
-              run(async () => {
-                await call('/act', { type: 'type', text: typed, submit: true });
-                setTyped('');
-              }, true)
-            }
-          />
-          <Pressable onPress={() => run(() => call('/act', { type: 'scroll', direction: 'up' }), true)} style={s.iconBtn}>
-            <Text style={s.iconText}>▲</Text>
-          </Pressable>
-          <Pressable onPress={() => run(() => call('/act', { type: 'scroll', direction: 'down' }), true)} style={s.iconBtn}>
-            <Text style={s.iconText}>▼</Text>
-          </Pressable>
-        </View>
-        <Text style={s.mutedSmall}>Tap the screen to click, swipe to scroll. What you type here goes straight to the page and is never logged.</Text>
+        {engine === 'cloud' && (
+          <View style={[s.row, { gap: 6 }]}>
+            <TextInput
+              value={typed}
+              onChangeText={setTyped}
+              placeholder="Type into the page (tap a field first)"
+              placeholderTextColor={C.muted}
+              style={[s.input, { flex: 1, paddingVertical: 8 }]}
+              autoCapitalize="none"
+              onSubmitEditing={() =>
+                run(async () => {
+                  await call('/act', { type: 'type', text: typed, submit: true });
+                  setTyped('');
+                }, true)
+              }
+            />
+            <Pressable onPress={() => run(() => call('/act', { type: 'scroll', direction: 'up' }), true)} style={s.iconBtn}>
+              <Text style={s.iconText}>▲</Text>
+            </Pressable>
+            <Pressable onPress={() => run(() => call('/act', { type: 'scroll', direction: 'down' }), true)} style={s.iconBtn}>
+              <Text style={s.iconText}>▼</Text>
+            </Pressable>
+          </View>
+        )}
 
-        {!!st?.steps?.length && (
+        {!!(engine === 'local' ? localSteps : st?.steps)?.length && (
           <View style={s.card}>
-            <Text style={s.cardTitle}>Steps{st.model ? `  ·  ${st.model}` : ''}</Text>
-            {st.steps
+            <Text style={s.cardTitle}>Steps · {engine === 'local' ? 'On-Device AI Browser' : st?.model || 'Cloud'}</Text>
+            {(engine === 'local' ? localSteps : st?.steps || [])
               .slice(-10)
               .reverse()
               .map((x) => (

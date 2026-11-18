@@ -80,7 +80,7 @@ const C = {
 const STORAGE_SETTINGS = 'pulseos.settings.v3';
 const STORAGE_CONVOS = 'pulseos.convos.v2';
 const STORAGE_USER_AUTH = 'pulseos.user_auth.v2';
-const SETTINGS_VERSION = 6;
+const SETTINGS_VERSION = 7;
 
 type Tab = 'PULSE' | 'VOICE' | 'APPS' | 'COMPUTER';
 type WebSearchMode = 'auto' | 'on' | 'off';
@@ -101,7 +101,7 @@ type Settings = {
 const DEFAULT_SETTINGS: Settings = {
   apiKey: '',
   model: DEFAULT_MODEL,
-  agentMode: 'auto',
+  agentMode: 'local',
   voiceOn: false,
   voiceLang: 'BILINGUAL_AUTO',
   ragEnabled: true,
@@ -115,11 +115,12 @@ function migrateSettings(raw: any): Settings {
   const s: Settings = { ...DEFAULT_SETTINGS, ...(raw || {}) };
   if (Number(raw?.settingsVersion) !== SETTINGS_VERSION) {
     s.voiceOn = false; // older builds spoke every reply in the background
+    s.agentMode = 'local'; // default to Pulse's own API-key-free engine
     s.webSearch = 'auto';
     s.memoryAuto = raw?.memoryAuto ?? true;
     s.settingsVersion = SETTINGS_VERSION;
   }
-  if (!['auto', 'local', 'cloud'].includes(s.agentMode)) s.agentMode = 'auto';
+  if (!['auto', 'local', 'cloud'].includes(s.agentMode)) s.agentMode = 'local';
   s.model = sanitizeModel(s.model); // drops gemini-pro / 2.x / 2.5 / unknown names
   if (!['auto', 'on', 'off'].includes(s.webSearch)) s.webSearch = 'auto';
   return s;
@@ -337,20 +338,14 @@ export default function App() {
         <View style={[styles.fill, tab !== 'VOICE' && styles.hidden]}>
           <HandsFreeScreen
             active={tab === 'VOICE' && appActive}
-            apiKey={settings.apiKey}
-            model={settings.model}
-            useLocalAgent={settings.agentMode === 'local'}
             voiceLang={settings.voiceLang}
             setVoiceLang={(l) => patchSettings({ voiceLang: l })}
             profile={profile}
-            memorySummary={memSummary}
             memory={memoryOps}
             reminders={reminders}
             knowledge={knowledge}
             workflows={workflows}
             onReminderSet={refreshReminders}
-            onAfterTurn={learnFrom}
-            openSettings={() => setSettingsOpen(true)}
           />
         </View>
         <View style={[styles.fill, tab !== 'APPS' && styles.hidden]}>
@@ -500,7 +495,7 @@ function ChatScreen({
         const parsed = raw ? JSON.parse(raw) : [];
         if (Array.isArray(parsed)) {
           const clean: ChatMessage[] = parsed
-            .filter((m: any) => m && typeof m.text === 'string' && m.id)
+            .filter((m: any) => m && typeof m.text === 'string' && m.id && !(m.role === 'error' && /exceeded your current quota|no longer available/i.test(m.text)))
             .map((m: any) => ({ ...m, text: m.role === 'assistant' ? cleanLegacyText(m.text) : m.text, streaming: false }));
           messagesRef.current = clean;
           setMessages(clean);
@@ -555,16 +550,17 @@ function ChatScreen({
     nearBottom.current = true;
     commit((prev) => [...prev, userMsg]);
 
-    // 1. Pulse Local Agent (API-key-free: multi-step workflows, commands, notes, math, reminders)
-    if (!att && settings.agentMode !== 'cloud') {
-      const strictLocal = settings.agentMode === 'local' || !settings.apiKey.trim();
+    // 1. Pulse Custom Engine (API-key-free, handles attachments, web knowledge, workflows, math, reminders)
+    if (settings.agentMode !== 'cloud') {
       const local = await runLocalAgent(text, {
         profile,
         memory,
         reminders,
         knowledge,
         workflows,
-        strictLocal,
+        history: messagesRef.current,
+        attachment: att || undefined,
+        webEnabled: settings.webSearch !== 'off',
       }).catch(() => null);
       if (local?.handled) {
         commit((prev) => [
@@ -574,6 +570,7 @@ function ChatScreen({
             role: 'assistant',
             text: local.text,
             actions: local.actions,
+            sources: local.sources,
             ts: Date.now(),
             card: local.reminder ? { kind: 'reminder', draft: local.reminder, status: 'pending' } : undefined,
           },
@@ -583,15 +580,28 @@ function ChatScreen({
       }
     }
 
-    // 2. Gemini
+    // 2. Optional Cloud AI (only when explicitly switched to Cloud mode with a valid key)
     if (!settings.apiKey.trim()) {
+      const fallback = await runLocalAgent(text, {
+        profile,
+        memory,
+        reminders,
+        knowledge,
+        workflows,
+        history: messagesRef.current,
+        attachment: att || undefined,
+        webEnabled: settings.webSearch !== 'off',
+      });
       commit((prev) => [
         ...prev,
         {
           id: uid(),
           role: 'assistant',
-          text: 'Pulse Local Agent handled your device & offline tasks. Add a Gemini API key in Settings if you also want open-ended Cloud AI answers.',
+          text: fallback.text,
+          actions: fallback.actions,
+          sources: fallback.sources,
           ts: Date.now(),
+          card: fallback.reminder ? { kind: 'reminder', draft: fallback.reminder, status: 'pending' } : undefined,
         },
       ]);
       return;

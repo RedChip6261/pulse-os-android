@@ -8,13 +8,12 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Animated, Easing, Linking, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSpeechRecognitionEvent } from 'expo-speech-recognition';
 import type { RagChunk, VoiceLanguageMode } from './pulseFeatures';
-import { buildContents, buildSystemPrompt, ChatMessage, uid, UserProfile } from './src/assistant';
+import { ChatMessage, uid, UserProfile } from './src/assistant';
 import { AutomationWorkflow } from './src/automation';
 import { MemoryOps } from './src/commands';
-import { looksTimeSensitive, streamChat } from './src/gemini';
 import { runLocalAgent } from './src/localAgent';
 import { describeWhen, Reminder, ReminderDraft, scheduleReminder } from './src/reminders';
-import { ensureMic, micOwner, MIC_ERRORS, releaseMic, speak, speakable, startListening, stopListening, stopSpeaking } from './src/voice';
+import { ensureMic, micOwner, MIC_ERRORS, releaseMic, speak, startListening, stopListening, stopSpeaking } from './src/voice';
 
 const C = {
   bg: '#090C12',
@@ -35,22 +34,16 @@ const MAX_SILENT_RETRIES = 6;
 
 export default function HandsFreeScreen(props: {
   active: boolean;
-  apiKey: string;
-  model: string;
-  useLocalAgent?: boolean;
   voiceLang: VoiceLanguageMode;
   setVoiceLang: (l: VoiceLanguageMode) => void;
   profile: UserProfile;
-  memorySummary: string;
   memory: MemoryOps;
   reminders: Reminder[];
   knowledge: RagChunk[];
   workflows: AutomationWorkflow[];
   onReminderSet: () => void;
-  onAfterTurn: (userText: string) => void;
-  openSettings: () => void;
 }) {
-  const { active, apiKey, model, voiceLang } = props;
+  const { active, voiceLang } = props;
   const [phase, setPhase] = useState<Phase>('idle');
   const [loopOn, setLoopOn] = useState(false);
   const [partial, setPartial] = useState('');
@@ -63,7 +56,6 @@ export default function HandsFreeScreen(props: {
   const genRef = useRef(0);
   const finalRef = useRef('');
   const silentRef = useRef(0);
-  const abortRef = useRef<AbortController | null>(null);
   const pendingReminderRef = useRef<ReminderDraft | null>(null);
   const turnsRef = useRef<ChatMessage[]>([]);
   const propsRef = useRef(props);
@@ -87,7 +79,7 @@ export default function HandsFreeScreen(props: {
   }, [phase, pulse]);
 
   const pushTurns = (add: ChatMessage[]) => {
-    turnsRef.current = [...turnsRef.current, ...add].slice(-16);
+    turnsRef.current = [...turnsRef.current, ...add].slice(-20);
     setTurns(turnsRef.current);
   };
 
@@ -108,8 +100,6 @@ export default function HandsFreeScreen(props: {
     loopRef.current = false;
     setLoopOn(false);
     genRef.current += 1;
-    abortRef.current?.abort();
-    abortRef.current = null;
     stopSpeaking();
     releaseMic('handsfree');
     setPhase('idle');
@@ -117,7 +107,6 @@ export default function HandsFreeScreen(props: {
     if (label) setReply((r) => r || '');
   }, []);
 
-  // Speak the answer and listen again afterwards (only if this turn is still current).
   const speakThenListen = useCallback(
     (text: string, gen: number) => {
       setPhase('speaking');
@@ -139,7 +128,6 @@ export default function HandsFreeScreen(props: {
       setError(null);
       setPhase('thinking');
 
-      // A pending reminder waits for "yes" / "no".
       const pending = pendingReminderRef.current;
       if (pending) {
         pendingReminderRef.current = null;
@@ -147,7 +135,7 @@ export default function HandsFreeScreen(props: {
           try {
             await scheduleReminder(pending);
             p.onReminderSet();
-            const msg = `Done. I'll remind you ${describeWhen(pending).toLowerCase()}: ${pending.title}.`;
+            const msg = `Done! I'll remind you ${describeWhen(pending).toLowerCase()}: ${pending.title}.`;
             setReply(msg);
             speakThenListen(msg, gen);
           } catch (e: any) {
@@ -158,15 +146,14 @@ export default function HandsFreeScreen(props: {
           return;
         }
         if (/^(no|nope|cancel|don'?t|leave it|vaddu)\b/i.test(spoken.trim())) {
-          setReply('Okay, cancelled.');
-          speakThenListen('Okay, cancelled.', gen);
+          setReply('No problem, cancelled.');
+          speakThenListen('No problem, cancelled.', gen);
           return;
         }
       }
 
       const lower = spoken.trim().toLowerCase();
 
-      // Voice control commands (stop, repeat, clear, language switch)
       if (/^(?:stop|stop\s+listening|pause|exit|bye|goodbye)$/i.test(lower)) {
         stopAll('Hands-Free paused');
         return;
@@ -181,7 +168,7 @@ export default function HandsFreeScreen(props: {
       if (/^(?:clear|new\s+chat|reset\s+chat)$/i.test(lower)) {
         turnsRef.current = [];
         setTurns([]);
-        const msg = 'Conversation cleared. What next?';
+        const msg = 'Conversation cleared. What would you like to talk about?';
         setReply(msg);
         speakThenListen(msg, gen);
         return;
@@ -201,23 +188,22 @@ export default function HandsFreeScreen(props: {
         return;
       }
 
-      // Custom API-key-free Pulse Local Agent (multi-step workflows, commands, notes, math, reminders)
-      const strictLocal = Boolean(p.useLocalAgent) || !p.apiKey.trim();
-      const local = await runLocalAgent(spoken, {
-        profile: p.profile,
-        memory: p.memory,
-        reminders: p.reminders,
-        knowledge: p.knowledge,
-        workflows: p.workflows,
-        strictLocal,
-      }).catch(() => null);
-
-      if (gen !== genRef.current) return;
-      if (local?.handled) {
-        let msg = local.text;
-        if (local.reminder) {
-          pendingReminderRef.current = local.reminder;
-          msg = `Set a reminder for ${describeWhen(local.reminder)}: ${local.reminder.title}? Say yes or no.`;
+      try {
+        const res = await runLocalAgent(spoken, {
+          profile: p.profile,
+          memory: p.memory,
+          reminders: p.reminders,
+          knowledge: p.knowledge,
+          workflows: p.workflows,
+          history: turnsRef.current,
+          webEnabled: true,
+          voice: true,
+        });
+        if (gen !== genRef.current) return;
+        let msg = res.text;
+        if (res.reminder) {
+          pendingReminderRef.current = res.reminder;
+          msg = `Should I set a reminder for ${describeWhen(res.reminder)} to ${res.reminder.title}? Say yes or no.`;
         }
         pushTurns([
           { id: uid(), role: 'user', text: spoken, ts: Date.now() },
@@ -225,79 +211,14 @@ export default function HandsFreeScreen(props: {
         ]);
         setReply(msg);
         speakThenListen(msg, gen);
-        return;
-      }
-
-      if (!p.apiKey.trim()) {
-        const msg = 'Add your Gemini API key in Settings so I can answer questions.';
-        setReply(msg);
-        speakThenListen(msg, gen);
-        return;
-      }
-
-      const userMsg: ChatMessage = { id: uid(), role: 'user', text: spoken, ts: Date.now() };
-      const contents = buildContents([...turnsRef.current, userMsg], 16, 0);
-      const system = buildSystemPrompt({ profile: p.profile, memory: p.memorySummary, voice: true });
-      const ctrl = new AbortController();
-      abortRef.current = ctrl;
-
-      // Speak sentence by sentence while the answer streams in, so the first words come out fast.
-      let spokenUpTo = 0;
-      let outstanding = 0;
-      let streamDone = false;
-      const finishIfDone = () => {
-        if (streamDone && outstanding === 0 && gen === genRef.current && loopRef.current) listen();
-      };
-      const enqueue = (chunk: string) => {
-        const t = speakable(chunk);
-        if (!t) return;
-        outstanding += 1;
-        setPhase('speaking');
-        speak(t, p.voiceLang, {
-          onDone: () => {
-            outstanding -= 1;
-            finishIfDone();
-          },
-        });
-      };
-      try {
-        const res = await streamChat({
-          apiKey: p.apiKey,
-          model: p.model,
-          system,
-          contents,
-          search: looksTimeSensitive(spoken),
-          signal: ctrl.signal,
-          onPartial: (full) => {
-            if (gen !== genRef.current) return;
-            setReply(full);
-            const rest = full.slice(spokenUpTo);
-            const m = rest.match(/^[\s\S]*[.!?।](\s|$)|^[\s\S]*\n/);
-            if (m && m[0].trim().length > 12) {
-              spokenUpTo += m[0].length;
-              enqueue(m[0]);
-            }
-          },
-        });
-        if (gen !== genRef.current) return;
-        setReply(res.text);
-        const tail = res.text.slice(spokenUpTo);
-        if (tail.trim()) enqueue(tail);
-        pushTurns([userMsg, { id: uid(), role: 'assistant', text: res.text, ts: Date.now() }]);
-        p.onAfterTurn(spoken);
-        streamDone = true;
-        finishIfDone();
       } catch (e: any) {
         if (gen !== genRef.current) return;
         const msg = e?.message || 'Something went wrong.';
         setError({ msg });
-        streamDone = true;
         speakThenListen(msg, gen);
-      } finally {
-        if (abortRef.current === ctrl) abortRef.current = null;
       }
     },
-    [listen, speakThenListen],
+    [listen, speakThenListen, stopAll],
   );
 
   /* ---------------- Speech recognition events (ignored unless Hands-Free owns the mic) ---------------- */
@@ -369,7 +290,6 @@ export default function HandsFreeScreen(props: {
     }
     // Barge-in: stop speaking/thinking and listen right away.
     genRef.current += 1;
-    abortRef.current?.abort();
     stopSpeaking();
     silentRef.current = 0;
     listen();
@@ -423,7 +343,11 @@ export default function HandsFreeScreen(props: {
 
       <ScrollView style={s.replyBox} contentContainerStyle={{ padding: 12 }}>
         {!!reply && <Text style={s.reply}>{reply}</Text>}
-        {!reply && !error && turns.length === 0 && <Text style={s.hint}>Ask anything out loud. I'll answer, then listen again. Say "remind me at 6 to…" or "remember that…" too.</Text>}
+        {!reply && !error && turns.length === 0 && (
+          <Text style={s.hint}>
+            Talk naturally—ask about weather, facts, math, your reminders, or run multi-step workflows (e.g. "morning briefing", "open Maps for Hyderabad, then remind me in 20 min"). Say "repeat", "clear", or "stop" anytime.
+          </Text>
+        )}
         {!!error && (
           <View style={s.errorCard}>
             <Text style={s.errorText}>{error.msg}</Text>
@@ -433,11 +357,6 @@ export default function HandsFreeScreen(props: {
               </Pressable>
             )}
           </View>
-        )}
-        {!apiKey.trim() && (
-          <Pressable onPress={props.openSettings} style={{ marginTop: 8 }}>
-            <Text style={{ color: C.cyan, fontSize: 13 }}>Add a Gemini API key in Settings for full answers</Text>
-          </Pressable>
         )}
       </ScrollView>
 
