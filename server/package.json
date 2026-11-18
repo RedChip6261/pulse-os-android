@@ -4,12 +4,16 @@
   "private": true,
   "description": "Cloud backend for the Pulse OS app (health check, Gemini chat, task runner).",
   "main": "server.js",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "postinstall": "playwright install chromium || true"
   },
   "dependencies": {
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "playwright": "^1.48.2"
   }
 }

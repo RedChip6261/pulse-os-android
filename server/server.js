@@ -14,13 +14,14 @@
 'use strict';
 
 const express = require('express');
+const computer = require('./computer');
 const crypto = require('crypto');
 
 const PORT = Number(process.env.PORT) || 3000;
 const SERVER_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const PULSE_TOKEN = (process.env.PULSE_TOKEN || '').trim();
-const DEFAULT_MODEL = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
-const FALLBACK_MODELS = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash'];
+const DEFAULT_MODEL = (process.env.GEMINI_MODEL || 'gemini-flash-latest').trim();
+const FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-3.5-flash', 'gemini-3.5-flash-lite'];
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
 const STARTED_AT = new Date();
 const MAX_RUNS = 100;
@@ -333,6 +334,7 @@ app.get('/health', (req, res) => {
     started_at: STARTED_AT.toISOString(),
     gemini_key_on_server: Boolean(SERVER_KEY),
     auth_required: Boolean(PULSE_TOKEN),
+    computer: computer.computerAvailable() && Boolean(PULSE_TOKEN),
     model: workingModel,
     public_url: publicUrl(),
   });
@@ -412,6 +414,8 @@ app.get('/api/tasks/:id', (req, res) => {
   if (!run) return res.status(404).json({ ok: false, error: 'Not found.' });
   res.json({ ok: true, run });
 });
+
+app.use('/api/computer', computer.router({ keyFor, token: PULSE_TOKEN }));
 
 app.use((req, res) => res.status(404).json({ ok: false, error: 'No such route.' }));
 
