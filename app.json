@@ -1,29 +1,27 @@
 {
   "expo": {
-    "name": "Hark Pro 5.1",
-    "slug": "pulse-os",
-    "version": "5.1.0",
+    "name": "Pulse OS",
+    "slug": "pulse-os-android",
+    "version": "5.2.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
-    "backgroundColor": "#04060E",
+    "backgroundColor": "#090C12",
     "newArchEnabled": false,
     "plugins": [
-      "./withHarkNativeOS.js"
+      "./withPulseNativeOS.js"
     ],
     "platforms": [
       "android"
     ],
     "splash": {
-      "image": "./assets/splash-icon.png",
-      "backgroundColor": "#04060E"
+      "backgroundColor": "#090C12"
     },
     "android": {
       "package": "com.pulseos.app",
-      "versionCode": 35,
+      "versionCode": 36,
       "newArchEnabled": false,
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#04060E"
+        "backgroundColor": "#090C12"
       },
       "permissions": [
         "android.permission.INTERNET",
@@ -31,6 +29,7 @@
         "android.permission.VIBRATE",
         "android.permission.RECORD_AUDIO",
         "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.READ_CONTACTS",
         "android.permission.QUERY_ALL_PACKAGES",
         "android.permission.REQUEST_INSTALL_PACKAGES",
         "android.permission.CAMERA",
@@ -46,7 +45,6 @@
         "android.permission.POST_NOTIFICATIONS"
       ],
       "softwareKeyboardLayoutMode": "resize"
-    },
-    "icon": "./assets/icon.png"
+    }
   }
 }

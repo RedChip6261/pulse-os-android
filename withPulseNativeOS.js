@@ -2,13 +2,13 @@ const { withAndroidManifest, withStringsXml, withMainApplication, withDangerousM
 const fs = require('fs');
 const path = require('path');
 
-const SERVICE_NAME = '.HarkAccessibilityService';
+const SERVICE_NAME = '.PulseAccessibilityService';
 const SERVICE_LABEL = 'Pulse OS Assistive Bridge';
-const SERVICE_DESC_KEY = 'hark_accessibility_service_description';
+const SERVICE_DESC_KEY = 'pulse_accessibility_service_description';
 const SERVICE_DESC_VALUE =
-  'Pulse OS Agentic & RAG Automation Bridge for launching apps, executing searches, auto-filling saved logins, reading screen context for RAG, and completing multi-step tasks.';
+  'Pulse OS Voice & Hands-Free Automation Bridge for launching apps, reading and managing emails, sending messages, scrolling, tapping, and controlling your device.';
 
-function withHarkAccessibilityManifest(config) {
+function withPulseAccessibilityManifest(config) {
   return withAndroidManifest(config, (config) => {
     const manifest = config.modResults.manifest;
 
@@ -19,9 +19,11 @@ function withHarkAccessibilityManifest(config) {
       }
     };
     ensurePerm('android.permission.INTERNET');
+    ensurePerm('android.permission.ACCESS_NETWORK_STATE');
     ensurePerm('android.permission.VIBRATE');
     ensurePerm('android.permission.RECORD_AUDIO');
     ensurePerm('android.permission.MODIFY_AUDIO_SETTINGS');
+    ensurePerm('android.permission.READ_CONTACTS');
     ensurePerm('android.permission.QUERY_ALL_PACKAGES');
     ensurePerm('android.permission.REQUEST_INSTALL_PACKAGES');
     ensurePerm('android.permission.CAMERA');
@@ -88,7 +90,8 @@ function withHarkAccessibilityManifest(config) {
 
     const ensureQueryIntent = (actionName, categoryName, schemeName) => {
       const exists = queriesBlock.intent.some(
-        (it) => it?.action?.[0]?.$?.['android:name'] === actionName &&
+        (it) =>
+          it?.action?.[0]?.$?.['android:name'] === actionName &&
           (!schemeName || it?.data?.[0]?.$?.['android:scheme'] === schemeName)
       );
       if (!exists) {
@@ -111,6 +114,8 @@ function withHarkAccessibilityManifest(config) {
     ensureQueryIntent('android.intent.action.TTS_SERVICE');
     ensureQueryIntent('android.intent.action.GET_CONTENT');
     ensureQueryIntent('android.intent.action.OPEN_DOCUMENT');
+    ensureQueryIntent('android.intent.action.SENDTO', null, 'mailto');
+    ensureQueryIntent('android.intent.action.SENDTO', null, 'smsto');
     ensureQueryIntent('android.intent.action.VIEW', null, 'https');
     ensureQueryIntent('android.intent.action.VIEW', null, 'http');
 
@@ -137,7 +142,7 @@ function withHarkAccessibilityManifest(config) {
           {
             $: {
               'android:name': 'android.accessibilityservice',
-              'android:resource': '@xml/hark_accessibility_config',
+              'android:resource': '@xml/pulse_accessibility_config',
             },
           },
         ],
@@ -148,7 +153,7 @@ function withHarkAccessibilityManifest(config) {
   });
 }
 
-function withHarkAccessibilityStrings(config) {
+function withPulseAccessibilityStrings(config) {
   return withStringsXml(config, (config) => {
     const strings = config.modResults.resources.string || [];
     if (!strings.some((s) => s?.$?.name === SERVICE_DESC_KEY)) {
@@ -159,37 +164,37 @@ function withHarkAccessibilityStrings(config) {
   });
 }
 
-function injectHarkPackageIntoMainApplication(src, pkgName) {
+function injectPulsePackageIntoMainApplication(src, pkgName) {
   let out = src;
-  const importLine = `import ${pkgName}.HarkBridgePackage`;
+  const importLine = `import ${pkgName}.PulseBridgePackage`;
   if (!out.includes(importLine) && !out.includes(`package ${pkgName}`)) {
     out = out.replace(/(package\s+[\w.]+\s*\n)/, `$1\n${importLine}\n`);
   }
-  if (!out.includes('HarkBridgePackage')) {
+  if (!out.includes('PulseBridgePackage')) {
     if (/PackageList\(this\)\.packages\.apply\s*\{/.test(out)) {
       out = out.replace(
         /PackageList\(this\)\.packages\.apply\s*\{/,
-        'PackageList(this).packages.apply {\n              add(HarkBridgePackage())',
+        'PackageList(this).packages.apply {\n              add(PulseBridgePackage())',
       );
     } else if (/PackageList\(this\)\.packages/.test(out)) {
       out = out.replace(
         /PackageList\(this\)\.packages/,
-        'PackageList(this).packages.apply { add(HarkBridgePackage()) }',
+        'PackageList(this).packages.apply { add(PulseBridgePackage()) }',
       );
     }
   }
   return out;
 }
 
-function withHarkMainApplicationPackage(config) {
+function withPulseMainApplicationPackage(config) {
   return withMainApplication(config, (config) => {
     const pkgName = config.android?.package || 'com.pulseos.app';
-    config.modResults.contents = injectHarkPackageIntoMainApplication(config.modResults.contents, pkgName);
+    config.modResults.contents = injectPulsePackageIntoMainApplication(config.modResults.contents, pkgName);
     return config;
   });
 }
 
-function withHarkKotlinFiles(config) {
+function withPulseKotlinFiles(config) {
   return withDangerousMod(config, [
     'android',
     async (config) => {
@@ -202,7 +207,7 @@ function withHarkKotlinFiles(config) {
       const xmlDir = path.join(androidRoot, 'app/src/main/res/xml');
       fs.mkdirSync(xmlDir, { recursive: true });
       fs.writeFileSync(
-        path.join(xmlDir, 'hark_accessibility_config.xml'),
+        path.join(xmlDir, 'pulse_accessibility_config.xml'),
         `<?xml version="1.0" encoding="utf-8"?>
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/${SERVICE_DESC_KEY}"
@@ -223,14 +228,14 @@ function withHarkKotlinFiles(config) {
       const mainAppKtPath = path.join(kotlinDir, 'MainApplication.kt');
       if (fs.existsSync(mainAppKtPath)) {
         const mainKt = fs.readFileSync(mainAppKtPath, 'utf8');
-        const updatedMainKt = injectHarkPackageIntoMainApplication(mainKt, packageName);
+        const updatedMainKt = injectPulsePackageIntoMainApplication(mainKt, packageName);
         if (updatedMainKt !== mainKt) {
           fs.writeFileSync(mainAppKtPath, updatedMainKt, 'utf8');
         }
       }
 
       fs.writeFileSync(
-        path.join(kotlinDir, 'HarkAccessibilityService.kt'),
+        path.join(kotlinDir, 'PulseAccessibilityService.kt'),
         `package ${packageName}
 
 import android.accessibilityservice.AccessibilityService
@@ -260,10 +265,10 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
-class HarkAccessibilityService : AccessibilityService() {
+class PulseAccessibilityService : AccessibilityService() {
     companion object {
         @Volatile
-        var instance: HarkAccessibilityService? = null
+        var instance: PulseAccessibilityService? = null
             private set
 
         @Volatile
@@ -332,10 +337,12 @@ class HarkAccessibilityService : AccessibilityService() {
             "chrome" to listOf("com.android.chrome"),
             "gmail" to listOf("com.google.android.gm"),
             "email" to listOf("com.google.android.gm"),
+            "mail" to listOf("com.google.android.gm"),
             "maps" to listOf("com.google.android.apps.maps"),
             "navigate" to listOf("com.google.android.apps.maps"),
             "phone" to listOf("com.google.android.dialer", "com.android.dialer"),
             "sms" to listOf("com.google.android.apps.messaging"),
+            "messages" to listOf("com.google.android.apps.messaging"),
             "calendar" to listOf("com.google.android.calendar"),
             "playstore" to listOf("com.android.vending"),
             "settings" to listOf("com.android.settings")
@@ -391,7 +398,7 @@ class HarkAccessibilityService : AccessibilityService() {
                 applyJsonToMemory(saved)
             }
         } catch (_: Exception) {}
-        recordStatus("Accessibility Bridge Connected", showToast = false)
+        recordStatus("Pulse OS Bridge Connected", showToast = false)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
@@ -585,7 +592,6 @@ class HarkAccessibilityService : AccessibilityService() {
         if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
             return true
         }
-        // Fallback: copy to clipboard and paste into focused node
         return try {
             val cm = applicationContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
             cm?.setPrimaryClip(ClipData.newPlainText("pulse_input", value))
@@ -639,6 +645,133 @@ class HarkAccessibilityService : AccessibilityService() {
             latch.await(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (_: Exception) {}
         return encoded
+    }
+
+    // ---- Email Automation (Read, Send, Delete in Gmail / Email Clients) ----
+
+    fun readVisibleEmailsSummary(): String {
+        val root = getActiveRoot() ?: return ""
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        val lines = mutableListOf<String>()
+        val h = screenHeight()
+        val seen = mutableSetOf<String>()
+        while (queue.isNotEmpty() && lines.size < 12) {
+            val n = queue.removeFirst()
+            if (n.isVisibleToUser && !n.isEditable) {
+                val r = Rect()
+                n.getBoundsInScreen(r)
+                if (r.centerY() in (h * 0.14).toInt()..(h * 0.90).toInt() && r.height() > 28) {
+                    val t = n.text?.toString()?.trim().orEmpty()
+                    val d = n.contentDescription?.toString()?.trim().orEmpty()
+                    val best = if (d.length > t.length) d else t
+                    if (best.length >= 8 && !best.equals("Search in mail", true) && !seen.contains(best)) {
+                        seen.add(best)
+                        lines.add(best.replace("\\n", " ").take(120))
+                    }
+                }
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+        return lines.joinToString("\\n")
+    }
+
+    fun deleteVisibleEmail(hint: String = ""): Boolean {
+        val deleteLabels = listOf("Delete", "Trash", "delete", "trash", "Archive", "Remove")
+        val btn = waitForMatchingNode(deleteLabels, 1200L)
+        if (btn != null && !btn.isEditable && performClickOrTap(btn)) {
+            recordStatus("Deleted email", showToast = true)
+            return true
+        }
+        // If in inbox list, swipe the first or matching email row left/right to archive/delete
+        val root = getActiveRoot() ?: return false
+        val w = screenWidth().toFloat()
+        val h = screenHeight().toFloat()
+        if (hint.isNotBlank()) {
+            val target = findNodeMultiTier(root, hint)
+            if (target != null) {
+                val r = Rect()
+                target.getBoundsInScreen(r)
+                if (!r.isEmpty) {
+                    return swipe(w * 0.80f, r.centerY().toFloat(), w * 0.15f, r.centerY().toFloat(), 240L)
+                }
+            }
+        }
+        return swipe(w * 0.80f, h * 0.28f, w * 0.15f, h * 0.28f, 240L)
+    }
+
+    fun sendVisibleEmail(): Boolean {
+        val sendLabels = listOf("Send", "send", "Send message")
+        val btn = waitForMatchingNode(sendLabels, 1500L)
+        if (btn != null && !btn.isEditable && performClickOrTap(btn)) {
+            recordStatus("Sent email", showToast = true)
+            return true
+        }
+        return false
+    }
+
+    // ---- WhatsApp / Messaging Workflow ----
+
+    fun runMessagingWorkflow(appKey: String, recipient: String, messageText: String, hasDirectDeepLink: Boolean) {
+        val mySeq = workflowSeq.incrementAndGet()
+        worker.execute {
+            try {
+                lastStepLogs.clear()
+                lastStatus = "running"
+                recordStatus("Opening \$appKey for messaging…", showToast = false)
+                waitForExternalAppWindow(5200L)
+                if (workflowSeq.get() != mySeq) return@execute
+                Thread.sleep(900)
+
+                if (hasDirectDeepLink) {
+                    val sendBtn = waitForMatchingNode(listOf("Send", "send", "iv_send", "send_button"), 2400L)
+                    if (sendBtn != null && !sendBtn.isEditable && performClickOrTap(sendBtn)) {
+                        lastStatus = "verified"
+                        lastCartVerified = true
+                        lastCartSummary = "Sent message via \$appKey"
+                        recordStatus(lastCartSummary, showToast = true)
+                        return@execute
+                    }
+                }
+
+                // Search for recipient in WhatsApp / Telegram
+                if (recipient.isNotBlank()) {
+                    val searchBtn = waitForMatchingNode(listOf("Search", "search", "menuitem_search", "Search…"), 1800L)
+                    if (searchBtn != null) {
+                        performClickOrTap(searchBtn)
+                        Thread.sleep(600)
+                    }
+                    val editNode = findEditableNode(getActiveRoot())
+                    if (editNode != null) {
+                        setNodeTextDirect(editNode, recipient)
+                        Thread.sleep(1000)
+                        clickFirstResultBelowHeader(recipient, minYRatio = 0.16f, maxYRatio = 0.60f)
+                        Thread.sleep(800)
+                    }
+                }
+
+                if (messageText.isNotBlank()) {
+                    val msgInput = waitForMatchingNode(listOf("Message", "Type a message", "entry", "chat_edit_text"), 1800L)
+                        ?: findEditableNode(getActiveRoot())
+                    if (msgInput != null) {
+                        setNodeTextDirect(msgInput, messageText)
+                        Thread.sleep(450)
+                        val sendBtn = waitForMatchingNode(listOf("Send", "send", "iv_send", "send_button"), 1400L)
+                        if (sendBtn != null && !sendBtn.isEditable) {
+                            performClickOrTap(sendBtn)
+                        }
+                    }
+                }
+
+                lastStatus = "verified"
+                lastCartVerified = true
+                lastCartSummary = "Message action completed in \$appKey"
+                recordStatus(lastCartSummary, showToast = true)
+            } catch (e: Exception) {
+                lastStatus = "error"
+                recordStatus("Messaging error: \${e.message}", showToast = false)
+            }
+        }
     }
 
     private fun verifyCartOrActionState(query: String): Pair<Boolean, String> {
@@ -712,7 +845,6 @@ class HarkAccessibilityService : AccessibilityService() {
                 if (workflowSeq.get() != mySeq) return@execute
                 Thread.sleep(800)
 
-                // 1. Check if app is asking for Login and auto-fill saved user login credentials
                 if (actionMode.equals("login", ignoreCase = true)) {
                     val parts = query.split("|")
                     val u = parts.getOrNull(0)?.trim().orEmpty()
@@ -742,7 +874,6 @@ class HarkAccessibilityService : AccessibilityService() {
                 val w = screenWidth().toFloat()
                 val h = screenHeight().toFloat()
 
-                // 2. Verify whether deep link actually landed on results; if not, locate search bar, type query, AND submit search
                 var searchSubmitted = false
                 if (usedDeepLink) {
                     Thread.sleep(1100)
@@ -787,7 +918,6 @@ class HarkAccessibilityService : AccessibilityService() {
                                 break
                             }
                         }
-                        // Fallback tap on standard top search bar region
                         val tapY = when (attempt) {
                             0 -> h * 0.11f
                             1 -> h * 0.16f
@@ -814,7 +944,6 @@ class HarkAccessibilityService : AccessibilityService() {
 
                 if (workflowSeq.get() != mySeq) return@execute
 
-                // 3. Complete the actual work inside the app based on app type
                 val lowerApp = appKey.lowercase()
                 val isEcommerceOrFood = lowerApp in listOf("blinkit", "zepto", "swiggy", "zomato", "meesho", "flipkart", "amazon") ||
                     actionMode.contains("order", true) || actionMode.contains("add", true) || actionMode.contains("buy", true)
@@ -987,10 +1116,8 @@ class HarkAccessibilityService : AccessibilityService() {
         editNode?.getBoundsInScreen(editRect)
         val minSuggestionY = if (!editRect.isEmpty) (editRect.bottom + 8) else (h * 0.15f).toInt()
 
-        // 1. Try native IME_ENTER action on the focused EditText
         pressImeEnterOnFocused()
 
-        // 2. Also look for an explicit Search / Submit icon button near the search bar (not the EditText itself)
         val searchBtnLabels = listOf("Search", "search_go_btn", "iv_search", "btn_search", "Go", "Submit", "search_button")
         for (lbl in searchBtnLabels) {
             val btn = findNodeMultiTier(root, lbl)
@@ -1006,7 +1133,6 @@ class HarkAccessibilityService : AccessibilityService() {
 
         Thread.sleep(500)
 
-        // 3. Check if we are still editing or if autocomplete suggestions are shown below the search bar
         val rootAfter = getActiveRoot() ?: return
         val stillEditing = findEditableNode(rootAfter) != null
         val queryWords = query.lowercase().split(" ").filter { it.length >= 2 }
@@ -1037,7 +1163,6 @@ class HarkAccessibilityService : AccessibilityService() {
             Thread.sleep(450)
         }
 
-        // 4. If the EditText is still focused (meaning IME_ENTER didn't submit), tap the keyboard's bottom-right Enter/Search key
         if (stillEditing || findEditableNode(getActiveRoot()) != null) {
             tapCoordinate(w * 0.91f, h * 0.90f, 75L)
             Thread.sleep(550)
@@ -1125,7 +1250,6 @@ class HarkAccessibilityService : AccessibilityService() {
     fun tapCoordinate(x: Float, y: Float, durationMs: Long = 75L): Boolean {
         val w = screenWidth().toFloat()
         val h = screenHeight().toFloat()
-        // Support both normalized (0..1) and pixel coordinates
         val px = if (x in 0.001f..1.0f && y in 0.001f..1.0f) x * w else x
         val py = if (x in 0.001f..1.0f && y in 0.001f..1.0f) y * h else y
         val clampedX = px.coerceIn(1f, w - 1f)
@@ -1214,12 +1338,10 @@ class HarkAccessibilityService : AccessibilityService() {
         return ok
     }
 
-
     fun selectPrimaryVisibleItem(hintText: String = ""): Boolean {
         val cleanHint = hintText.trim()
         val lowerHint = cleanHint.lowercase()
 
-        // Determine if user asked for a specific ordinal item (first, second, third, fourth, last)
         val ordinalIndex = when {
             lowerHint.contains("second") || lowerHint.contains("2nd") || lowerHint == "2" || lowerHint.contains("rendava") || cleanHint.contains("రెండవ") -> 1
             lowerHint.contains("third") || lowerHint.contains("3rd") || lowerHint == "3" || lowerHint.contains("moodava") || cleanHint.contains("మూడవ") -> 2
@@ -1239,7 +1361,7 @@ class HarkAccessibilityService : AccessibilityService() {
         val ignoreSet = setOf("back", "navigate up", "close", "cancel", "search", "clear", "home", "menu")
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
-        val candidates = mutableListOf<Triple<AccessibilityNodeInfo, Int, Int>>() // node, score, centerY
+        val candidates = mutableListOf<Triple<AccessibilityNodeInfo, Int, Int>>()
         while (queue.isNotEmpty()) {
             val n = queue.removeFirst()
             if (n.isVisibleToUser && !n.isEditable) {
@@ -1315,6 +1437,18 @@ class HarkAccessibilityService : AccessibilityService() {
                 res.put("action", "scroll_up")
                 res.put("ok", ok)
             }
+            lower.contains("scroll left") || lower.contains("swipe left") -> {
+                val ok = scrollDirection("left")
+                res.put("handled", true)
+                res.put("action", "scroll_left")
+                res.put("ok", ok)
+            }
+            lower.contains("scroll right") || lower.contains("swipe right") -> {
+                val ok = scrollDirection("right")
+                res.put("handled", true)
+                res.put("action", "scroll_right")
+                res.put("ok", ok)
+            }
             lower.startsWith("select") || lower == "click it" || lower == "open it" ||
             lower.contains("select chey") || raw.contains("సెలెక్ట్") || raw.contains("ఎంచుకో") -> {
                 val hint = lower.removePrefix("select it").removePrefix("select").removePrefix("click it").trim()
@@ -1374,38 +1508,35 @@ class HarkAccessibilityService : AccessibilityService() {
       );
 
       fs.writeFileSync(
-        path.join(kotlinDir, 'HarkBridgeModule.kt'),
+        path.join(kotlinDir, 'PulseBridgeModule.kt'),
         `package ${packageName}
 
 import android.Manifest
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.Typeface
-import android.graphics.pdf.PdfDocument
-import android.os.Bundle
-import android.os.Environment
-import android.os.Handler
-import android.os.Looper
-import android.provider.OpenableColumns
-import org.json.JSONObject
-import java.io.File
-import java.io.FileOutputStream
 import android.app.Activity
-import android.app.SearchManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Typeface
+import android.graphics.pdf.PdfDocument
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import android.provider.ContactsContract
+import android.provider.OpenableColumns
 import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -1415,8 +1546,11 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.facebook.react.bridge.*
 import com.facebook.react.modules.core.DeviceEventManagerModule
+import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
 
-class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
+class PulseBridgeModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext), ActivityEventListener {
 
     private var voicePromise: Promise? = null
@@ -1427,7 +1561,10 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     private var torchEnabled: Boolean = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private var speechRecognizer: SpeechRecognizer? = null
+    @Volatile
     private var continuousHandsFree: Boolean = false
+    @Volatile
+    private var pausedForTts: Boolean = false
     private var currentVoiceLang: String = "en-IN"
 
     init {
@@ -1444,12 +1581,12 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
         } catch (_: Exception) {}
     }
 
-    override fun getName(): String = "HarkBridge"
+    override fun getName(): String = "PulseBridge"
 
     @ReactMethod
     fun isAccessibilityEnabled(promise: Promise) {
         try {
-            if (HarkAccessibilityService.instance != null) {
+            if (PulseAccessibilityService.instance != null) {
                 promise.resolve(true)
                 return
             }
@@ -1460,7 +1597,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
             val myPkg = reactContext.packageName
             promise.resolve(enabledServices.contains(myPkg, ignoreCase = true))
         } catch (e: Exception) {
-            promise.resolve(HarkAccessibilityService.instance != null)
+            promise.resolve(PulseAccessibilityService.instance != null)
         }
     }
 
@@ -1517,7 +1654,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                 Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
             ) ?: ""
             val settingEnabled = enabledServices.contains(reactContext.packageName, ignoreCase = true)
-            val activeInstance = HarkAccessibilityService.instance != null
+            val activeInstance = PulseAccessibilityService.instance != null
 
             map.putInt("batteryPct", batteryPct)
             map.putBoolean("isCharging", isCharging)
@@ -1525,8 +1662,8 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
             map.putBoolean("torchOn", torchEnabled)
             map.putBoolean("accessibilityEnabled", activeInstance || settingEnabled)
             map.putBoolean("serviceConnected", activeInstance)
-            map.putString("lastStatus", HarkAccessibilityService.lastStatus)
-            map.putString("lastMessage", HarkAccessibilityService.lastMessage)
+            map.putString("lastStatus", PulseAccessibilityService.lastStatus)
+            map.putString("lastMessage", PulseAccessibilityService.lastMessage)
             promise.resolve(map)
         } catch (e: Exception) {
             promise.reject("DEVICE_STATUS_ERR", e.message)
@@ -1626,6 +1763,65 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun lookupContactPhone(nameQuery: String, promise: Promise) {
+        try {
+            val perm = ContextCompat.checkSelfPermission(reactContext, Manifest.permission.READ_CONTACTS)
+            if (perm != PackageManager.PERMISSION_GRANTED) {
+                currentActivity?.let { act ->
+                    ActivityCompat.requestPermissions(act, arrayOf(Manifest.permission.READ_CONTACTS), 9416)
+                }
+                val res = Arguments.createMap()
+                res.putBoolean("found", false)
+                res.putBoolean("needsPermission", true)
+                promise.resolve(res)
+                return
+            }
+            val clean = nameQuery.trim().lowercase()
+            val res = Arguments.createMap()
+            if (clean.isEmpty()) {
+                res.putBoolean("found", false)
+                promise.resolve(res)
+                return
+            }
+            val cr = reactContext.contentResolver
+            val projection = arrayOf(
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                ContactsContract.CommonDataKinds.Phone.NUMBER
+            )
+            var matchedName = ""
+            var matchedPhone = ""
+            cr.query(ContactsContract.CommonDataKinds.Phone.CONTENT_URI, projection, null, null, null)?.use { cursor ->
+                val nameIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
+                val numIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+                while (cursor.moveToNext()) {
+                    val cName = if (nameIdx >= 0) cursor.getString(nameIdx)?.trim() ?: "" else ""
+                    val cNum = if (numIdx >= 0) cursor.getString(numIdx)?.trim() ?: "" else ""
+                    if (cName.isNotEmpty() && cNum.isNotEmpty()) {
+                        val cl = cName.lowercase()
+                        if (cl == clean) {
+                            matchedName = cName
+                            matchedPhone = cNum
+                            break
+                        }
+                        if (matchedPhone.isEmpty() && (cl.contains(clean) || clean.contains(cl))) {
+                            matchedName = cName
+                            matchedPhone = cNum
+                        }
+                    }
+                }
+            }
+            res.putBoolean("found", matchedPhone.isNotEmpty())
+            res.putString("name", matchedName)
+            res.putString("phone", matchedPhone)
+            promise.resolve(res)
+        } catch (e: Exception) {
+            val res = Arguments.createMap()
+            res.putBoolean("found", false)
+            promise.resolve(res)
+        }
+    }
+
+    @ReactMethod
     fun dialPhone(phone: String, directCall: Boolean, promise: Promise) {
         try {
             val clean = phone.replace(Regex("[^0-9+]"), "")
@@ -1665,6 +1861,104 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun sendWhatsAppMessage(phoneOrName: String, message: String, promise: Promise) {
+        try {
+            val rawTarget = phoneOrName.trim()
+            val digitsOnly = rawTarget.replace(Regex("[^0-9+]"), "")
+            val isPhone = digitsOnly.length >= 7
+            if (isPhone) {
+                var formatted = digitsOnly.replace("+", "")
+                if (formatted.length == 10 && formatted.first() in '6'..'9') {
+                    formatted = "91\$formatted"
+                }
+                val encMsg = Uri.encode(message)
+                val uri = Uri.parse("whatsapp://send?phone=\$formatted&text=\$encMsg")
+                val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                reactContext.startActivity(intent)
+                PulseAccessibilityService.instance?.runMessagingWorkflow("whatsapp", formatted, message, true)
+                promise.resolve(true)
+                return
+            }
+            // Launch WhatsApp and automate search + send
+            val pm = reactContext.packageManager
+            val launchIntent = pm.getLaunchIntentForPackage("com.whatsapp")
+                ?: pm.getLaunchIntentForPackage("com.whatsapp.w4b")
+            if (launchIntent != null) {
+                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                reactContext.startActivity(launchIntent)
+                PulseAccessibilityService.instance?.runMessagingWorkflow("whatsapp", rawTarget, message, false)
+                promise.resolve(true)
+            } else {
+                promise.resolve(false)
+            }
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun composeEmail(to: String, subject: String, body: String, autoSend: Boolean, promise: Promise) {
+        try {
+            val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:")).apply {
+                if (to.isNotBlank()) putExtra(Intent.EXTRA_EMAIL, arrayOf(to.trim()))
+                if (subject.isNotBlank()) putExtra(Intent.EXTRA_SUBJECT, subject.trim())
+                if (body.isNotBlank()) putExtra(Intent.EXTRA_TEXT, body.trim())
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            try {
+                intent.setPackage("com.google.android.gm")
+                reactContext.startActivity(intent)
+            } catch (_: Exception) {
+                intent.setPackage(null)
+                val chooser = Intent.createChooser(intent, "Send Email").apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                reactContext.startActivity(chooser)
+            }
+            if (autoSend) {
+                mainHandler.postDelayed({
+                    PulseAccessibilityService.instance?.sendVisibleEmail()
+                }, 1800L)
+            }
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun readVisibleEmails(promise: Promise) {
+        try {
+            val summary = PulseAccessibilityService.instance?.readVisibleEmailsSummary() ?: ""
+            promise.resolve(summary)
+        } catch (e: Exception) {
+            promise.resolve("")
+        }
+    }
+
+    @ReactMethod
+    fun deleteVisibleEmail(hint: String?, promise: Promise) {
+        try {
+            val ok = PulseAccessibilityService.instance?.deleteVisibleEmail(hint ?: "") ?: false
+            promise.resolve(ok)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun sendVisibleEmail(promise: Promise) {
+        try {
+            val ok = PulseAccessibilityService.instance?.sendVisibleEmail() ?: false
+            promise.resolve(ok)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
     fun shareText(text: String, title: String?, promise: Promise) {
         try {
             val sendIntent = Intent(Intent.ACTION_SEND).apply {
@@ -1685,7 +1979,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun syncUserLoginData(jsonStr: String, promise: Promise) {
         try {
-            HarkAccessibilityService.updateLoginDataFromJson(reactContext, jsonStr)
+            PulseAccessibilityService.updateLoginDataFromJson(reactContext, jsonStr)
             promise.resolve(true)
         } catch (e: Exception) {
             promise.resolve(false)
@@ -1695,15 +1989,15 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun getAutomationResult(promise: Promise) {
         val map = Arguments.createMap()
-        map.putString("status", HarkAccessibilityService.lastStatus)
-        map.putString("message", HarkAccessibilityService.lastMessage)
-        map.putBoolean("cartVerified", HarkAccessibilityService.lastCartVerified)
-        map.putString("cartSummary", HarkAccessibilityService.lastCartSummary)
-        map.putString("screenshot", HarkAccessibilityService.lastScreenshotBase64)
-        map.putString("screenDump", HarkAccessibilityService.lastScreenTextDump)
-        map.putDouble("ts", HarkAccessibilityService.lastUpdatedTs.toDouble())
+        map.putString("status", PulseAccessibilityService.lastStatus)
+        map.putString("message", PulseAccessibilityService.lastMessage)
+        map.putBoolean("cartVerified", PulseAccessibilityService.lastCartVerified)
+        map.putString("cartSummary", PulseAccessibilityService.lastCartSummary)
+        map.putString("screenshot", PulseAccessibilityService.lastScreenshotBase64)
+        map.putString("screenDump", PulseAccessibilityService.lastScreenTextDump)
+        map.putDouble("ts", PulseAccessibilityService.lastUpdatedTs.toDouble())
         val logsArr = Arguments.createArray()
-        for (l in HarkAccessibilityService.lastStepLogs) {
+        for (l in PulseAccessibilityService.lastStepLogs) {
             logsArr.pushString(l)
         }
         map.putArray("stepLogs", logsArr)
@@ -1712,7 +2006,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun captureScreenVerification(promise: Promise) {
-        val svc = HarkAccessibilityService.instance
+        val svc = PulseAccessibilityService.instance
         if (svc == null) {
             promise.resolve("")
             return
@@ -1726,7 +2020,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun dumpScreenNodes(promise: Promise) {
         try {
-            val dump = HarkAccessibilityService.instance?.dumpScreenSummary(100) ?: ""
+            val dump = PulseAccessibilityService.instance?.dumpScreenSummary(100) ?: ""
             promise.resolve(dump)
         } catch (e: Exception) {
             promise.resolve("")
@@ -1734,9 +2028,36 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun pauseHandsFreeListening(promise: Promise) {
+        pausedForTts = true
+        mainHandler.post {
+            try {
+                speechRecognizer?.cancel()
+            } catch (_: Exception) {}
+            promise.resolve(true)
+        }
+    }
+
+    @ReactMethod
+    fun resumeHandsFreeListening(promise: Promise) {
+        pausedForTts = false
+        if (!continuousHandsFree) {
+            promise.resolve(false)
+            return
+        }
+        mainHandler.postDelayed({
+            if (continuousHandsFree && !pausedForTts) {
+                startContinuousRecognizerInternal()
+            }
+        }, 350L)
+        promise.resolve(true)
+    }
+
+    @ReactMethod
     fun startHandsFreeListening(lang: String?, promise: Promise) {
         currentVoiceLang = if (lang.isNullOrBlank()) "en-IN" else lang
         continuousHandsFree = true
+        pausedForTts = false
 
         val perm = ContextCompat.checkSelfPermission(reactContext, Manifest.permission.RECORD_AUDIO)
         if (perm != PackageManager.PERMISSION_GRANTED) {
@@ -1746,7 +2067,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
             val map = Arguments.createMap()
             map.putString("status", "permission_requested")
             map.putBoolean("handsFree", true)
-            emitVoiceEvent("HarkVoiceStatus", map)
+            emitVoiceEvent("PulseVoiceStatus", map)
             promise.resolve(false)
             return
         }
@@ -1765,7 +2086,15 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    private fun destroyRecognizer() {
+        try {
+            speechRecognizer?.destroy()
+        } catch (_: Exception) {}
+        speechRecognizer = null
+    }
+
     private fun startContinuousRecognizerInternal() {
+        if (!continuousHandsFree || pausedForTts) return
         try {
             if (speechRecognizer == null) {
                 speechRecognizer = SpeechRecognizer.createSpeechRecognizer(reactContext.applicationContext)
@@ -1774,7 +2103,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                         val map = Arguments.createMap()
                         map.putString("status", "listening")
                         map.putBoolean("handsFree", continuousHandsFree)
-                        emitVoiceEvent("HarkVoiceStatus", map)
+                        emitVoiceEvent("PulseVoiceStatus", map)
                     }
                     override fun onBeginningOfSpeech() {}
                     override fun onRmsChanged(rmsdB: Float) {}
@@ -1785,13 +2114,19 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                         map.putString("status", "idle")
                         map.putInt("errorCode", error)
                         map.putBoolean("handsFree", continuousHandsFree)
-                        emitVoiceEvent("HarkVoiceStatus", map)
-                        // If continuous hands-free is on and error is not fatal permission denial, restart listening
-                        if (continuousHandsFree && error != SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
-                            mainHandler.postDelayed({
-                                if (continuousHandsFree) startContinuousRecognizerInternal()
-                            }, 900L)
+                        emitVoiceEvent("PulseVoiceStatus", map)
+                        if (!continuousHandsFree || pausedForTts) return
+                        if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                            continuousHandsFree = false
+                            return
                         }
+                        if (error == SpeechRecognizer.ERROR_CLIENT || error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
+                            destroyRecognizer()
+                        }
+                        val delay = if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) 450L else 900L
+                        mainHandler.postDelayed({
+                            if (continuousHandsFree && !pausedForTts) startContinuousRecognizerInternal()
+                        }, delay)
                     }
                     override fun onResults(results: Bundle?) {
                         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
@@ -1800,12 +2135,12 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                             val map = Arguments.createMap()
                             map.putString("transcript", best)
                             map.putBoolean("handsFree", continuousHandsFree)
-                            emitVoiceEvent("HarkVoiceResult", map)
+                            emitVoiceEvent("PulseVoiceResult", map)
                         }
-                        if (continuousHandsFree) {
+                        if (continuousHandsFree && !pausedForTts) {
                             mainHandler.postDelayed({
-                                if (continuousHandsFree) startContinuousRecognizerInternal()
-                            }, 1200L)
+                                if (continuousHandsFree && !pausedForTts) startContinuousRecognizerInternal()
+                            }, 900L)
                         }
                     }
                     override fun onPartialResults(partialResults: Bundle?) {
@@ -1814,7 +2149,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                         if (part.isNotEmpty()) {
                             val map = Arguments.createMap()
                             map.putString("partial", part)
-                            emitVoiceEvent("HarkVoicePartial", map)
+                            emitVoiceEvent("PulseVoicePartial", map)
                         }
                     }
                     override fun onEvent(eventType: Int, params: Bundle?) {}
@@ -1824,26 +2159,31 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
             val recIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, currentVoiceLang)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, currentVoiceLang)
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2200L)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1400L)
             }
             speechRecognizer?.startListening(recIntent)
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+            destroyRecognizer()
+        }
     }
 
     @ReactMethod
     fun stopHandsFreeListening(promise: Promise) {
         continuousHandsFree = false
+        pausedForTts = false
         mainHandler.post {
             try {
                 speechRecognizer?.stopListening()
                 speechRecognizer?.cancel()
+                destroyRecognizer()
                 val map = Arguments.createMap()
                 map.putString("status", "stopped")
                 map.putBoolean("handsFree", false)
-                emitVoiceEvent("HarkVoiceStatus", map)
+                emitVoiceEvent("PulseVoiceStatus", map)
                 promise.resolve(true)
             } catch (_: Exception) {
                 promise.resolve(false)
@@ -1863,7 +2203,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (lang.isNullOrBlank()) "en-IN" else lang)
-                putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak naturally in Telugu or English…")
+                putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak naturally to Pulse OS…")
             }
             activity.startActivityForResult(intent, VOICE_REQ_CODE)
         } catch (e: Exception) {
@@ -1891,7 +2231,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                     else -> type = "*/*"
                 }
             }
-            activity.startActivityForResult(Intent.createChooser(intent, "Select Media or File"), PICK_MEDIA_REQ_CODE)
+            activity.startActivityForResult(Intent.createChooser(intent, "Select File"), PICK_MEDIA_REQ_CODE)
         } catch (e: Exception) {
             mediaPromise = null
             promise.reject("PICK_ERR", e.message)
@@ -2050,7 +2390,6 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    // Only use direct URI deep-links for apps whose URI schemes reliably open search results
     private fun tryReliableDeepLinkIntent(pkg: String, appKey: String, query: String): Boolean {
         if (query.isBlank()) return false
         val enc = Uri.encode(query.trim())
@@ -2085,7 +2424,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
             val pm = reactContext.packageManager
 
             val candidates = mutableListOf<String>()
-            HarkAccessibilityService.KNOWN_APP_PACKAGES[lower]?.let { candidates.addAll(it) }
+            PulseAccessibilityService.KNOWN_APP_PACKAGES[lower]?.let { candidates.addAll(it) }
             if (clean.contains(".")) candidates.add(clean)
 
             var launched = false
@@ -2142,7 +2481,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
 
             if (launched && cleanQuery.isNotEmpty()) {
                 val mode = if (cleanQuery.contains("|")) "login" else "order"
-                HarkAccessibilityService.instance?.runAutonomousAppWorkflow(resolvedKey, cleanQuery, mode, usedDeepLink)
+                PulseAccessibilityService.instance?.runAutonomousAppWorkflow(resolvedKey, cleanQuery, mode, usedDeepLink)
             }
             promise.resolve(launched)
         } catch (e: Exception) {
@@ -2152,7 +2491,7 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun runAutonomousWorkflow(appKey: String, query: String, mode: String, promise: Promise) {
-        val svc = HarkAccessibilityService.instance
+        val svc = PulseAccessibilityService.instance
         if (svc == null) {
             promise.resolve(false)
             return
@@ -2163,19 +2502,19 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun clickByText(text: String, promise: Promise) {
-        val ok = HarkAccessibilityService.instance?.clickNodeByText(text) ?: false
+        val ok = PulseAccessibilityService.instance?.clickNodeByText(text) ?: false
         promise.resolve(ok)
     }
 
     @ReactMethod
     fun tapCoordinate(x: Double, y: Double, promise: Promise) {
-        val svcOk = HarkAccessibilityService.instance?.tapCoordinate(x.toFloat(), y.toFloat()) ?: false
+        val svcOk = PulseAccessibilityService.instance?.tapCoordinate(x.toFloat(), y.toFloat()) ?: false
         promise.resolve(svcOk)
     }
 
     @ReactMethod
     fun swipeScreen(startX: Double, startY: Double, endX: Double, endY: Double, promise: Promise) {
-        val svcOk = HarkAccessibilityService.instance?.swipe(
+        val svcOk = PulseAccessibilityService.instance?.swipe(
             startX.toFloat(),
             startY.toFloat(),
             endX.toFloat(),
@@ -2186,39 +2525,38 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun scrollScreen(direction: String, promise: Promise) {
-        val svcOk = HarkAccessibilityService.instance?.scrollDirection(direction) ?: false
+        val svcOk = PulseAccessibilityService.instance?.scrollDirection(direction) ?: false
         promise.resolve(svcOk)
     }
 
     @ReactMethod
     fun inputText(targetLabel: String?, text: String, promise: Promise) {
-        val ok = HarkAccessibilityService.instance?.inputTextIntoNode(targetLabel, text) ?: false
+        val ok = PulseAccessibilityService.instance?.inputTextIntoNode(targetLabel, text) ?: false
         promise.resolve(ok)
     }
 
-
     @ReactMethod
     fun selectBestVisibleNode(hintText: String, promise: Promise) {
-        val ok = HarkAccessibilityService.instance?.selectPrimaryVisibleItem(hintText) ?: false
+        val ok = PulseAccessibilityService.instance?.selectPrimaryVisibleItem(hintText) ?: false
         promise.resolve(ok)
     }
 
     @ReactMethod
     fun proceedAction(promise: Promise) {
-        val ok = HarkAccessibilityService.instance?.proceedOnScreen() ?: false
+        val ok = PulseAccessibilityService.instance?.proceedOnScreen() ?: false
         promise.resolve(ok)
     }
 
     @ReactMethod
     fun performInAppSearch(query: String, promise: Promise) {
-        val ok = HarkAccessibilityService.instance?.inputTextIntoNode("Search", query) ?: false
+        val ok = PulseAccessibilityService.instance?.inputTextIntoNode("Search", query) ?: false
         promise.resolve(ok)
     }
 
     @ReactMethod
     fun executeVoiceCommand(spokenText: String, promise: Promise) {
         try {
-            val svc = HarkAccessibilityService.instance
+            val svc = PulseAccessibilityService.instance
             if (svc == null) {
                 val out = JSONObject()
                 out.put("handled", false)
@@ -2300,11 +2638,11 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                 var y = margin + 20f
                 canvas.drawText(title.take(54), margin, y, titlePaint)
                 y += 22f
-                canvas.drawText(subtitle.ifBlank { "Generated by Hark Pro 5.0 OmniCore" }.take(78), margin, y, subPaint)
+                canvas.drawText(subtitle.ifBlank { "Generated by Pulse OS" }.take(78), margin, y, subPaint)
                 y += 24f
                 for ((lineText, isHead) in lines) {
                     if (y > pageHeight - 56f) {
-                        canvas.drawText("Hark Pro 5.0 OmniCore  •  Page " + pageNumber, margin, pageHeight - 24f, footerPaint)
+                        canvas.drawText("Pulse OS  •  Page " + pageNumber, margin, pageHeight - 24f, footerPaint)
                         pdfDoc.finishPage(page)
                         pageNumber++
                         pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, pageNumber).create()
@@ -2323,11 +2661,11 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
                         y += 16f
                     }
                 }
-                canvas.drawText("Hark Pro 5.0 OmniCore  •  Page " + pageNumber, margin, pageHeight - 24f, footerPaint)
+                canvas.drawText("Pulse OS  •  Page " + pageNumber, margin, pageHeight - 24f, footerPaint)
                 pdfDoc.finishPage(page)
                 val outDir = reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: reactContext.cacheDir
                 if (!outDir.exists()) outDir.mkdirs()
-                val safeSlug = title.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(30).ifBlank { "hark_report" }
+                val safeSlug = title.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(30).ifBlank { "pulse_report" }
                 val outFile = File(outDir, safeSlug + "_" + System.currentTimeMillis() + ".pdf")
                 FileOutputStream(outFile).use { fos -> pdfDoc.writeTo(fos) }
                 pdfDoc.close()
@@ -2349,14 +2687,14 @@ class HarkBridgeModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun globalAction(action: String, promise: Promise) {
-        val ok = HarkAccessibilityService.instance?.runGlobal(action) ?: false
+        val ok = PulseAccessibilityService.instance?.runGlobal(action) ?: false
         promise.resolve(ok)
     }
 }
 
-class HarkBridgePackage : com.facebook.react.ReactPackage {
+class PulseBridgePackage : com.facebook.react.ReactPackage {
     override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> {
-        return listOf(HarkBridgeModule(reactContext))
+        return listOf(PulseBridgeModule(reactContext))
     }
 
     override fun createViewManagers(reactContext: ReactApplicationContext): List<com.facebook.react.uimanager.ViewManager<*, *>> {
@@ -2367,7 +2705,6 @@ class HarkBridgePackage : com.facebook.react.ReactPackage {
         'utf8',
       );
 
-      // 1. Optimize gradle-wrapper.properties: use lighter -bin.zip instead of -all.zip
       const wrapperPropsPath = path.join(androidRoot, 'gradle/wrapper/gradle-wrapper.properties');
       if (fs.existsSync(wrapperPropsPath)) {
         let props = fs.readFileSync(wrapperPropsPath, 'utf8');
@@ -2378,7 +2715,6 @@ class HarkBridgePackage : com.facebook.react.ReactPackage {
         fs.writeFileSync(wrapperPropsPath, props, 'utf8');
       }
 
-      // 2. Patch android/gradlew to pre-fetch the wrapper zip with curl retry before running exec "$JAVACMD" "$@" once
       const gradlewPath = path.join(androidRoot, 'gradlew');
       if (fs.existsSync(gradlewPath)) {
         let gw = fs.readFileSync(gradlewPath, 'utf8');
@@ -2414,10 +2750,10 @@ class HarkBridgePackage : com.facebook.react.ReactPackage {
   ]);
 }
 
-module.exports = function withHarkNativeOS(config) {
-  config = withHarkAccessibilityManifest(config);
-  config = withHarkAccessibilityStrings(config);
-  config = withHarkMainApplicationPackage(config);
-  config = withHarkKotlinFiles(config);
+module.exports = function withPulseNativeOS(config) {
+  config = withPulseAccessibilityManifest(config);
+  config = withPulseAccessibilityStrings(config);
+  config = withPulseMainApplicationPackage(config);
+  config = withPulseKotlinFiles(config);
   return config;
 };
