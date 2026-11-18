@@ -1,6 +1,6 @@
 /*
- * Pulse OS cloud backend v2.0 (Fast Gemini 2.5 Flash + Multimodal + Action Extraction + Source Verification)
- * ----------------------------------------------------------------------------------------------------------
+ * Pulse OS cloud backend v3.0 (Gemini flash-lite first + cloud computer with live MJPEG stream and SSE events)
+ * ------------------------------------------------------------------------------------------------------------
  * Routes:
  *   GET  /health          -> liveness + config check
  *   GET  /api/info        -> server info, available task types
@@ -9,6 +9,11 @@
  *   POST /api/task        -> Run one named task (echo, budget, plan, summarize, verify_source, extract_actions)
  *   GET  /api/tasks       -> Recent task runs
  *   GET  /api/tasks/:id   -> Single task run
+ *   /api/computer/*       -> cloud browser (see computer.js): /stream (MJPEG), /events (SSE), /state, /task, /act ...
+ *
+ * Auth: when PULSE_TOKEN is set every /api call needs "Authorization: Bearer <token>" or "?token=<token>"
+ * (the query form exists for <img> and EventSource clients, which cannot set headers).
+ * The server never runs shell commands or code sent by the app.
  */
 
 'use strict';
@@ -20,23 +25,20 @@ const crypto = require('crypto');
 const PORT = Number(process.env.PORT) || 3000;
 const SERVER_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const PULSE_TOKEN = (process.env.PULSE_TOKEN || '').trim();
-const DEFAULT_MODEL = (process.env.GEMINI_MODEL || 'gemini-flash-latest').trim();
-const FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-3.5-flash', 'gemini-3.5-flash-lite'];
+// Fastest first. Never gemini-2.x / 1.x (2.5 reroutes on Dec 1 2026) and never pro models.
+const FORBIDDEN_MODEL = /(gemini-(1|2)\.|(^|-)pro($|-)|gemini-pro)/i;
+const ENV_MODEL = (process.env.GEMINI_MODEL || '').trim();
+const DEFAULT_MODEL = ENV_MODEL && !FORBIDDEN_MODEL.test(ENV_MODEL) ? ENV_MODEL : 'gemini-flash-lite-latest';
+const FALLBACK_MODELS = ['gemini-flash-lite-latest', 'gemini-flash-latest', 'gemini-3.5-flash-lite', 'gemini-3.5-flash'];
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
 const STARTED_AT = new Date();
 const MAX_RUNS = 100;
 
 const SYSTEM_PROMPT = [
-  'You are Pulse, an advanced multimodal AI assistant and device automation agent inside the Pulse OS mobile app.',
-  'Core capabilities:',
-  '1. DEVICE AUTOMATION AGENT: You help the user interact with installed mobile apps (such as Meesho, WhatsApp, Instagram, Telegram, Free Fire, Flipkart, YouTube, Maps), navigate UI elements, input user-specified data, and execute shopping or messaging workflows ONLY upon explicit user confirmation.',
-  '2. MULTIMODAL AI ASSISTANT:',
-  '   - For images: Describe contents accurately, extract visible text (OCR), detect objects, and answer specific questions about visual details.',
-  '   - For documents and files: Read uploaded content, extract key facts, and provide concise, structured summaries.',
-  '   - For video links: Extract/analyze transcript or video context, summarize core content, and answer questions precisely.',
-  '3. SMART CONTEXT MEMORY & ACTION EXTRACTION: Personalize responses using the provided user memory profile, and automatically extract actionable tasks, calendar events, and reminders from text, files, images, or videos.',
-  '4. QUICK-VERIFY SOURCE CHECKING: Cross-check extracted facts, URLs, prices, and dates for internal consistency and flag any unverified claims.',
-  'Always provide structured, precise, and practical answers without unnecessary filler.',
+  'You are Pulse, a fast, capable personal assistant in the Pulse OS phone app (user in India, times in IST unless told otherwise).',
+  'Answer first, in as few words as the question needs; then only the detail that helps. No filler, no repeating the question.',
+  'Images: describe, read text, answer the question. Files: key facts first. Never invent facts, prices or dates; say when unsure.',
+  'Use the memory profile quietly to personalise; do not recite it.',
   'You MUST reply with ONLY a single strict JSON object with these keys:',
   '"direct_response": string (clear, structured answer without filler);',
   '"proactive_checklist": array of 2 to 5 short strings (follow-up actions);',
@@ -109,11 +111,10 @@ function parsePulseReply(raw) {
 
 let workingModel = DEFAULT_MODEL;
 
+// Lite models: near-off thinking. Other flash models: low. Retried without it if a model rejects the field.
 function thinkingConfigFor(model) {
-  if (/gemini-2\.5/i.test(model) && !/pro/i.test(model)) {
-    return { thinkingBudget: 0 };
-  }
-  return undefined;
+  if (FORBIDDEN_MODEL.test(model)) return undefined;
+  return /lite/i.test(model) ? { thinkingLevel: 'minimal' } : { thinkingLevel: 'low' };
 }
 
 async function gemini(apiKey, { system, contents, json = true, temperature = 0.4, timeoutMs = 12000 }) {
@@ -146,7 +147,7 @@ async function gemini(apiKey, { system, contents, json = true, temperature = 0.4
     }
   };
 
-  const candidates = [workingModel, ...FALLBACK_MODELS.filter((m) => m !== workingModel)];
+  const candidates = [workingModel, ...FALLBACK_MODELS.filter((m) => m !== workingModel)].filter((m) => !FORBIDDEN_MODEL.test(m));
   let lastData = null;
   let lastStatus = 502;
 
@@ -318,7 +319,7 @@ function safeEqual(a, b) {
 app.use('/api', (req, res, next) => {
   if (!PULSE_TOKEN) return next();
   const header = String(req.get('authorization') || '');
-  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : String(req.query.token || '').trim();
   if (token && safeEqual(token, PULSE_TOKEN)) return next();
   res.status(401).json({ ok: false, error: 'Missing or wrong token.' });
 });
@@ -329,13 +330,15 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     service: 'pulse-os-backend',
-    version: '2.0.0',
+    version: '3.0.0',
     uptime_s: Math.round(process.uptime()),
     started_at: STARTED_AT.toISOString(),
     gemini_key_on_server: Boolean(SERVER_KEY),
     auth_required: Boolean(PULSE_TOKEN),
     computer: computer.computerAvailable() && Boolean(PULSE_TOKEN),
+    computer_features: ['stream', 'events', 'wake'],
     model: workingModel,
+    agent_models: computer.agentModels(),
     public_url: publicUrl(),
   });
 });
@@ -427,6 +430,6 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Pulse OS backend v2.0 listening on :${PORT}`);
+  console.log(`Pulse OS backend v3.0 listening on :${PORT}`);
   console.log(`Public URL: ${publicUrl()}`);
 });
