@@ -27,6 +27,7 @@ import { StatusBar } from 'expo-status-bar';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Speech from 'expo-speech';
 import * as FileSystem from 'expo-file-system';
+import ComputerScreen from './ComputerScreen';
 
 import {
   buildAgenticRagContext,
@@ -71,7 +72,7 @@ const DEFAULT_MODEL = 'gemini-3.5-flash';
 const FAST_MODEL = 'gemini-3.5-flash-lite';
 const DEFAULT_UPDATE_REPO = 'RedChip6261/pulse-os-android';
 
-type Tab = 'PULSE' | 'VOICE' | 'APPS';
+type Tab = 'PULSE' | 'VOICE' | 'APPS' | 'COMPUTER';
 
 type Settings = {
   apiKey: string;
@@ -856,15 +857,19 @@ export default function App() {
         <View style={[styles.fill, tab !== 'APPS' && styles.hidden]}>
           <AppsScreen installedApps={installedApps} />
         </View>
+        <View style={[styles.fill, tab !== 'COMPUTER' && styles.hidden]}>
+          <ComputerScreen active={tab === 'COMPUTER'} geminiKey={settings.apiKey} />
+        </View>
       </View>
 
-      {/* Clean 3-Tab Bottom Navigation */}
+      {/* Bottom Navigation */}
       <View style={styles.tabBar}>
         {(
           [
             { id: 'PULSE', label: 'Pulse' },
             { id: 'VOICE', label: 'Hands-Free' },
             { id: 'APPS', label: 'Apps' },
+            { id: 'COMPUTER', label: 'Computer' },
           ] as { id: Tab; label: string }[]
         ).map((t) => {
           const active = tab === t.id;

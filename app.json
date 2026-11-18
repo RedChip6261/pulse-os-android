@@ -7,13 +7,12 @@
     "userInterfaceStyle": "dark",
     "backgroundColor": "#090C12",
     "newArchEnabled": false,
-    "plugins": [
-      "./withPulseNativeOS.js"
-    ],
     "platforms": [
       "android"
     ],
     "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
       "backgroundColor": "#090C12"
     },
     "android": {
@@ -21,6 +20,7 @@
       "versionCode": 36,
       "newArchEnabled": false,
       "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#090C12"
       },
       "permissions": [
@@ -45,6 +45,7 @@
         "android.permission.POST_NOTIFICATIONS"
       ],
       "softwareKeyboardLayoutMode": "resize"
-    }
+    },
+    "icon": "./assets/icon.png"
   }
 }

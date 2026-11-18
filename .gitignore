@@ -5,3 +5,4 @@ dist/
 *.apk
 .DS_Store
 package-lock.json
+server/.browser-profile/
