@@ -7,6 +7,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Animated,
+  Easing,
   Image,
   KeyboardAvoidingView,
   Platform,
@@ -19,6 +21,7 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { WebView, WebViewMessageEvent } from 'react-native-webview';
+import { buildTypeAndSubmitJs, BUY_GUARD_RE, DomSnapshot, OBSERVE_DOM_JS, parseHumanGoal } from './src/computerAgent';
 
 const STORAGE = 'pulseos.computer.v1';
 export const DEFAULT_COMPUTER_URL = 'https://scaling-space-telegram-jjg94w99g6pj255vv-3000.app.github.dev';
@@ -35,6 +38,7 @@ const C = {
   text: '#F8FAFC',
   muted: '#8B9BB4',
   accent: '#6366F1',
+  cyan: '#38BDF8',
   good: '#10B981',
   warn: '#F59E0B',
   danger: '#EF4444',
@@ -108,9 +112,18 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
   const [localUrl, setLocalUrl] = useState('https://www.google.com');
   const [localTitle, setLocalTitle] = useState('Google');
   const [localLoading, setLocalLoading] = useState(false);
+  const [localRunning, setLocalRunning] = useState(false);
+  const [localStatusLine, setLocalStatusLine] = useState('Ready · Watching live browser');
+  const [planExpanded, setPlanExpanded] = useState(false);
   const [localAnswer, setLocalAnswer] = useState('');
   const [localSteps, setLocalSteps] = useState<Step[]>([]);
   const localWebRef = useRef<WebView>(null);
+  const cursorXY = useRef(new Animated.ValueXY({ x: 180, y: 260 })).current;
+  const cursorOpacity = useRef(new Animated.Value(0)).current;
+  const cursorPulse = useRef(new Animated.Value(1)).current;
+  const agentAbortRef = useRef(false);
+  const domWaiterRef = useRef<((snap: DomSnapshot) => void) | null>(null);
+  const loadWaiterRef = useRef<(() => void) | null>(null);
 
   const [cfg, setCfg] = useState<Cfg>({ url: DEFAULT_COMPUTER_URL, token: '' });
   const [setupOpen, setSetupOpen] = useState(false);
@@ -339,65 +352,124 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
     setLocalSteps((prev) => [...prev.slice(-14), { n: prev.length + 1, at: new Date().toISOString(), action, detail }]);
   };
 
-  const runLocalComputerTask = (rawGoal: string) => {
-    const clauses = rawGoal
-      .split(/\s*(?:;|,|\bthen\b|\band\s+then\b)\s*/i)
-      .map((c) => c.trim())
-      .filter(Boolean);
+  const glideCursor = (nx: number, ny: number, tap = true): Promise<void> =>
+    new Promise((resolve) => {
+      const tx = Math.max(16, Math.min(boxRef.current.w - 28, nx * boxRef.current.w - 14));
+      const ty = Math.max(16, Math.min(boxRef.current.h - 28, ny * boxRef.current.h - 14));
+      Animated.timing(cursorOpacity, { toValue: 1, duration: 140, useNativeDriver: true }).start();
+      Animated.timing(cursorXY, {
+        toValue: { x: tx, y: ty },
+        duration: 380,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start(() => {
+        if (!tap) return resolve();
+        Animated.sequence([
+          Animated.timing(cursorPulse, { toValue: 1.45, duration: 130, useNativeDriver: true }),
+          Animated.timing(cursorPulse, { toValue: 1, duration: 130, useNativeDriver: true }),
+        ]).start(() => resolve());
+      });
+    });
+
+  const hideCursor = () => Animated.timing(cursorOpacity, { toValue: 0, duration: 250, useNativeDriver: true }).start();
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+  const waitForLoad = (ms = 7500) =>
+    new Promise<void>((resolve) => {
+      const t = setTimeout(() => { loadWaiterRef.current = null; resolve(); }, ms);
+      loadWaiterRef.current = () => { clearTimeout(t); loadWaiterRef.current = null; resolve(); };
+    });
+  const observeDom = (ms = 3000) =>
+    new Promise<DomSnapshot | null>((resolve) => {
+      const t = setTimeout(() => { domWaiterRef.current = null; resolve(null); }, ms);
+      domWaiterRef.current = (snap) => { clearTimeout(t); domWaiterRef.current = null; resolve(snap); };
+      localWebRef.current?.injectJavaScript(OBSERVE_DOM_JS);
+    });
+
+  const runLocalComputerTask = async (rawGoal: string) => {
+    agentAbortRef.current = false;
+    setLocalRunning(true);
     setLocalAnswer('');
-    for (const clause of clauses) {
-      const lower = clause.toLowerCase();
-      if (/^(?:open|go\s+to|visit|navigate\s+to)\s+(.+)$/i.test(clause)) {
-        const target = clause.replace(/^(?:open|go\s+to|visit|navigate\s+to)\s+/i, '').trim();
-        const url = toBrowserUrl(target);
-        setLocalUrl(url);
-        addLocalStep('open', url);
-      } else if (/^(?:search(?:\s+for)?|google|find)\s+(.+)$/i.test(clause)) {
-        const q = clause.replace(/^(?:search(?:\s+for)?|google|find)\s+/i, '').trim();
-        const url = `https://www.google.com/search?q=${encodeURIComponent(q)}`;
-        setLocalUrl(url);
-        addLocalStep('search', q);
-      } else if (/^scroll\s+up/i.test(lower)) {
-        localWebRef.current?.injectJavaScript('window.scrollBy({top:-500,behavior:"smooth"});true;');
-        addLocalStep('scroll', 'up');
-      } else if (/^scroll\s+down/i.test(lower)) {
-        localWebRef.current?.injectJavaScript('window.scrollBy({top:500,behavior:"smooth"});true;');
-        addLocalStep('scroll', 'down');
-      } else if (/^(?:go\s+)?back$/i.test(lower)) {
-        localWebRef.current?.goBack();
-        addLocalStep('back', '');
-      } else if (/^(?:reload|refresh)$/i.test(lower)) {
-        localWebRef.current?.reload();
-        addLocalStep('reload', '');
-      } else if (/^(?:read|summari[sz]e)(?:\s+page)?$/i.test(lower)) {
-        localWebRef.current?.injectJavaScript(
-          'window.ReactNativeWebView.postMessage(JSON.stringify({t:"read",title:document.title,text:(document.body?document.body.innerText:"").slice(0,900)}));true;',
-        );
-        addLocalStep('read', 'Extracting page text');
-      } else if (/^(?:click|tap|press)\s+(.+)$/i.test(clause)) {
-        const target = clause.replace(/^(?:click|tap|press)\s+/i, '').trim().toLowerCase();
-        localWebRef.current?.injectJavaScript(`
-          (function(){
-            var els = Array.from(document.querySelectorAll('a,button,input[type=submit],[role=button]'));
-            var m = els.find(function(e){ return (e.innerText||e.value||e.getAttribute('aria-label')||'').toLowerCase().includes(${JSON.stringify(target)}); });
-            if(m){ m.click(); window.ReactNativeWebView.postMessage(JSON.stringify({t:'clicked',label:m.innerText||${JSON.stringify(target)}})); }
-          })(); true;
-        `);
-        addLocalStep('click', target);
-      } else {
-        const url = toBrowserUrl(clause);
-        setLocalUrl(url);
-        addLocalStep('open', url);
+    setLocalSteps([]);
+    const parsed = parseHumanGoal(rawGoal);
+    try {
+      setLocalStatusLine(`Opening ${parsed.startUrl.replace(/^https?:\/\/(www\.|m\.)?/, '')}…`);
+      addLocalStep('navigate', parsed.startUrl);
+      const loadP = waitForLoad(7500);
+      setLocalUrl(parsed.startUrl);
+      await loadP;
+      await sleep(500);
+      if (agentAbortRef.current) return;
+
+      if (parsed.searchQuery) {
+        const snap = await observeDom();
+        if (agentAbortRef.current) return;
+        const box = snap?.inputs.find((i) => /search|q\b|query|keyword|find/i.test(`${i.name} ${i.placeholder} ${i.type}`)) || snap?.inputs[0];
+        if (box) {
+          setLocalStatusLine(`Moving to "${box.placeholder || 'search box'}"…`);
+          await glideCursor(box.x, box.y, true);
+          if (agentAbortRef.current) return;
+          setLocalStatusLine(`Typing "${parsed.searchQuery}"…`);
+          addLocalStep('type', `"${parsed.searchQuery}" into ${box.placeholder || 'search box'}`);
+          const afterType = waitForLoad(7500);
+          localWebRef.current?.injectJavaScript(buildTypeAndSubmitJs(box.id, parsed.searchQuery));
+          await afterType;
+          await sleep(600);
+          if (agentAbortRef.current) return;
+        }
       }
+
+      setLocalStatusLine('Scanning page results…');
+      addLocalStep('scroll', 'Scanning visible items on page');
+      await glideCursor(0.5, 0.65, false);
+      localWebRef.current?.injectJavaScript('window.scrollBy({top: 380, behavior: "smooth"}); true;');
+      await sleep(750);
+      if (agentAbortRef.current) return;
+
+      let snap = await observeDom();
+      if (agentAbortRef.current) return;
+
+      if (parsed.wantsOpenResult && snap?.links.length) {
+        const qWords = parsed.clickHint.toLowerCase().split(/\s+/).filter((w) => w.length >= 3);
+        const bestLink =
+          snap.links.find((l) => !BUY_GUARD_RE.test(l.text) && qWords.some((w) => l.text.toLowerCase().includes(w))) ||
+          snap.links.find((l) => !BUY_GUARD_RE.test(l.text) && l.text.length > 10);
+        if (bestLink) {
+          setLocalStatusLine(`Opening "${bestLink.text.slice(0, 32)}…"`);
+          await glideCursor(bestLink.x, bestLink.y, true);
+          if (agentAbortRef.current) return;
+          addLocalStep('click', bestLink.text.slice(0, 60));
+          const clickLoad = waitForLoad(6500);
+          localWebRef.current?.injectJavaScript(`(function(){ var a=document.querySelector('[data-pulse-lk="${bestLink.id}"]'); if(a) a.click(); })(); true;`);
+          await clickLoad;
+          await sleep(500);
+          snap = await observeDom();
+        }
+      }
+
+      const summaryLines = (snap?.text || '').split('\n').map((l) => l.trim()).filter((l) => l.length >= 12).slice(0, 8);
+      setLocalAnswer(`**${snap?.title || localTitle}**\n${summaryLines.join('\n')}\n\n_(Completed on-device — nothing was bought or submitted.)_`);
+      setLocalStatusLine('Done · Watching live browser');
+      addLocalStep('done', snap?.title || 'Finished');
+    } finally {
+      hideCursor();
+      setLocalRunning(false);
     }
+  };
+
+  const stopLocalAgent = () => {
+    agentAbortRef.current = true;
+    hideCursor();
+    setLocalRunning(false);
+    setLocalStatusLine('Stopped');
+    addLocalStep('stopped', 'Stopped by user');
   };
 
   const startTask = () => {
     const g = goal.trim();
     if (!g) return;
     if (engine === 'local') {
-      runLocalComputerTask(g);
       setGoal('');
+      runLocalComputerTask(g);
       return;
     }
     run(async () => {
@@ -427,8 +499,13 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
   const onLocalMessage = (e: WebViewMessageEvent) => {
     try {
       const m = JSON.parse(e.nativeEvent.data);
-      if (m.t === 'read') setLocalAnswer(`${m.title}\n\n${m.text}`.trim());
-      else if (m.t === 'clicked') addLocalStep('clicked', m.label || 'element');
+      if (m.t === 'dom' && domWaiterRef.current) {
+        domWaiterRef.current(m as DomSnapshot);
+      } else if (m.t === 'read') {
+        setLocalAnswer(`${m.title}\n\n${m.text}`.trim());
+      } else if (m.t === 'clicked') {
+        addLocalStep('clicked', m.label || 'element');
+      }
     } catch {}
   };
 
@@ -524,12 +601,16 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
             onSubmitEditing={startTask}
           />
           <View style={[s.row, { gap: 8, marginTop: 8 }]}>
-            <Pressable onPress={startTask} disabled={busy || (engine === 'cloud' && (!cfg.token || running))} style={[s.btn, { flex: 1 }, (busy || (engine === 'cloud' && running)) && { opacity: 0.5 }]}>
-              <Text style={s.btnText}>Run task</Text>
+            <Pressable
+              onPress={startTask}
+              disabled={busy || localRunning || (engine === 'cloud' && (!cfg.token || running))}
+              style={[s.btn, { flex: 1 }, (busy || localRunning || (engine === 'cloud' && running)) && { opacity: 0.5 }]}
+            >
+              <Text style={s.btnText}>{localRunning ? 'Working…' : 'Run task'}</Text>
             </Pressable>
-            {engine === 'local' && (
-              <Pressable onPress={() => runLocalComputerTask('read page')} style={[s.btn, { backgroundColor: C.surface2, borderWidth: 1, borderColor: C.border }]}>
-                <Text style={s.btnText}>Read page</Text>
+            {engine === 'local' && localRunning && (
+              <Pressable onPress={stopLocalAgent} style={[s.btn, { backgroundColor: C.danger }]}>
+                <Text style={s.btnText}>Stop</Text>
               </Pressable>
             )}
             {engine === 'cloud' && running && (
@@ -539,6 +620,30 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
             )}
           </View>
         </View>
+
+        {engine === 'local' && (localRunning || localSteps.length > 0) && (
+          <Pressable onPress={() => setPlanExpanded((v) => !v)} style={[s.card, { borderColor: localRunning ? C.accent : C.border, paddingVertical: 10 }]}>
+            <View style={s.rowBetween}>
+              <View style={[s.row, { flex: 1 }]}>
+                <View style={[s.dot, { backgroundColor: localRunning ? C.cyan : C.good }]} />
+                <Text style={[s.body, { fontSize: 13, fontWeight: '600', flex: 1 }]} numberOfLines={1}>
+                  {localStatusLine}
+                </Text>
+              </View>
+              <Text style={{ color: C.cyan, fontSize: 12, fontWeight: '700' }}>{planExpanded ? 'Hide Plan ▲' : `Plan (${localSteps.length}) ▼`}</Text>
+            </View>
+            {planExpanded && (
+              <View style={{ marginTop: 8, gap: 4 }}>
+                {localSteps.map((x) => (
+                  <Text key={x.n} style={s.step} numberOfLines={2}>
+                    <Text style={{ color: C.good }}>✓ </Text>
+                    <Text style={{ color: C.accent, fontWeight: '700' }}>{x.action}</Text> {x.detail}
+                  </Text>
+                ))}
+              </View>
+            )}
+          </Pressable>
+        )}
 
         {engine === 'local' && !!localAnswer && (
           <View style={[s.card, { borderColor: C.good }]}>
@@ -677,7 +782,10 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
               source={{ uri: localUrl }}
               onMessage={onLocalMessage}
               onLoadStart={() => setLocalLoading(true)}
-              onLoadEnd={() => setLocalLoading(false)}
+              onLoadEnd={() => {
+                setLocalLoading(false);
+                loadWaiterRef.current?.();
+              }}
               onNavigationStateChange={(nav) => {
                 if (nav.url) setLocalUrl(nav.url);
                 if (nav.title) setLocalTitle(nav.title);
@@ -734,6 +842,20 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
             <ActivityIndicator style={s.busy} color={C.accent} />
           )}
           {tapFx && <View pointerEvents="none" style={[s.tapFx, { left: tapFx.x * boxRef.current.w - 14, top: tapFx.y * boxRef.current.h - 14 }]} />}
+          {engine === 'local' && (
+            <Animated.View
+              pointerEvents="none"
+              style={[
+                s.glassCursor,
+                {
+                  opacity: cursorOpacity,
+                  transform: [{ translateX: cursorXY.x }, { translateY: cursorXY.y }, { scale: cursorPulse }],
+                },
+              ]}
+            >
+              <View style={s.glassCursorCore} />
+            </Animated.View>
+          )}
         </View>
         {!!(engine === 'local' ? localTitle : st?.title) && (
           <Text style={s.muted} numberOfLines={1}>
@@ -833,4 +955,28 @@ const s = StyleSheet.create({
   busy: { position: 'absolute', top: 10, right: 10 },
   step: { color: C.muted, fontSize: 12, marginTop: 3 },
   tapFx: { position: 'absolute', width: 28, height: 28, borderRadius: 14, borderWidth: 2, borderColor: C.accent, backgroundColor: 'rgba(99,102,241,0.25)' },
+  glassCursor: {
+    position: 'absolute',
+    left: 0,
+    top: 0,
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: 'rgba(56, 189, 248, 0.28)',
+    borderWidth: 2,
+    borderColor: 'rgba(248, 250, 252, 0.92)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#38BDF8',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.75,
+    shadowRadius: 8,
+    elevation: 6,
+  },
+  glassCursorCore: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: '#38BDF8',
+  },
 });
