@@ -67,8 +67,8 @@ const STORAGE_SETTINGS = 'pulseos.settings.v3';
 const STORAGE_CONVOS = 'pulseos.convos.v2';
 const STORAGE_USER_AUTH = 'pulseos.user_auth.v2';
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
-const DEFAULT_MODEL = 'gemini-2.5-flash';
-const FAST_MODEL = 'gemini-2.5-flash-lite';
+const DEFAULT_MODEL = 'gemini-3.5-flash';
+const FAST_MODEL = 'gemini-3.5-flash-lite';
 const DEFAULT_UPDATE_REPO = 'RedChip6261/pulse-os-android';
 
 type Tab = 'PULSE' | 'VOICE' | 'APPS';
@@ -483,11 +483,41 @@ async function executePulseIntent(
 /* ------------------------------------------------------------------ */
 
 const FALLBACK_MODELS = [
-  'gemini-2.5-flash',
-  'gemini-2.0-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.5-flash',
   'gemini-flash-latest',
+  'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
 ];
+
+async function discoverAvailableGeminiModel(apiKey: string): Promise<string | null> {
+  try {
+    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models', {
+      headers: { 'x-goog-api-key': apiKey },
+    });
+    if (!res.ok) return null;
+    const json: any = await res.json();
+    const models: any[] = Array.isArray(json?.models) ? json.models : [];
+    const usable = models
+      .filter((m) => Array.isArray(m?.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent'))
+      .map((m) => String(m?.name || '').replace(/^models\//, ''))
+      .filter(Boolean);
+    if (usable.length === 0) return null;
+    const prefs = [
+      (n: string) => /gemini-3\.5.*flash-lite/i.test(n),
+      (n: string) => /gemini-3\.5.*flash/i.test(n),
+      (n: string) => /flash-lite/i.test(n),
+      (n: string) => /flash/i.test(n),
+    ];
+    for (const pred of prefs) {
+      const match = usable.find(pred);
+      if (match) return match;
+    }
+    return usable[0];
+  } catch {
+    return null;
+  }
+}
 
 function streamGeminiOnce(
   apiKey: string,
@@ -599,7 +629,7 @@ async function callGeminiChat(
   });
 
   const chain: string[] = [];
-  if (model && !/1\.5|^gemini-pro$/i.test(model)) chain.push(model);
+  if (model && !/1\.5|2\.0|2\.5|^gemini-pro$/i.test(model)) chain.push(model);
   for (const fb of FALLBACK_MODELS) {
     if (!chain.includes(fb)) chain.push(fb);
   }
@@ -615,6 +645,13 @@ async function callGeminiChat(
     if (res.status === 0 && lastErr === 'Network error') {
       throw new Error('No internet connection.');
     }
+  }
+
+  const discovered = await discoverAvailableGeminiModel(cleanKey);
+  if (discovered && !chain.includes(discovered)) {
+    const res = await streamGeminiOnce(cleanKey, discovered, body, onPartial);
+    if (res.ok) return res.text;
+    if (res.error) lastErr = res.error;
   }
   throw new Error(lastErr);
 }
