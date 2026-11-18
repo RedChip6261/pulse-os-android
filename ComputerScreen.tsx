@@ -1,14 +1,14 @@
 /*
- * Pulse OS cloud computer screen.
- * Shows the Codespace's own Chrome browser live, lets you tap and type on it,
- * and lets a Gemini agent run tasks on it while your phone does something else.
+ * Pulse OS cloud computer screen (v3).
+ * Shows the Codespace's own Chrome browser as a live MJPEG stream (react-native-webview <img>), follows the
+ * agent through Server-Sent Events (XHR streaming), and lets you tap / swipe / type on the page.
+ * Falls back to the old screenshot + state polling when the server is older.
  */
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
   KeyboardAvoidingView,
-  LayoutChangeEvent,
   Platform,
   Pressable,
   ScrollView,
@@ -18,10 +18,14 @@ import {
   View,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { WebView, WebViewMessageEvent } from 'react-native-webview';
 
 const STORAGE = 'pulseos.computer.v1';
 export const DEFAULT_COMPUTER_URL = 'https://scaling-space-telegram-jjg94w99g6pj255vv-3000.app.github.dev';
-const SCREEN_RATIO = 860 / 412; // server viewport height / width
+const VIEW_W = 412;
+const VIEW_H = 860;
+const STREAM_WIDTH = 618; // 1.5x the viewport: sharp on a 1080p screen, still light on mobile data
+const STREAM_QUALITY = 55;
 
 const C = {
   bg: '#090C12',
@@ -51,6 +55,7 @@ type ComputerState = {
   browser: boolean;
 };
 type Cfg = { url: string; token: string };
+type Mode = 'unknown' | 'stream' | 'legacy';
 
 function normalizeUrl(raw: string): string {
   const s = raw.trim().replace(/\/+$/, '');
@@ -60,6 +65,35 @@ function normalizeUrl(raw: string): string {
   return `https://${s}`;
 }
 
+/** The live screen page inside the WebView: one <img> fed by the MJPEG stream, plus tap/swipe capture. */
+function streamHtml(src: string): string {
+  return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<style>html,body{margin:0;padding:0;height:100%;background:#000;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
+img{position:absolute;inset:0;width:100%;height:100%;object-fit:fill;display:block;-webkit-user-drag:none}</style></head>
+<body><img id="s" draggable="false" alt=""><script>
+(function(){
+  var img=document.getElementById('s'), SRC=${JSON.stringify(src)}, tries=0, live=false;
+  function post(o){ try{ window.ReactNativeWebView.postMessage(JSON.stringify(o)); }catch(e){} }
+  function load(){ live=false; img.src = SRC + '&r=' + Date.now(); }
+  img.onload=function(){ tries=0; if(!live){ live=true; post({t:'live'}); } };
+  img.onerror=function(){ post({t:'err'}); tries++; setTimeout(load, Math.min(6000, 600*tries)); };
+  var sx=0, sy=0, st=0, ly=0, moved=false;
+  document.addEventListener('touchstart', function(e){ var t=e.touches[0]; sx=t.clientX; sy=t.clientY; ly=sy; st=Date.now(); moved=false; }, {passive:true});
+  document.addEventListener('touchmove', function(e){
+    var t=e.touches[0]; var dy=ly-t.clientY;
+    if(Math.abs(t.clientY-sy)>12 || Math.abs(t.clientX-sx)>12) moved=true;
+    if(moved && Math.abs(dy)>24){ post({t:'scroll', dy: Math.round(dy * ${VIEW_H} / window.innerHeight * 1.6)}); ly=t.clientY; }
+  }, {passive:true});
+  document.addEventListener('touchend', function(e){
+    if(moved || Date.now()-st>600) return;
+    post({t:'tap', x: sx/window.innerWidth, y: sy/window.innerHeight});
+  }, {passive:true});
+  document.addEventListener('visibilitychange', function(){ if(!document.hidden) load(); });
+  load();
+})();
+</script></body></html>`;
+}
+
 export default function ComputerScreen({ active, geminiKey }: { active: boolean; geminiKey: string }) {
   const [cfg, setCfg] = useState<Cfg>({ url: DEFAULT_COMPUTER_URL, token: '' });
   const [setupOpen, setSetupOpen] = useState(false);
@@ -67,15 +101,19 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
   const [st, setSt] = useState<ComputerState | null>(null);
   const [conn, setConn] = useState<'unknown' | 'ok' | 'error'>('unknown');
   const [connMsg, setConnMsg] = useState('');
+  const [mode, setMode] = useState<Mode>('unknown');
+  const [streamLive, setStreamLive] = useState(false);
+  const [streamKey, setStreamKey] = useState(0);
   const [frame, setFrame] = useState(0);
   const [shownFrame, setShownFrame] = useState(0);
-  const [box, setBox] = useState({ w: 1, h: 1 });
   const [goal, setGoal] = useState('');
   const [addr, setAddr] = useState('');
   const [typed, setTyped] = useState('');
   const [reply, setReply] = useState('');
   const [busy, setBusy] = useState(false);
-  const failCount = useRef(0);
+  const [tapFx, setTapFx] = useState<{ x: number; y: number; k: number } | null>(null);
+  const [screenTouch, setScreenTouch] = useState(false); // stops the page ScrollView stealing swipes from the live screen
+  const boxRef = useRef({ w: 1, h: 1 });
 
   useEffect(() => {
     AsyncStorage.getItem(STORAGE)
@@ -95,6 +133,7 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
   const saveCfg = useCallback((next: Cfg) => {
     const c = { url: normalizeUrl(next.url), token: next.token.trim() };
     setCfg(c);
+    setMode('unknown');
     AsyncStorage.setItem(STORAGE, JSON.stringify(c)).catch(() => undefined);
   }, []);
 
@@ -128,11 +167,102 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
     [cfg.url, headers],
   );
 
-  // Poll state while the tab is open (and keep polling while a task runs).
+  // Detect server features once per config: new servers stream, old ones get polled.
   useEffect(() => {
-    if (!loaded || !cfg.token) return;
-    const running = st?.status === 'running' || st?.status === 'waiting';
+    if (!loaded || !cfg.token || mode !== 'unknown') return;
+    let alive = true;
+    fetch(`${cfg.url}/health`)
+      .then((r) => r.json())
+      .then((h) => {
+        if (!alive) return;
+        setMode(Array.isArray(h?.computer_features) && h.computer_features.includes('stream') ? 'stream' : 'legacy');
+      })
+      .catch((e) => {
+        if (!alive) return;
+        setConn('error');
+        setConnMsg(`Can't reach the server: ${String(e?.message || e)}. Start your Codespace, then come back.`);
+        setTimeout(() => alive && setMode('unknown'), 5000);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [loaded, cfg.url, cfg.token, mode]);
+
+  const running = st?.status === 'running' || st?.status === 'waiting';
+
+  // State via Server-Sent Events over XHR streaming (EventSource can't send headers in RN).
+  useEffect(() => {
+    if (mode !== 'stream' || !cfg.token) return;
     if (!active && !running) return;
+    let alive = true;
+    let xhr: XMLHttpRequest | null = null;
+    let retry: any = null;
+    let backoff = 800;
+    const connect = () => {
+      if (!alive) return;
+      const x = new XMLHttpRequest();
+      xhr = x;
+      let seen = 0;
+      let buf = '';
+      x.open('GET', `${cfg.url}/api/computer/events`);
+      x.setRequestHeader('Authorization', `Bearer ${cfg.token}`);
+      x.setRequestHeader('Accept', 'text/event-stream');
+      x.onprogress = () => {
+        if (x.status !== 200) return;
+        const chunk = x.responseText.slice(seen);
+        seen = x.responseText.length;
+        buf += chunk;
+        const blocks = buf.split('\n\n');
+        buf = blocks.pop() || '';
+        for (const b of blocks) {
+          const data = b
+            .split('\n')
+            .filter((l) => l.startsWith('data:'))
+            .map((l) => l.slice(5).trim())
+            .join('\n');
+          if (!data) continue;
+          try {
+            setSt(JSON.parse(data));
+            setConn('ok');
+            setConnMsg('');
+            backoff = 800;
+          } catch {}
+        }
+        // Recycle the connection before responseText grows large.
+        if (seen > 2_000_000) x.abort();
+      };
+      const again = () => {
+        if (!alive) return;
+        if (x.status === 401) {
+          setConn('error');
+          setConnMsg('Wrong token. Check Setup.');
+          return;
+        }
+        retry = setTimeout(connect, backoff);
+        backoff = Math.min(6000, backoff * 1.7);
+      };
+      x.onerror = () => {
+        setConn((c) => (c === 'ok' ? 'ok' : 'error'));
+        again();
+      };
+      x.onload = again; // server closed the stream
+      x.onabort = () => alive && (retry = setTimeout(connect, 100));
+      x.send();
+    };
+    connect();
+    return () => {
+      alive = false;
+      clearTimeout(retry);
+      if (xhr) {
+        xhr.onabort = null;
+        xhr.abort();
+      }
+    };
+  }, [mode, active, running, cfg.url, cfg.token]);
+
+  // Legacy servers: poll /state and screenshots like before.
+  useEffect(() => {
+    if (mode !== 'legacy' || !cfg.token || (!active && !running)) return;
     let alive = true;
     const tick = async () => {
       try {
@@ -141,45 +271,33 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
         setSt(s);
         setConn('ok');
         setConnMsg('');
-        failCount.current = 0;
       } catch (e: any) {
         if (!alive) return;
-        failCount.current += 1;
-        if (failCount.current >= 2) {
-          setConn('error');
-          setConnMsg(String(e?.message || e));
-        }
+        setConn('error');
+        setConnMsg(String(e?.message || e));
       }
     };
     tick();
-    const id = setInterval(tick, 1200);
+    const id = setInterval(tick, 1500);
+    const id2 = active ? setInterval(() => setFrame((f) => f + 1), 1000) : null;
     return () => {
       alive = false;
       clearInterval(id);
+      if (id2) clearInterval(id2);
     };
-  }, [active, loaded, cfg.token, call, st?.status]);
+  }, [mode, active, running, cfg.token, call]);
 
-  // Refresh the screen image.
-  useEffect(() => {
-    if (!active || !cfg.token || conn !== 'ok' || !st?.browser) return;
-    const id = setInterval(() => setFrame((f) => f + 1), 900);
-    return () => clearInterval(id);
-  }, [active, cfg.token, conn, st?.browser]);
-
-  const run = useCallback(
-    async (fn: () => Promise<any>) => {
-      setBusy(true);
-      try {
-        await fn();
-        setFrame((f) => f + 1);
-      } catch (e: any) {
-        setConnMsg(String(e?.message || e));
-      } finally {
-        setBusy(false);
-      }
-    },
-    [],
-  );
+  const run = useCallback(async (fn: () => Promise<any>, quiet = false) => {
+    if (!quiet) setBusy(true);
+    try {
+      await fn();
+      setFrame((f) => f + 1);
+    } catch (e: any) {
+      setConnMsg(String(e?.message || e));
+    } finally {
+      if (!quiet) setBusy(false);
+    }
+  }, []);
 
   const startTask = () => {
     const g = goal.trim();
@@ -190,12 +308,32 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
     });
   };
 
-  const onLayout = (e: LayoutChangeEvent) => setBox({ w: e.nativeEvent.layout.width, h: e.nativeEvent.layout.height });
-
-  const onTap = (e: any) => {
-    const { locationX, locationY } = e.nativeEvent;
-    run(() => call('/act', { type: 'tap', x: locationX / box.w, y: locationY / box.h }));
+  const tapAt = (x: number, y: number) => {
+    setTapFx({ x, y, k: Date.now() });
+    run(() => call('/act', { type: 'tap', x, y }), true);
   };
+
+  const onStreamMessage = (e: WebViewMessageEvent) => {
+    let m: any;
+    try {
+      m = JSON.parse(e.nativeEvent.data);
+    } catch {
+      return;
+    }
+    if (m.t === 'live') setStreamLive(true);
+    else if (m.t === 'err') setStreamLive(false);
+    else if (m.t === 'tap') tapAt(Number(m.x), Number(m.y));
+    else if (m.t === 'scroll') run(() => call('/act', { type: 'scroll', dy: Number(m.dy) }), true);
+  };
+
+  const streamSrc = `${cfg.url}/api/computer/stream?token=${encodeURIComponent(cfg.token)}&w=${STREAM_WIDTH}&q=${STREAM_QUALITY}`;
+  const html = useMemo(() => streamHtml(streamSrc), [streamSrc]);
+
+  useEffect(() => {
+    if (!tapFx) return;
+    const t = setTimeout(() => setTapFx(null), 350);
+    return () => clearTimeout(t);
+  }, [tapFx]);
 
   if (!loaded) {
     return (
@@ -205,8 +343,7 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
     );
   }
 
-  const statusColor =
-    conn === 'error' ? C.danger : st?.status === 'running' ? C.accent : st?.status === 'waiting' ? C.warn : conn === 'ok' ? C.good : C.muted;
+  const statusColor = conn === 'error' ? C.danger : st?.status === 'running' ? C.accent : st?.status === 'waiting' ? C.warn : conn === 'ok' ? C.good : C.muted;
   const statusText =
     conn === 'error'
       ? 'Not connected'
@@ -223,11 +360,12 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
                 : st.browser
                   ? 'Ready'
                   : 'Asleep';
-  const imgUri = `${cfg.url}/api/computer/screen.jpg?f=${frame}`;
+  const showScreen = !!cfg.token && conn === 'ok' && !!st?.browser;
+  const legacyUri = `${cfg.url}/api/computer/screen.jpg?f=${frame}`;
 
   return (
     <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-      <ScrollView contentContainerStyle={s.wrap} keyboardShouldPersistTaps="handled">
+      <ScrollView contentContainerStyle={s.wrap} keyboardShouldPersistTaps="handled" scrollEnabled={!screenTouch}>
         <View style={s.rowBetween}>
           <View style={s.row}>
             <View style={[s.dot, { backgroundColor: statusColor }]} />
@@ -246,14 +384,12 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
               saveCfg(c);
               setSetupOpen(false);
               setConn('unknown');
-              failCount.current = 0;
             }}
           />
         )}
 
         {!!connMsg && <Text style={s.error}>{connMsg}</Text>}
 
-        {/* Task box */}
         <View style={s.card}>
           <TextInput
             value={goal}
@@ -265,28 +401,22 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
             onSubmitEditing={startTask}
           />
           <View style={[s.row, { gap: 8, marginTop: 8 }]}>
-            <Pressable onPress={startTask} disabled={busy || !cfg.token} style={[s.btn, { flex: 1 }]}>
+            <Pressable onPress={startTask} disabled={busy || !cfg.token || running} style={[s.btn, { flex: 1 }, (busy || running) && { opacity: 0.5 }]}>
               <Text style={s.btnText}>Run task</Text>
             </Pressable>
-            {(st?.status === 'running' || st?.status === 'waiting') && (
+            {running && (
               <Pressable onPress={() => run(() => call('/stop', {}))} style={[s.btn, { backgroundColor: C.danger }]}>
                 <Text style={s.btnText}>Stop</Text>
               </Pressable>
             )}
           </View>
+          <Text style={s.mutedSmall}>The agent never types passwords, OTPs, PINs or card numbers, and asks before any pay / order / book / send / delete.</Text>
         </View>
 
-        {/* Agent question */}
         {st?.status === 'waiting' && !!st.question && (
           <View style={[s.card, { borderColor: C.warn }]}>
             <Text style={s.body}>{st.question}</Text>
-            <TextInput
-              value={reply}
-              onChangeText={setReply}
-              placeholder="Your answer"
-              placeholderTextColor={C.muted}
-              style={[s.input, { marginTop: 8 }]}
-            />
+            <TextInput value={reply} onChangeText={setReply} placeholder="Your answer" placeholderTextColor={C.muted} style={[s.input, { marginTop: 8 }]} />
             <View style={[s.row, { gap: 8, marginTop: 8 }]}>
               <Pressable
                 onPress={() =>
@@ -314,16 +444,21 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
           </View>
         )}
 
-        {/* Final answer */}
         {st?.status === 'done' && !!st.answer && (
           <View style={[s.card, { borderColor: C.good }]}>
-            <Text style={s.body}>{st.answer}</Text>
+            <Text selectable style={s.body}>
+              {st.answer}
+            </Text>
+          </View>
+        )}
+        {st?.status === 'error' && !!st.error && (
+          <View style={[s.card, { borderColor: C.danger }]}>
+            <Text style={s.body}>{st.error}</Text>
           </View>
         )}
 
-        {/* Address bar */}
         <View style={[s.row, { gap: 6 }]}>
-          <Pressable onPress={() => run(() => call('/act', { type: 'back' }))} style={s.iconBtn}>
+          <Pressable onPress={() => run(() => call('/act', { type: 'back' }), true)} style={s.iconBtn}>
             <Text style={s.iconText}>‹</Text>
           </Pressable>
           <TextInput
@@ -344,25 +479,46 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
               });
             }}
           />
-          <Pressable onPress={() => run(() => call('/act', { type: 'reload' }))} style={s.iconBtn}>
+          <Pressable onPress={() => run(() => call('/act', { type: 'reload' }), true)} style={s.iconBtn}>
             <Text style={s.iconText}>↻</Text>
           </Pressable>
         </View>
 
-        {/* Live screen */}
-        <View style={[s.screen, { aspectRatio: 1 / SCREEN_RATIO }]} onLayout={onLayout}>
-          {cfg.token && conn === 'ok' && st?.browser ? (
-            <Pressable onPress={onTap} style={StyleSheet.absoluteFill}>
-              {/* Two stacked images: the old frame stays visible until the new one loads (no flicker). */}
+        <View
+          style={[s.screen, { aspectRatio: VIEW_W / VIEW_H }]}
+          onTouchStart={() => setScreenTouch(true)}
+          onTouchEnd={() => setScreenTouch(false)}
+          onTouchCancel={() => setScreenTouch(false)}
+          onLayout={(e) => {
+            boxRef.current = { w: e.nativeEvent.layout.width, h: e.nativeEvent.layout.height };
+          }}
+        >
+          {showScreen && mode === 'stream' && active ? (
+            <WebView
+              key={`${streamKey}-${cfg.url}`}
+              source={{ html, baseUrl: cfg.url }}
+              originWhitelist={['*']}
+              onMessage={onStreamMessage}
+              style={{ flex: 1, backgroundColor: '#000' }}
+              containerStyle={{ backgroundColor: '#000' }}
+              scrollEnabled={false}
+              overScrollMode="never"
+              javaScriptEnabled
+              domStorageEnabled={false}
+              cacheEnabled={false}
+              androidLayerType="hardware"
+              setSupportMultipleWindows={false}
+              onRenderProcessGone={() => setStreamKey((k) => k + 1)}
+            />
+          ) : showScreen && mode === 'legacy' ? (
+            <Pressable
+              onPress={(e) => tapAt(e.nativeEvent.locationX / boxRef.current.w, e.nativeEvent.locationY / boxRef.current.h)}
+              style={StyleSheet.absoluteFill}
+            >
+              <Image source={{ uri: `${cfg.url}/api/computer/screen.jpg?f=${shownFrame}`, headers: headers(false) }} style={StyleSheet.absoluteFill} resizeMode="contain" fadeDuration={0} />
               <Image
-                source={{ uri: `${cfg.url}/api/computer/screen.jpg?f=${shownFrame}`, headers: headers(false) }}
-                style={StyleSheet.absoluteFill}
-                resizeMode="contain"
-                fadeDuration={0}
-              />
-              <Image
-                key={imgUri}
-                source={{ uri: imgUri, headers: headers(false) }}
+                key={legacyUri}
+                source={{ uri: legacyUri, headers: headers(false) }}
                 style={[StyleSheet.absoluteFill, { opacity: 0 }]}
                 fadeDuration={0}
                 onLoad={() => setShownFrame(frame)}
@@ -370,20 +526,26 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
             </Pressable>
           ) : (
             <View style={s.center}>
-              <Text style={s.muted}>
-                {!cfg.token
-                  ? 'Add your server token in Setup.'
-                  : conn === 'error'
-                    ? 'Start your Codespace, then come back.'
-                    : 'The browser is asleep. Run a task or open a page to wake it.'}
+              <Text style={[s.muted, { textAlign: 'center' }]}>
+                {!cfg.token ? 'Add your server token in Setup.' : conn === 'error' ? 'Start your Codespace, then come back.' : conn === 'unknown' ? 'Connecting…' : 'The browser is asleep.'}
               </Text>
+              {!!cfg.token && conn === 'ok' && !st?.browser && (
+                <Pressable onPress={() => run(() => call(mode === 'stream' ? '/wake' : '/act', mode === 'stream' ? {} : { type: 'reload' }))} style={[s.btn, { marginTop: 12 }]}>
+                  <Text style={s.btnText}>Wake browser</Text>
+                </Pressable>
+              )}
             </View>
           )}
+          {showScreen && mode === 'stream' && !streamLive && <ActivityIndicator style={s.busy} color={C.accent} />}
           {busy && <ActivityIndicator style={s.busy} color={C.accent} />}
+          {tapFx && <View pointerEvents="none" style={[s.tapFx, { left: tapFx.x * boxRef.current.w - 14, top: tapFx.y * boxRef.current.h - 14 }]} />}
         </View>
-        {!!st?.title && <Text style={s.muted} numberOfLines={1}>{st.title}</Text>}
+        {!!st?.title && (
+          <Text style={s.muted} numberOfLines={1}>
+            {st.title}
+          </Text>
+        )}
 
-        {/* Manual controls */}
         <View style={[s.row, { gap: 6 }]}>
           <TextInput
             value={typed}
@@ -392,24 +554,22 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
             placeholderTextColor={C.muted}
             style={[s.input, { flex: 1, paddingVertical: 8 }]}
             autoCapitalize="none"
-            secureTextEntry={false}
             onSubmitEditing={() =>
               run(async () => {
                 await call('/act', { type: 'type', text: typed, submit: true });
                 setTyped('');
-              })
+              }, true)
             }
           />
-          <Pressable onPress={() => run(() => call('/act', { type: 'scroll', direction: 'up' }))} style={s.iconBtn}>
+          <Pressable onPress={() => run(() => call('/act', { type: 'scroll', direction: 'up' }), true)} style={s.iconBtn}>
             <Text style={s.iconText}>▲</Text>
           </Pressable>
-          <Pressable onPress={() => run(() => call('/act', { type: 'scroll', direction: 'down' }))} style={s.iconBtn}>
+          <Pressable onPress={() => run(() => call('/act', { type: 'scroll', direction: 'down' }), true)} style={s.iconBtn}>
             <Text style={s.iconText}>▼</Text>
           </Pressable>
         </View>
-        <Text style={s.mutedSmall}>Passwords and codes you type here go straight to the page and are never logged.</Text>
+        <Text style={s.mutedSmall}>Tap the screen to click, swipe to scroll. What you type here goes straight to the page and is never logged.</Text>
 
-        {/* Steps */}
         {!!st?.steps?.length && (
           <View style={s.card}>
             <Text style={s.cardTitle}>Steps{st.model ? `  ·  ${st.model}` : ''}</Text>
@@ -435,15 +595,7 @@ function SetupCard({ cfg, onSave }: { cfg: Cfg; onSave: (c: Cfg) => void }) {
     <View style={s.card}>
       <Text style={s.cardTitle}>Server</Text>
       <Text style={s.mutedSmall}>Your Codespace URL (or just its name) and the PULSE_TOKEN you set as a Codespace secret.</Text>
-      <TextInput
-        value={url}
-        onChangeText={setUrl}
-        placeholder={DEFAULT_COMPUTER_URL}
-        placeholderTextColor={C.muted}
-        style={[s.input, { marginTop: 8 }]}
-        autoCapitalize="none"
-        autoCorrect={false}
-      />
+      <TextInput value={url} onChangeText={setUrl} placeholder={DEFAULT_COMPUTER_URL} placeholderTextColor={C.muted} style={[s.input, { marginTop: 8 }]} autoCapitalize="none" autoCorrect={false} />
       <TextInput
         value={token}
         onChangeText={setToken}
@@ -469,37 +621,20 @@ const s = StyleSheet.create({
   dot: { width: 8, height: 8, borderRadius: 4, marginRight: 8 },
   title: { color: C.text, fontSize: 16, fontWeight: '700' },
   muted: { color: C.muted, fontSize: 13 },
-  mutedSmall: { color: C.muted, fontSize: 11 },
+  mutedSmall: { color: C.muted, fontSize: 11, marginTop: 6 },
   body: { color: C.text, fontSize: 14, lineHeight: 20 },
   error: { color: C.danger, fontSize: 13 },
   card: { backgroundColor: C.surface, borderRadius: 14, borderWidth: 1, borderColor: C.border, padding: 12 },
   cardTitle: { color: C.text, fontSize: 14, fontWeight: '700', marginBottom: 6 },
-  input: {
-    backgroundColor: C.surface2,
-    color: C.text,
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    fontSize: 14,
-    borderWidth: 1,
-    borderColor: C.border,
-  },
+  input: { backgroundColor: C.surface2, color: C.text, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10, fontSize: 14, borderWidth: 1, borderColor: C.border },
   btn: { backgroundColor: C.accent, borderRadius: 10, paddingVertical: 11, paddingHorizontal: 14, alignItems: 'center' },
   btnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
   pill: { borderWidth: 1, borderColor: C.border, borderRadius: 999, paddingHorizontal: 12, paddingVertical: 6 },
   pillText: { color: C.text, fontSize: 12, fontWeight: '600' },
-  iconBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 10,
-    backgroundColor: C.surface2,
-    borderWidth: 1,
-    borderColor: C.border,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
+  iconBtn: { width: 40, height: 40, borderRadius: 10, backgroundColor: C.surface2, borderWidth: 1, borderColor: C.border, alignItems: 'center', justifyContent: 'center' },
   iconText: { color: C.text, fontSize: 18, fontWeight: '700' },
   screen: { width: '100%', backgroundColor: '#000', borderRadius: 14, overflow: 'hidden', borderWidth: 1, borderColor: C.border },
   busy: { position: 'absolute', top: 10, right: 10 },
   step: { color: C.muted, fontSize: 12, marginTop: 3 },
+  tapFx: { position: 'absolute', width: 28, height: 28, borderRadius: 14, borderWidth: 2, borderColor: C.accent, backgroundColor: 'rgba(99,102,241,0.25)' },
 });
