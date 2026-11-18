@@ -107,17 +107,35 @@ img{position:absolute;inset:0;width:100%;height:100%;object-fit:fill;display:blo
 </script></body></html>`;
 }
 
-export default function ComputerScreen({ active, geminiKey }: { active: boolean; geminiKey?: string }) {
+export default function ComputerScreen({
+  active,
+  geminiKey,
+  pendingGoal,
+  onConsumeGoal,
+}: {
+  active: boolean;
+  geminiKey?: string;
+  pendingGoal?: string;
+  onConsumeGoal?: () => void;
+}) {
   const [engine, setEngine] = useState<EngineMode>('local');
+  const [sessions, setSessions] = useState([
+    { id: 1, label: 'Browser 1', url: 'https://www.google.com', title: 'Google' },
+    { id: 2, label: 'Amazon', url: 'https://www.amazon.in', title: 'Amazon' },
+    { id: 3, label: 'YouTube', url: 'https://m.youtube.com', title: 'YouTube' },
+  ]);
+  const [activeSessionId, setActiveSessionId] = useState(1);
   const [localUrl, setLocalUrl] = useState('https://www.google.com');
   const [localTitle, setLocalTitle] = useState('Google');
   const [localLoading, setLocalLoading] = useState(false);
   const [localRunning, setLocalRunning] = useState(false);
-  const [localStatusLine, setLocalStatusLine] = useState('Ready · Watching live browser');
-  const [planExpanded, setPlanExpanded] = useState(false);
+  const [localStatusLine, setLocalStatusLine] = useState('Handoff² Ready · Watching live browser');
+  const [cursorLabel, setCursorLabel] = useState('');
+  const [planExpanded, setPlanExpanded] = useState(true);
   const [localAnswer, setLocalAnswer] = useState('');
   const [localSteps, setLocalSteps] = useState<Step[]>([]);
   const localWebRef = useRef<WebView>(null);
+  const localUrlRef = useRef('https://www.google.com');
   const cursorXY = useRef(new Animated.ValueXY({ x: 180, y: 260 })).current;
   const cursorOpacity = useRef(new Animated.Value(0)).current;
   const cursorPulse = useRef(new Animated.Value(1)).current;
@@ -385,60 +403,104 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
       localWebRef.current?.injectJavaScript(OBSERVE_DOM_JS);
     });
 
+  const navigateLocal = async (targetUrl: string, maxWait = 3800) => {
+    const cleanCur = localUrlRef.current.replace(/\/+$/, '').toLowerCase();
+    const cleanTgt = targetUrl.replace(/\/+$/, '').toLowerCase();
+    if (cleanCur === cleanTgt) {
+      await sleep(200);
+      return;
+    }
+    const loadP = waitForLoad(maxWait);
+    localUrlRef.current = targetUrl;
+    setLocalUrl(targetUrl);
+    setSessions((prev) => prev.map((s) => (s.id === activeSessionId ? { ...s, url: targetUrl } : s)));
+    await loadP;
+    await sleep(300);
+  };
+
+  const getDirectSearchUrl = (siteUrl: string, q: string) => {
+    const enc = encodeURIComponent(q.trim());
+    const u = siteUrl.toLowerCase();
+    if (u.includes('amazon.')) return `${siteUrl.replace(/\/+$/, '')}/s?k=${enc}`;
+    if (u.includes('flipkart.')) return `${siteUrl.replace(/\/+$/, '')}/search?q=${enc}`;
+    if (u.includes('youtube.')) return `${siteUrl.replace(/\/+$/, '')}/results?search_query=${enc}`;
+    if (u.includes('wikipedia.')) return `${siteUrl.replace(/\/+$/, '')}/w/index.php?search=${enc}`;
+    if (u.includes('reddit.')) return `${siteUrl.replace(/\/+$/, '')}/search/?q=${enc}`;
+    if (u.includes('github.')) return `${siteUrl.replace(/\/+$/, '')}/search?q=${enc}`;
+    return `${siteUrl.replace(/\/+$/, '')}/search?q=${enc}`;
+  };
+
   const runLocalComputerTask = async (rawGoal: string) => {
     agentAbortRef.current = false;
     setLocalRunning(true);
     setLocalAnswer('');
     setLocalSteps([]);
     const parsed = parseHumanGoal(rawGoal);
+    let startSite = parsed.startUrl;
+    if (startSite.includes('google.com')) {
+      if (/\b(play|watch|video|song|trailer|tutorial|music)\b/i.test(rawGoal)) startSite = 'https://m.youtube.com';
+      else if (/\b(price|deal|deals|cheapest|shop|headphones|laptop|phone|shoes|sneakers|watch)\b/i.test(rawGoal)) startSite = 'https://www.amazon.in';
+    }
+    const hostLabel = startSite.replace(/^https?:\/\/(www\.|m\.|en\.m\.)?/, '').split('/')[0];
     try {
-      setLocalStatusLine(`Opening ${parsed.startUrl.replace(/^https?:\/\/(www\.|m\.)?/, '')}…`);
-      addLocalStep('navigate', parsed.startUrl);
-      const loadP = waitForLoad(7500);
-      setLocalUrl(parsed.startUrl);
-      await loadP;
-      await sleep(500);
+      setCursorLabel(`Opening ${hostLabel}`);
+      setLocalStatusLine(`Handoff² · Opening ${hostLabel}…`);
+      addLocalStep('navigate', startSite);
+      await navigateLocal(startSite, 3800);
       if (agentAbortRef.current) return;
 
       if (parsed.searchQuery) {
-        const snap = await observeDom();
+        const snap = await observeDom(1800);
         if (agentAbortRef.current) return;
         const box = snap?.inputs.find((i) => /search|q\b|query|keyword|find/i.test(`${i.name} ${i.placeholder} ${i.type}`)) || snap?.inputs[0];
         if (box) {
+          setCursorLabel('Click search');
           setLocalStatusLine(`Moving to "${box.placeholder || 'search box'}"…`);
           await glideCursor(box.x, box.y, true);
           if (agentAbortRef.current) return;
+          setCursorLabel(`Typing "${parsed.searchQuery.slice(0, 16)}"`);
           setLocalStatusLine(`Typing "${parsed.searchQuery}"…`);
           addLocalStep('type', `"${parsed.searchQuery}" into ${box.placeholder || 'search box'}`);
-          const afterType = waitForLoad(7500);
+          const afterType = waitForLoad(1200);
           localWebRef.current?.injectJavaScript(buildTypeAndSubmitJs(box.id, parsed.searchQuery));
           await afterType;
-          await sleep(600);
+          await sleep(300);
+          if (agentAbortRef.current) return;
+        }
+        const stillOnHome = /^https?:\/\/[^/]+\/?(\?.*)?$/i.test(localUrlRef.current);
+        if (!box || stillOnHome) {
+          const directUrl = getDirectSearchUrl(startSite, parsed.searchQuery);
+          setCursorLabel(`Searching ${hostLabel}`);
+          setLocalStatusLine(`Loading "${parsed.searchQuery}" results on ${hostLabel}…`);
+          addLocalStep('search', directUrl);
+          await navigateLocal(directUrl, 4000);
           if (agentAbortRef.current) return;
         }
       }
 
-      setLocalStatusLine('Scanning page results…');
+      setCursorLabel('Scanning live results');
+      setLocalStatusLine('Handoff² · Inspecting & highlighting top items…');
       addLocalStep('scroll', 'Scanning visible items on page');
-      await glideCursor(0.5, 0.65, false);
+      await glideCursor(0.5, 0.62, false);
       localWebRef.current?.injectJavaScript('window.scrollBy({top: 380, behavior: "smooth"}); true;');
-      await sleep(750);
+      await sleep(600);
       if (agentAbortRef.current) return;
 
-      let snap = await observeDom();
+      let snap = await observeDom(2000);
       if (agentAbortRef.current) return;
 
-      if (parsed.wantsOpenResult && snap?.links.length) {
+      if ((parsed.wantsOpenResult || Boolean(parsed.searchQuery)) && snap?.links.length) {
         const qWords = parsed.clickHint.toLowerCase().split(/\s+/).filter((w) => w.length >= 3);
         const bestLink =
-          snap.links.find((l) => !BUY_GUARD_RE.test(l.text) && qWords.some((w) => l.text.toLowerCase().includes(w))) ||
-          snap.links.find((l) => !BUY_GUARD_RE.test(l.text) && l.text.length > 10);
+          snap.links.find((l) => !BUY_GUARD_RE.test(l.text) && l.text.length >= 12 && qWords.some((w) => l.text.toLowerCase().includes(w))) ||
+          snap.links.find((l) => !BUY_GUARD_RE.test(l.text) && l.text.length > 14);
         if (bestLink) {
-          setLocalStatusLine(`Opening "${bestLink.text.slice(0, 32)}…"`);
+          setCursorLabel(`Opening "${bestLink.text.slice(0, 18)}…"`);
+          setLocalStatusLine(`Opening "${bestLink.text.slice(0, 34)}…"`);
           await glideCursor(bestLink.x, bestLink.y, true);
           if (agentAbortRef.current) return;
           addLocalStep('click', bestLink.text.slice(0, 60));
-          const clickLoad = waitForLoad(6500);
+          const clickLoad = waitForLoad(4200);
           localWebRef.current?.injectJavaScript(`(function(){ var a=document.querySelector('[data-pulse-lk="${bestLink.id}"]'); if(a) a.click(); })(); true;`);
           await clickLoad;
           await sleep(500);
@@ -447,14 +509,26 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
       }
 
       const summaryLines = (snap?.text || '').split('\n').map((l) => l.trim()).filter((l) => l.length >= 12).slice(0, 8);
-      setLocalAnswer(`**${snap?.title || localTitle}**\n${summaryLines.join('\n')}\n\n_(Completed on-device — nothing was bought or submitted.)_`);
-      setLocalStatusLine('Done · Watching live browser');
+      setLocalAnswer(`**${snap?.title || localTitle}**\n${summaryLines.join('\n')}\n\n🔒 _Secured by Pulse Handoff² — Paused before any purchase or checkout step._`);
+      setLocalStatusLine('Handoff² Complete · Live browser ready');
       addLocalStep('done', snap?.title || 'Finished');
     } finally {
+      setCursorLabel('');
       hideCursor();
       setLocalRunning(false);
     }
   };
+
+  useEffect(() => {
+    if (pendingGoal && pendingGoal.trim() && loaded) {
+      const g = pendingGoal.trim();
+      onConsumeGoal?.();
+      setEngine('local');
+      setGoal('');
+      runLocalComputerTask(g);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingGoal, loaded]);
 
   const stopLocalAgent = () => {
     agentAbortRef.current = true;
@@ -556,7 +630,7 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
         <View style={[s.rowBetween, { flexWrap: 'wrap', gap: 8 }]}>
           <View style={s.row}>
             <View style={[s.dot, { backgroundColor: statusColor }]} />
-            <Text style={s.title}>AI Computer</Text>
+            <Text style={s.title}>Handoff²</Text>
             <Text style={s.muted}> · {statusText}</Text>
           </View>
           <View style={[s.row, { gap: 6 }]}>
@@ -703,21 +777,57 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
           </View>
         )}
 
+        {engine === 'local' && (
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 6 }}>
+            {sessions.map((sess) => {
+              const on = sess.id === activeSessionId;
+              return (
+                <Pressable
+                  key={sess.id}
+                  onPress={() => {
+                    setActiveSessionId(sess.id);
+                    localUrlRef.current = sess.url;
+                    setLocalUrl(sess.url);
+                    setLocalTitle(sess.title);
+                  }}
+                  style={[s.pill, on && { borderColor: C.cyan, backgroundColor: 'rgba(56,189,248,0.14)' }]}
+                >
+                  <Text style={[s.pillText, on && { color: C.cyan }]}>🌐 {sess.label}</Text>
+                </Pressable>
+              );
+            })}
+            <Pressable
+              onPress={() => {
+                if (sessions.length >= 6) return;
+                const nextId = sessions.length + 1;
+                const nextUrl = 'https://www.google.com';
+                setSessions((prev) => [...prev, { id: nextId, label: `Browser ${nextId}`, url: nextUrl, title: 'Google' }]);
+                setActiveSessionId(nextId);
+                localUrlRef.current = nextUrl;
+                setLocalUrl(nextUrl);
+              }}
+              style={s.pill}
+            >
+              <Text style={s.pillText}>+ New Session</Text>
+            </Pressable>
+          </ScrollView>
+        )}
+
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 6 }}>
           {[
-            { label: 'Google', url: 'https://www.google.com' },
-            { label: 'YouTube', url: 'https://m.youtube.com' },
-            { label: 'Wikipedia', url: 'https://en.m.wikipedia.org' },
-            { label: 'News', url: 'https://news.google.com' },
+            { label: '⚡ Amazon Headphones', task: 'Search Amazon for wireless headphones deals' },
+            { label: '🎬 YouTube AI Demos', task: 'Open YouTube and search AI agent demos' },
+            { label: '🛍️ Flipkart Phones', task: 'Search Flipkart for best 5G smartphones' },
+            { label: '📖 Wikipedia AI', task: 'Search Wikipedia for autonomous agents' },
+            { label: '📰 Tech News', task: 'Search Google News for latest AI technology' },
           ].map((q) => (
             <Pressable
               key={q.label}
               onPress={() => {
                 if (engine === 'local') {
-                  setLocalUrl(q.url);
-                  addLocalStep('open', q.url);
+                  runLocalComputerTask(q.task);
                 } else {
-                  run(() => call('/act', { type: 'navigate', url: q.url }), true);
+                  run(() => call('/task', { goal: q.task }));
                 }
               }}
               style={s.pill}
@@ -787,7 +897,10 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
                 loadWaiterRef.current?.();
               }}
               onNavigationStateChange={(nav) => {
-                if (nav.url) setLocalUrl(nav.url);
+                if (nav.url) {
+                  localUrlRef.current = nav.url;
+                  setLocalUrl(nav.url);
+                }
                 if (nav.title) setLocalTitle(nav.title);
               }}
               style={{ flex: 1, backgroundColor: '#fff' }}
@@ -854,6 +967,11 @@ export default function ComputerScreen({ active, geminiKey }: { active: boolean;
               ]}
             >
               <View style={s.glassCursorCore} />
+              {!!cursorLabel && (
+                <View style={{ position: 'absolute', left: 34, top: 2, backgroundColor: 'rgba(9,12,18,0.92)', borderColor: C.cyan, borderWidth: 1, borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3, minWidth: 110 }}>
+                  <Text style={{ color: C.text, fontSize: 10, fontWeight: '700' }} numberOfLines={1}>{cursorLabel}</Text>
+                </View>
+              )}
             </Animated.View>
           )}
         </View>

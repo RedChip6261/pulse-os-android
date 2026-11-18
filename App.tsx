@@ -33,6 +33,7 @@ import { useSpeechRecognitionEvent } from 'expo-speech-recognition';
 import AuthScreen from './AuthScreen';
 import ComputerScreen from './ComputerScreen';
 import HandsFreeScreen from './HandsFreeScreen';
+import HarkHomeScreen from './HarkHomeScreen';
 import ProfileScreen, { AgentMode } from './ProfileScreen';
 import {
   buildAgenticRagContext,
@@ -138,6 +139,9 @@ export default function App() {
   const [tab, setTabState] = useState<Tab>('PULSE');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
+  const [appsModalOpen, setAppsModalOpen] = useState(false);
+  const [pendingHandoffGoal, setPendingHandoffGoal] = useState('');
+  const [pendingChatPrompt, setPendingChatPrompt] = useState('');
   const [user, setUser] = useState<PublicUser | null>(null);
   const [guestMode, setGuestMode] = useState(false);
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
@@ -333,6 +337,12 @@ export default function App() {
             learnFrom={learnFrom}
             onReminderSet={refreshReminders}
             openSettings={() => setSettingsOpen(true)}
+            pendingPrompt={pendingChatPrompt}
+            onConsumePrompt={() => setPendingChatPrompt('')}
+            onLaunchHandoff={(g) => {
+              setPendingHandoffGoal(g);
+              setTab('COMPUTER');
+            }}
           />
         </View>
         <View style={[styles.fill, tab !== 'VOICE' && styles.hidden]}>
@@ -349,20 +359,48 @@ export default function App() {
           />
         </View>
         <View style={[styles.fill, tab !== 'APPS' && styles.hidden]}>
-          <AppsScreen />
+          <HarkHomeScreen
+            userName={profile.name}
+            onRunChatPrompt={(p) => {
+              setPendingChatPrompt(p);
+              setTab('PULSE');
+            }}
+            onRunHandoffTask={(g) => {
+              setPendingHandoffGoal(g);
+              setTab('COMPUTER');
+            }}
+            onOpenAppsLauncher={() => setAppsModalOpen(true)}
+          />
         </View>
         <View style={[styles.fill, tab !== 'COMPUTER' && styles.hidden]}>
-          <ComputerScreen active={tab === 'COMPUTER' && appActive} geminiKey={settings.apiKey} />
+          <ComputerScreen
+            active={tab === 'COMPUTER' && appActive}
+            geminiKey={settings.apiKey}
+            pendingGoal={pendingHandoffGoal}
+            onConsumeGoal={() => setPendingHandoffGoal('')}
+          />
         </View>
       </View>
+
+      <Modal visible={appsModalOpen} animationType="slide" onRequestClose={() => setAppsModalOpen(false)}>
+        <SafeAreaView style={styles.root}>
+          <View style={styles.header}>
+            <Text style={styles.brand}>Phone Apps & Quick Settings</Text>
+            <Pressable onPress={() => setAppsModalOpen(false)} style={styles.pillBtn}>
+              <Text style={styles.pillText}>Done</Text>
+            </Pressable>
+          </View>
+          <AppsScreen />
+        </SafeAreaView>
+      </Modal>
 
       <View style={styles.tabBar}>
         {(
           [
-            { id: 'PULSE', label: 'Pulse' },
+            { id: 'APPS', label: 'Home OS' },
+            { id: 'PULSE', label: 'Chat' },
+            { id: 'COMPUTER', label: 'Handoff²' },
             { id: 'VOICE', label: 'Hands-Free' },
-            { id: 'APPS', label: 'Apps' },
-            { id: 'COMPUTER', label: 'Computer' },
           ] as { id: Tab; label: string }[]
         ).map((t) => {
           const on = tab === t.id;
@@ -452,6 +490,9 @@ function ChatScreen({
   learnFrom,
   onReminderSet,
   openSettings,
+  pendingPrompt,
+  onConsumePrompt,
+  onLaunchHandoff,
 }: {
   active: boolean;
   settings: Settings;
@@ -465,6 +506,9 @@ function ChatScreen({
   learnFrom: (t: string) => void;
   onReminderSet: () => void;
   openSettings: () => void;
+  pendingPrompt?: string;
+  onConsumePrompt?: () => void;
+  onLaunchHandoff?: (goal: string) => void;
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
@@ -536,6 +580,15 @@ function ChatScreen({
     speak(text, settings.voiceLang, { onDone: () => setSpeaking(false), onStopped: () => setSpeaking(false) });
   };
 
+  useEffect(() => {
+    if (pendingPrompt && pendingPrompt.trim() && !busy) {
+      const p = pendingPrompt.trim();
+      onConsumePrompt?.();
+      send(p);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingPrompt]);
+
   const send = async (override?: string) => {
     const raw = (override ?? input).trim();
     const att = pending;
@@ -549,6 +602,23 @@ function ChatScreen({
     setPending(null);
     nearBottom.current = true;
     commit((prev) => [...prev, userMsg]);
+
+    // Direct Chat -> Handoff² Live Browser handoff (Hark Pro signature flow)
+    if (!att && onLaunchHandoff && /\b(handoff|in\s+browser|search\s+(?:amazon|flipkart|youtube|wikipedia)|find\s+deals\s+on|compare\s+prices\s+on)\b/i.test(text)) {
+      const cleanGoal = text.replace(/^handoff²?:?\s*/i, '').trim();
+      const replyText = `⚡ **Handoff² Live Browser launched**\nDriving the on-device browser for: _"${cleanGoal}"_ — watch the glass cursor navigate, type, and highlight results live.`;
+      commit((prev) => [
+        ...prev,
+        {
+          id: uid(),
+          role: 'assistant',
+          text: replyText,
+          ts: Date.now(),
+        },
+      ]);
+      onLaunchHandoff(cleanGoal);
+      return;
+    }
 
     // 1. Pulse Custom Engine (API-key-free, handles attachments, web knowledge, workflows, math, reminders)
     if (settings.agentMode !== 'cloud') {
@@ -772,15 +842,20 @@ function ChatScreen({
             <Text style={styles.emptyTitle}>Hi{profile.name ? `, ${profile.name.split(' ')[0]}` : ''}</Text>
             <Text style={styles.emptySub}>Ask anything, attach a photo or PDF, or set a reminder.</Text>
             <View style={styles.suggestionWrap}>
-              {['Weather in Hyderabad today', 'Remind me at 6pm to call Amma', 'Remember I am vegetarian', 'Best biryani near Gachibowli'].map((ex) => (
+              {[
+                'Search Amazon for wireless headphones deals',
+                'Search YouTube for AI agent demos',
+                'Weather in Hyderabad today',
+                'Remind me at 6pm to call Amma',
+              ].map((ex) => (
                 <Pressable key={ex} onPress={() => send(ex)} style={styles.suggestionPill}>
                   <Text style={styles.suggestionText}>{ex}</Text>
                 </Pressable>
               ))}
             </View>
-            {!settings.apiKey.trim() ? (
-              <Pressable onPress={openSettings} style={{ marginTop: 18 }}>
-                <Text style={{ color: C.cyan, fontSize: 13 }}>Add your Gemini API key in Settings</Text>
+            {onLaunchHandoff ? (
+              <Pressable onPress={() => onLaunchHandoff('Search Amazon for wireless headphones deals')} style={{ marginTop: 18 }}>
+                <Text style={{ color: C.cyan, fontSize: 13, fontWeight: '700' }}>⚡ Open Handoff² Autonomous Browser →</Text>
               </Pressable>
             ) : null}
           </View>
