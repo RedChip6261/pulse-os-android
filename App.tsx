@@ -482,41 +482,20 @@ async function executePulseIntent(
 /* Gemini Streaming Client (For General Q&A & Complex Reasoning)      */
 /* ------------------------------------------------------------------ */
 
-async function callGeminiChat(
+const FALLBACK_MODELS = [
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+  'gemini-flash-latest',
+  'gemini-2.5-flash-lite',
+];
+
+function streamGeminiOnce(
   apiKey: string,
   model: string,
-  history: ChatMessage[],
-  ragContext: string,
-  profile: UserProfile,
+  body: string,
   onPartial?: (txt: string) => void,
-): Promise<string> {
-  const sys = [
-    'You are Pulse OS, a minimalist, helpful, fast AI assistant on Android.',
-    'Answer concisely and clearly in the same language the user uses (English or Telugu).',
-    profile.name || profile.address || profile.email
-      ? `User Profile: ${[profile.name, profile.email, profile.phone, profile.address].filter(Boolean).join(' | ')}`
-      : '',
-    ragContext,
-  ]
-    .filter(Boolean)
-    .join('\n\n');
-
-  const contents = history
-    .filter((m) => m.role !== 'error' && (m.text.trim() || m.attachment))
-    .slice(-10)
-    .map((m) => {
-      const parts: any[] = [];
-      if (m.attachment?.base64 && m.attachment.mimeType) {
-        parts.push({ inlineData: { mimeType: m.attachment.mimeType, data: m.attachment.base64 } });
-      }
-      if (m.attachment?.textContent) {
-        parts.push({ text: `[File: ${m.attachment.name}]\n${m.attachment.textContent.slice(0, 20000)}` });
-      }
-      if (m.text.trim()) parts.push({ text: m.text });
-      return { role: m.role === 'user' ? 'user' : 'model', parts };
-    });
-
-  return new Promise((resolve, reject) => {
+): Promise<{ ok: boolean; status: number; text: string; error?: string }> {
+  return new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
     let seen = 0;
     let buffer = '';
@@ -545,7 +524,7 @@ async function callGeminiChat(
       }
       if (changed && onPartial) onPartial(full);
     };
-    xhr.open('POST', GEMINI_BASE + encodeURIComponent(model || DEFAULT_MODEL) + ':streamGenerateContent?alt=sse');
+    xhr.open('POST', GEMINI_BASE + encodeURIComponent(model) + ':streamGenerateContent?alt=sse');
     xhr.setRequestHeader('Content-Type', 'application/json');
     xhr.setRequestHeader('x-goog-api-key', apiKey);
     xhr.timeout = 45000;
@@ -556,21 +535,88 @@ async function callGeminiChat(
       if (xhr.status === 200) {
         buffer += '\n';
         pump();
-        resolve(full.trim() || 'Done.');
+        resolve({ ok: true, status: 200, text: full.trim() || 'Done.' });
       } else {
-        reject(new Error(`Gemini HTTP ${xhr.status}`));
+        let msg = `Gemini HTTP ${xhr.status}`;
+        try {
+          const parsed = JSON.parse(xhr.responseText);
+          const apiMsg = (Array.isArray(parsed) ? parsed[0] : parsed)?.error?.message;
+          if (apiMsg) msg = apiMsg;
+        } catch {}
+        resolve({ ok: false, status: xhr.status, text: '', error: msg });
       }
     };
-    xhr.onerror = () => reject(new Error('Network error'));
-    xhr.ontimeout = () => reject(new Error('Request timed out'));
-    xhr.send(
-      JSON.stringify({
-        systemInstruction: { parts: [{ text: sys }] },
-        contents,
-        generationConfig: { temperature: 0.3, maxOutputTokens: 2048 },
-      }),
-    );
+    xhr.onerror = () => resolve({ ok: false, status: 0, text: '', error: 'Network error' });
+    xhr.ontimeout = () =>
+      resolve(
+        full.trim()
+          ? { ok: true, status: 200, text: full.trim() }
+          : { ok: false, status: 0, text: '', error: 'Request timed out' },
+      );
+    xhr.send(body);
   });
+}
+
+async function callGeminiChat(
+  apiKey: string,
+  model: string,
+  history: ChatMessage[],
+  ragContext: string,
+  profile: UserProfile,
+  onPartial?: (txt: string) => void,
+): Promise<string> {
+  const cleanKey = apiKey.trim();
+  const sys = [
+    'You are Pulse OS, a minimalist, helpful, fast AI assistant on Android.',
+    'Answer concisely and clearly in the same language the user uses (English or Telugu).',
+    profile.name || profile.address || profile.email
+      ? `User Profile: ${[profile.name, profile.email, profile.phone, profile.address].filter(Boolean).join(' | ')}`
+      : '',
+    ragContext,
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+
+  const contents = history
+    .filter((m) => m.role !== 'error' && (m.text.trim() || m.attachment))
+    .slice(-10)
+    .map((m) => {
+      const parts: any[] = [];
+      if (m.attachment?.base64 && m.attachment.mimeType) {
+        parts.push({ inlineData: { mimeType: m.attachment.mimeType, data: m.attachment.base64 } });
+      }
+      if (m.attachment?.textContent) {
+        parts.push({ text: `[File: ${m.attachment.name}]\n${m.attachment.textContent.slice(0, 20000)}` });
+      }
+      if (m.text.trim()) parts.push({ text: m.text });
+      return { role: m.role === 'user' ? 'user' : 'model', parts };
+    });
+
+  const body = JSON.stringify({
+    systemInstruction: { parts: [{ text: sys }] },
+    contents,
+    generationConfig: { temperature: 0.3, maxOutputTokens: 2048 },
+  });
+
+  const chain: string[] = [];
+  if (model && !/1\.5|^gemini-pro$/i.test(model)) chain.push(model);
+  for (const fb of FALLBACK_MODELS) {
+    if (!chain.includes(fb)) chain.push(fb);
+  }
+
+  let lastErr = 'Request failed';
+  for (const m of chain) {
+    const res = await streamGeminiOnce(cleanKey, m, body, onPartial);
+    if (res.ok) return res.text;
+    lastErr = res.error || `Gemini HTTP ${res.status}`;
+    if (res.status === 401 || res.status === 403 || (res.status === 400 && /api key/i.test(lastErr))) {
+      throw new Error('Invalid Gemini API key. Check it in Settings.');
+    }
+    if (res.status === 0 && lastErr === 'Network error') {
+      throw new Error('No internet connection.');
+    }
+  }
+  throw new Error(lastErr);
 }
 
 /* ------------------------------------------------------------------ */
