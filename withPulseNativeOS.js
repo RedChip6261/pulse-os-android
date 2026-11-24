@@ -452,7 +452,7 @@ class PulseAccessibilityService : AccessibilityService() {
     // Sessions nest (a hands-free voice action can fire inside a workflow), so keep a stack.
     private val sessionStack = java.util.concurrent.CopyOnWriteArrayList<BridgeSession>()
 
-    private fun newSessionId(): String = System.currentTimeMillis().toString(36) + Math.random().toString(36).substring(2, 8)
+    private fun newSessionId(): String = System.currentTimeMillis().toString(36) + java.util.UUID.randomUUID().toString().replace("-", "").take(8)
 
     /** Opens a session; subsequent recordStep calls attach to it. */
     private fun startSession(workflowName: String): BridgeSession {
@@ -578,7 +578,7 @@ class PulseAccessibilityService : AccessibilityService() {
 
         val status = TextView(applicationContext).apply {
             text = "PULSE ARMED"
-            textColor = Color.parseColor("#FF3B30")
+            setTextColor(Color.parseColor("#FF3B30"))
             textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER_VERTICAL
@@ -593,7 +593,7 @@ class PulseAccessibilityService : AccessibilityService() {
         // Kill-switch: instantly halts all automation.
         val killBtn = TextView(applicationContext).apply {
             text = "STOP"
-            textColor = Color.WHITE
+            setTextColor(Color.WHITE)
             textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
@@ -766,7 +766,7 @@ class PulseAccessibilityService : AccessibilityService() {
         val cls = n.className?.toString()?.lowercase() ?: ""
         return when {
             n.isCheckable -> "checkbox"
-            n.isButton || cls.contains("button") -> "button"
+            cls.contains("button") -> "button"
             n.isClickable -> "clickable"
             n.isScrollable -> "scrollable"
             cls.contains("edittext") || cls.contains("textfield") -> "input"
@@ -792,7 +792,7 @@ class PulseAccessibilityService : AccessibilityService() {
             id.isNotEmpty() && id != primary -> "\$primary · \$id"
             else -> primary
         }
-        return secondary.replace("\\n", " ").replace("\\s+".toRegex(), " ").trim().take(120)
+        return secondary.replace("\\n", " ").replace(Regex("\\\\s+"), " ").trim().take(120)
     }
 
     /**
@@ -1099,7 +1099,8 @@ class PulseAccessibilityService : AccessibilityService() {
                 targetNode = findEditableNode(getActiveRoot())
             }
 
-            val node = targetNode ?: run {
+            val node = targetNode
+            if (node == null) {
                 Thread.sleep(320)
                 continue
             }
@@ -1621,7 +1622,7 @@ class PulseAccessibilityService : AccessibilityService() {
                 recordStatus("Workflow error in \$appKey: \${e.message ?: "paused"}", showToast = false)
                 hideTacticalHUD()
             } finally {
-                endSession(if (lastLoopGuardHit) "error" else "completed", lastStatus, lastLoopGuardHit)
+                endSession(if (lastLoopGuardHit.isNotEmpty()) "error" else "completed", lastStatus, lastLoopGuardHit.isNotEmpty())
             }
         }
     }
@@ -1896,13 +1897,6 @@ class PulseAccessibilityService : AccessibilityService() {
         if (root != null) {
             val scrollable = collectSemanticNodes(root, 120).firstOrNull { it.scrollable && it.enabled }
             if (scrollable != null) {
-                val args = Bundle().apply {
-                    putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SCROLL_AXIS_VERTICAL, 1)
-                }
-                if (scrollable.node.performAction(action, args)) {
-                    recordStep("scroll", direction, "done", System.currentTimeMillis() - started, "Scrolled \$direction")
-                    return true
-                }
                 if (scrollable.node.performAction(action)) {
                     recordStep("scroll", direction, "done", System.currentTimeMillis() - started, "Scrolled \$direction")
                     return true
@@ -2323,7 +2317,7 @@ class PulseBridgeModule(private val reactContext: ReactApplicationContext) :
             val intent = Intent(action).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 if (panel?.lowercase()?.trim() == "overlay") {
-                    intent.data = Uri.parse("package:\${reactContext.packageName}")
+                    setData(Uri.parse("package:\${reactContext.packageName}"))
                 }
             }
             reactContext.startActivity(intent)
@@ -2720,7 +2714,7 @@ class PulseBridgeModule(private val reactContext: ReactApplicationContext) :
                 val raw = prefs.getString("last_session", "") ?: ""
                 if (raw.isNotEmpty()) map.putString("bridgeSession", raw)
                 val structured = Arguments.createArray()
-                for (e in svc.savedStepLogs) {
+                for (e in PulseAccessibilityService.savedStepLogs) {
                     val o = Arguments.createMap()
                     o.putString("actionType", e.actionType)
                     o.putString("target", e.target)
