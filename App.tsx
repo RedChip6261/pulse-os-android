@@ -444,6 +444,11 @@ export default function App() {
               workflows: workflows.length,
               notes: knowledge.length,
             }}
+            onRunMacro={(trigger) => {
+              setProfileOpen(false);
+              setPendingChatPrompt(trigger);
+              setTab('PULSE');
+            }}
             onClose={() => setProfileOpen(false)}
           />
         </SafeAreaView>

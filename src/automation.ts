@@ -10,6 +10,7 @@ import { parsePulseVoiceCommand } from '../pulseFeatures';
 import { ActionLink, openApp, runOpenIntent } from './actions';
 import { makeMemory, MemoryItem, parseMemoryCommand, toMemoryText } from './memory';
 import { describeWhen, isReminderRequest, parseReminderLocal, Reminder, ReminderDraft } from './reminders';
+import { appendSession, finishSession, loadMacros, makeStepLog, matchMacro, newSession, saveMacro, ActionType, StepLog, StepStatus } from './sessionLog';
 
 const STORAGE_WORKFLOWS = 'pulseos.workflows.v1';
 
@@ -152,6 +153,29 @@ export function looksLikeAutomation(input: string, workflows: AutomationWorkflow
   return splitCompoundClauses(input).length >= 2;
 }
 
+/** Maps a persisted action type onto a workflow step kind, falling back to a dynamic clause. */
+function macroStepKind(actionType: ActionType): WorkflowStepKind {
+  switch (actionType) {
+    case 'open_app':
+    case 'launch_app':
+      return 'open_app';
+    case 'open_setting':
+      return 'open_setting';
+    case 'memory_add':
+      return 'memory_add';
+    case 'reminder_create':
+      return 'reminder_create';
+    case 'briefing':
+      return 'briefing';
+    case 'maps_query':
+    case 'maps_directions':
+    case 'maps':
+      return 'maps_query';
+    default:
+      return 'command';
+  }
+}
+
 export async function executeAutomation(
   input: string,
   ctx: {
@@ -182,7 +206,25 @@ export async function executeAutomation(
     return runWorkflowSteps(matchedWf.name, matchedWf.steps, ctx);
   }
 
-  // 2. Parse compound multi-step natural language command
+  // 2. Replay a saved macro captured from an earlier session
+  const macros = await loadMacros().catch(() => []);
+  const macro = matchMacro(macros, input);
+  if (macro) {
+    const steps: WorkflowStep[] = macro.steps.map((s, idx) => ({
+      id: `macro_${idx}`,
+      kind: macroStepKind(s.actionType),
+      label: s.label || s.actionType,
+      target: s.target,
+      query: s.query,
+    }));
+    const result = await runWorkflowSteps(macro.name, steps, ctx);
+    macro.useCount += 1;
+    macro.lastUsedAt = Date.now();
+    await saveMacro(macro).catch(() => undefined);
+    return result;
+  }
+
+  // 3. Parse compound multi-step natural language command
   const clauses = splitCompoundClauses(input);
   if (clauses.length < 2) return null;
 
@@ -208,9 +250,18 @@ export async function runWorkflowSteps(
 ): Promise<AutomationRunResult> {
   const logs: StepExecutionLog[] = [];
   const actions: ActionLink[] = [];
+  const stepLogs: StepLog[] = [];
   let pendingReminder: ReminderDraft | undefined;
+  let sessionError: string | undefined;
 
   for (const step of steps) {
+    const startedAt = Date.now();
+    // Records one step into both the user-facing log and the persisted session log.
+    const record = (status: StepStatus, detail: string, actionType: ActionType, target?: string, query?: string) => {
+      logs.push({ label: step.label, status, detail });
+      stepLogs.push(makeStepLog(actionType, { target, query, status, detail, latencyMs: Date.now() - startedAt }));
+    };
+
     try {
       if (step.kind === 'briefing') {
         const now = new Date().toLocaleString('en-IN', {
@@ -223,11 +274,7 @@ export async function runWorkflowSteps(
         });
         const remCount = ctx.reminders.length;
         const nextRem = ctx.reminders[0] ? `Next: "${ctx.reminders[0].title}" (${describeWhen(ctx.reminders[0])})` : 'No upcoming reminders';
-        logs.push({
-          label: step.label,
-          status: 'done',
-          detail: `${now} IST · ${remCount} reminder(s). ${nextRem}. ${ctx.memories.length} saved memories.`,
-        });
+        record('done', `${now} IST · ${remCount} reminder(s). ${nextRem}. ${ctx.memories.length} saved memories.`, 'briefing');
         continue;
       }
 
@@ -237,7 +284,7 @@ export async function runWorkflowSteps(
         } else {
           await Linking.openSettings();
         }
-        logs.push({ label: step.label, status: 'done', detail: 'Opened system settings screen.' });
+        record('done', 'Opened system settings screen.', 'open_setting', step.target);
         continue;
       }
 
@@ -245,13 +292,13 @@ export async function runWorkflowSteps(
         const q = step.query;
         actions.push({ type: 'maps', label: `Maps: ${q}`, query: q });
         await Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(q)}`).catch(() => undefined);
-        logs.push({ label: step.label, status: 'done', detail: `Opened Maps for "${q}".` });
+        record('done', `Opened Maps for "${q}".`, 'maps_query', undefined, q);
         continue;
       }
 
       if (step.kind === 'open_app' && step.target) {
         const r = await openApp(step.target, step.query || '');
-        logs.push({ label: step.label, status: r.ok ? 'done' : 'error', detail: r.msg });
+        record(r.ok ? 'done' : 'error', r.msg, 'open_app', step.target, step.query);
         continue;
       }
 
@@ -259,9 +306,9 @@ export async function runWorkflowSteps(
         const m = makeMemory(toMemoryText(step.query), 'other', 'manual');
         if (m) {
           ctx.addMemory([m]);
-          logs.push({ label: step.label, status: 'done', detail: `Saved: ${m.text}` });
+          record('done', `Saved: ${m.text}`, 'memory_add', undefined, step.query);
         } else {
-          logs.push({ label: step.label, status: 'skipped', detail: 'Skipped sensitive or empty memory.' });
+          record('skipped', 'Skipped sensitive or empty memory.', 'memory_add', undefined, step.query);
         }
         continue;
       }
@@ -270,9 +317,9 @@ export async function runWorkflowSteps(
         const draft = parseReminderLocal(step.query);
         if (draft) {
           pendingReminder = draft;
-          logs.push({ label: step.label, status: 'needs_confirm', detail: `Ready to set: ${draft.title} (${describeWhen(draft)})` });
+          record('needs_confirm', `Ready to set: ${draft.title} (${describeWhen(draft)})`, 'reminder_create', undefined, step.query);
         } else {
-          logs.push({ label: step.label, status: 'skipped', detail: 'Could not parse reminder time locally.' });
+          record('skipped', 'Could not parse reminder time locally.', 'reminder_create', undefined, step.query);
         }
         continue;
       }
@@ -284,9 +331,9 @@ export async function runWorkflowSteps(
         const m = makeMemory(toMemoryText(mc.text), 'other', 'manual');
         if (m) {
           ctx.addMemory([m]);
-          logs.push({ label: step.label, status: 'done', detail: `Saved memory: ${m.text}` });
+          record('done', `Saved memory: ${m.text}`, 'memory_add', undefined, text);
         } else {
-          logs.push({ label: step.label, status: 'skipped', detail: 'Skipped (sensitive or too long).' });
+          record('skipped', 'Skipped (sensitive or too long).', 'memory_add', undefined, text);
         }
         continue;
       }
@@ -295,9 +342,9 @@ export async function runWorkflowSteps(
         const draft = parseReminderLocal(text);
         if (draft) {
           pendingReminder = draft;
-          logs.push({ label: step.label, status: 'needs_confirm', detail: `Confirm reminder: ${draft.title} (${describeWhen(draft)})` });
+          record('needs_confirm', `Confirm reminder: ${draft.title} (${describeWhen(draft)})`, 'reminder_create', undefined, text);
         } else {
-          logs.push({ label: step.label, status: 'skipped', detail: 'Specify a time like "at 6pm" or "in 20 minutes".' });
+          record('skipped', 'Specify a time like "at 6pm" or "in 20 minutes".', 'reminder_create', undefined, text);
         }
         continue;
       }
@@ -307,7 +354,7 @@ export async function runWorkflowSteps(
         const q = dirMatch[1].trim();
         actions.push({ type: 'maps', label: `Directions: ${q}`, query: q });
         await Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(q)}`).catch(() => undefined);
-        logs.push({ label: step.label, status: 'done', detail: `Opened Maps for "${q}".` });
+        record('done', `Opened Maps for "${q}".`, 'maps_directions', undefined, q);
         continue;
       }
 
@@ -315,19 +362,28 @@ export async function runWorkflowSteps(
       if (intent.type !== 'CONVERSATION') {
         const res = await runOpenIntent(intent).catch(() => null);
         if (res) {
-          logs.push({ label: step.label, status: 'done', detail: res });
+          record('done', res, 'command', intent.app || intent.query || undefined, text);
           continue;
         }
       }
 
-      logs.push({ label: step.label, status: 'skipped', detail: 'No matching device action for this step.' });
+      record('skipped', 'No matching device action for this step.', 'command', undefined, text);
     } catch (e: any) {
-      logs.push({ label: step.label, status: 'error', detail: e?.message || 'Step failed.' });
+      const detail = e?.message || 'Step failed.';
+      sessionError = sessionError || detail;
+      record('error', detail, 'command', undefined, step.query || step.label);
     }
   }
 
   const doneCount = logs.filter((l) => l.status === 'done' || l.status === 'needs_confirm').length;
   const lines = logs.map((l, i) => `${i + 1}. ${l.status === 'done' ? '✓' : l.status === 'needs_confirm' ? '⏰' : '•'} ${l.detail}`);
+
+  // Persist the full session (steps, latency, statuses, errors) for later inspection and macro mining.
+  const entry = newSession(workflowName, 'workflow');
+  entry.steps = stepLogs;
+  entry.error = sessionError;
+  await appendSession(finishSession(entry, sessionError ? 'error' : 'completed')).catch(() => undefined);
+
   return {
     workflowName,
     summary: `**${workflowName}** (${doneCount}/${logs.length} steps ready)\n${lines.join('\n')}`,

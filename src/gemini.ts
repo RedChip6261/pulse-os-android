@@ -22,7 +22,9 @@ export type Source = { title: string; uri: string };
 export type GeminiPart = { text?: string; inlineData?: { mimeType: string; data: string } };
 export type GeminiContent = { role: 'user' | 'model'; parts: GeminiPart[] };
 
-export type StreamResult = { text: string; sources: Source[]; model: string; searched: boolean };
+export type TokenUsage = { prompt: number; candidates: number; total: number };
+
+export type StreamResult = { text: string; sources: Source[]; model: string; searched: boolean; usage?: TokenUsage };
 
 function thinkingFor(model: string) {
   // Lite models: near-off thinking for speed. Other flash models: low.
@@ -59,7 +61,17 @@ function addSources(into: Source[], meta: any) {
   }
 }
 
-type Attempt = { ok: boolean; status: number; text: string; sources: Source[]; error?: string; aborted?: boolean };
+type Attempt = { ok: boolean; status: number; text: string; sources: Source[]; error?: string; aborted?: boolean; usage?: TokenUsage };
+
+function readUsage(meta: any): TokenUsage | undefined {
+  const u = meta?.usageMetadata;
+  if (!u) return undefined;
+  const prompt = Number(u.promptTokenCount || 0);
+  const candidates = Number(u.candidatesTokenCount || 0);
+  const total = Number(u.totalTokenCount || prompt + candidates);
+  if (!prompt && !candidates && !total) return undefined;
+  return { prompt, candidates, total };
+}
 
 function streamOnce(apiKey: string, model: string, body: string, onPartial?: (t: string) => void, signal?: AbortSignal): Promise<Attempt> {
   return new Promise((resolve) => {
@@ -68,6 +80,7 @@ function streamOnce(apiKey: string, model: string, body: string, onPartial?: (t:
     let buffer = '';
     let full = '';
     const sources: Source[] = [];
+    let usage: TokenUsage | undefined;
     let done = false;
     const finish = (r: Attempt) => {
       if (done) return;
@@ -95,17 +108,19 @@ function streamOnce(apiKey: string, model: string, body: string, onPartial?: (t:
             }
           }
           if (cand?.groundingMetadata) addSources(sources, cand.groundingMetadata);
+          const u = readUsage(j);
+          if (u) usage = u;
         } catch {}
       }
       if (changed && onPartial) onPartial(full);
     };
     if (signal) {
-      if (signal.aborted) return finish({ ok: false, status: 0, text: '', sources, aborted: true });
+      if (signal.aborted) return finish({ ok: false, status: 0, text: '', sources, aborted: true, usage });
       signal.addEventListener('abort', () => {
         try {
           xhr.abort();
         } catch {}
-        finish({ ok: full.length > 0, status: 0, text: full.trim(), sources, aborted: true });
+        finish({ ok: full.length > 0, status: 0, text: full.trim(), sources, aborted: true, usage });
       });
     }
     xhr.open('POST', GEMINI_BASE + encodeURIComponent(model) + ':streamGenerateContent?alt=sse');
@@ -119,7 +134,7 @@ function streamOnce(apiKey: string, model: string, body: string, onPartial?: (t:
       if (xhr.status === 200) {
         buffer += '\n';
         pump();
-        finish({ ok: true, status: 200, text: full.trim(), sources });
+        finish({ ok: true, status: 200, text: full.trim(), sources, usage });
       } else {
         let msg = `Gemini HTTP ${xhr.status}`;
         try {
@@ -127,11 +142,11 @@ function streamOnce(apiKey: string, model: string, body: string, onPartial?: (t:
           const apiMsg = (Array.isArray(parsed) ? parsed[0] : parsed)?.error?.message;
           if (apiMsg) msg = apiMsg;
         } catch {}
-        finish({ ok: false, status: xhr.status, text: '', sources, error: msg });
+        finish({ ok: false, status: xhr.status, text: '', sources, error: msg, usage });
       }
     };
-    xhr.onerror = () => finish(full ? { ok: true, status: 200, text: full.trim(), sources } : { ok: false, status: 0, text: '', sources, error: 'Network error' });
-    xhr.ontimeout = () => finish(full ? { ok: true, status: 200, text: full.trim(), sources } : { ok: false, status: 0, text: '', sources, error: 'Request timed out' });
+    xhr.onerror = () => finish(full ? { ok: true, status: 200, text: full.trim(), sources, usage } : { ok: false, status: 0, text: '', sources, error: 'Network error', usage });
+    xhr.ontimeout = () => finish(full ? { ok: true, status: 200, text: full.trim(), sources, usage } : { ok: false, status: 0, text: '', sources, error: 'Request timed out', usage });
     xhr.send(body);
   });
 }
@@ -156,8 +171,8 @@ export async function streamChat(opts: {
     for (let tries = 0; tries < 3; tries++) {
       const body = buildBody({ system: opts.system, contents: opts.contents, search, thinking, model });
       const r = await streamOnce(key, model, body, opts.onPartial, opts.signal);
-      if (r.aborted) return { text: r.text, sources: r.sources, model, searched: search };
-      if (r.ok && r.text) return { text: r.text, sources: r.sources, model, searched: search };
+      if (r.aborted) return { text: r.text, sources: r.sources, model, searched: search, usage: r.usage };
+      if (r.ok && r.text) return { text: r.text, sources: r.sources, model, searched: search, usage: r.usage };
       if (r.ok && !r.text) {
         lastErr = 'Empty answer';
         break;

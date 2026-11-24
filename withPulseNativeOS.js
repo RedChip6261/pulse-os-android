@@ -33,6 +33,8 @@ function withPulseAccessibilityManifest(config) {
     ensurePerm('android.permission.READ_EXTERNAL_STORAGE');
     ensurePerm('android.permission.READ_MEDIA_IMAGES');
     ensurePerm('android.permission.READ_MEDIA_VIDEO');
+    ensurePerm('android.permission.SYSTEM_ALERT_WINDOW');
+    ensurePerm('android.permission.FOREGROUND_SERVICE');
 
     if (!manifest.queries) manifest.queries = [];
     const queriesBlock = manifest.queries[0] || { package: [], intent: [] };
@@ -244,16 +246,25 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.Path
+import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
 import android.view.Display
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.FrameLayout
+import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
@@ -312,6 +323,32 @@ class PulseAccessibilityService : AccessibilityService() {
         val savedAppCreds = mutableMapOf<String, Pair<String, String>>()
 
         private val workflowSeq = AtomicInteger(0)
+
+        @Volatile
+        var automationPaused: Boolean = false
+
+        @Volatile
+        var hudVisible: Boolean = false
+
+        @Volatile
+        var lastActionSignature: String = ""
+
+        @Volatile
+        var repeatActionCount: Int = 0
+
+        @Volatile
+        var lastLoopGuardHit: String = ""
+
+        const val MAX_REPEAT_SAME_ACTION = 3
+
+        val SESSION_LOG = "pulseos.bridge_session.v1"
+        const val MAX_SESSION_STEPS = 200
+
+        val savedStepLogs = CopyOnWriteArrayList<StepLogEntry>()
+
+        const val MAX_NODE_SCAN = 900
+
+        const val MAX_SEMANTIC_NODES = 60
 
         val KNOWN_APP_PACKAGES: Map<String, List<String>> = mapOf(
             "blinkit" to listOf("com.grofers.customerapp"),
@@ -387,6 +424,93 @@ class PulseAccessibilityService : AccessibilityService() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
 
+    // ---- Session & action logging ----
+
+    data class StepLogEntry(
+        val actionType: String,
+        val target: String,
+        val status: String,
+        val latencyMs: Long,
+        val detail: String,
+        val at: Long
+    )
+
+    data class BridgeSession(
+        val id: String,
+        val workflowName: String,
+        val startedAt: Long,
+        var endedAt: Long = 0L,
+        var status: String = "running",
+        var error: String = "",
+        var loopGuardHit: Boolean = false,
+        val steps: MutableList<StepLogEntry> = ArrayList()
+    )
+
+    @Volatile
+    private var currentSession: BridgeSession? = null
+
+    // Sessions nest (a hands-free voice action can fire inside a workflow), so keep a stack.
+    private val sessionStack = java.util.concurrent.CopyOnWriteArrayList<BridgeSession>()
+
+    private fun newSessionId(): String = System.currentTimeMillis().toString(36) + Math.random().toString(36).substring(2, 8)
+
+    /** Opens a session; subsequent recordStep calls attach to it. */
+    private fun startSession(workflowName: String): BridgeSession {
+        val s = BridgeSession(newSessionId(), workflowName, System.currentTimeMillis())
+        sessionStack.add(s)
+        currentSession = s
+        savedStepLogs.clear()
+        return s
+    }
+
+    /** Records one action step with its latency and outcome. */
+    private fun recordStep(actionType: String, target: String, status: String, latencyMs: Long, detail: String) {
+        val entry = StepLogEntry(actionType, target, status, latencyMs, detail, System.currentTimeMillis())
+        savedStepLogs.add(entry)
+        while (savedStepLogs.size > MAX_SESSION_STEPS) {
+            savedStepLogs.removeAt(0)
+        }
+        currentSession?.steps?.add(entry)
+    }
+
+    /** Closes the session and persists it so the JS layer can read it back. */
+    private fun endSession(status: String, error: String = "", loopGuardHit: Boolean = false) {
+        val s = sessionStack.removeLastOrNull() ?: return
+        s.endedAt = System.currentTimeMillis()
+        s.status = status
+        s.error = error
+        s.loopGuardHit = loopGuardHit
+        currentSession = sessionStack.lastOrNull()
+        persistSession(s)
+    }
+
+    private fun persistSession(s: BridgeSession) {
+        try {
+            val prefs = applicationContext.getSharedPreferences(SESSION_LOG, Context.MODE_PRIVATE)
+            val arr = JSONArray()
+            for (step in s.steps) {
+                val o = JSONObject()
+                o.put("actionType", step.actionType)
+                o.put("target", step.target)
+                o.put("status", step.status)
+                o.put("latencyMs", step.latencyMs)
+                o.put("detail", step.detail)
+                o.put("at", step.at)
+                arr.put(o)
+            }
+            val session = JSONObject()
+            session.put("id", s.id)
+            session.put("workflowName", s.workflowName)
+            session.put("startedAt", s.startedAt)
+            session.put("endedAt", s.endedAt)
+            session.put("status", s.status)
+            session.put("error", s.error)
+            session.put("loopGuardHit", s.loopGuardHit)
+            session.put("steps", arr)
+            prefs.edit().putString("last_session", session.toString()).apply()
+        } catch (_: Exception) {}
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
@@ -406,7 +530,180 @@ class PulseAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         if (instance === this) instance = null
+        // Hide the tactical HUD when the service is destroyed.
+        try {
+            hudView?.let { view ->
+                val wm = applicationContext.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+                wm?.removeViewImmediate(view)
+            }
+        } catch (_: Exception) {}
+        hudView = null
+        hudStatusLabel = null
+        hudVisible = false
         super.onDestroy()
+    }
+
+    // ---- Tactical floating HUD (SYSTEM_ALERT_WINDOW) ----
+
+    @Volatile
+    private var hudView: View? = null
+
+    @Volatile
+    private var hudStatusLabel: TextView? = null
+
+    private fun hudWindowType(): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private fun buildHUD(): View {
+        val container = FrameLayout(applicationContext).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT
+            )
+            setPadding(dp(10), dp(6), dp(6), dp(6))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(10).toFloat()
+                setColor(Color.parseColor("#D9000000"))
+                setStroke(dp(1), Color.parseColor("#55FF3B30"))
+            }
+        }
+
+        val status = TextView(applicationContext).apply {
+            text = "PULSE ARMED"
+            textColor = Color.parseColor("#FF3B30")
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+        hudStatusLabel = status
+        container.addView(status)
+
+        // Kill-switch: instantly halts all automation.
+        val killBtn = TextView(applicationContext).apply {
+            text = "STOP"
+            textColor = Color.WHITE
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(8).toFloat()
+                setColor(Color.parseColor("#FF3B30"))
+            }
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.END or Gravity.CENTER_VERTICAL
+            )
+            setOnClickListener {
+                automationPaused = true
+                resetLoopGuard()
+                lastStatus = "halted"
+                recordStatus("HALTED by user — automation stopped", showToast = true)
+                hudStatusLabel?.text = "PULSE HALTED"
+                hudStatusLabel?.setTextColor(Color.parseColor("#FF3B30"))
+            }
+        }
+        container.addView(killBtn)
+
+        return container
+    }
+
+    /**
+     * Shows the floating tactical HUD. The HUD stays on screen while automation
+     * runs so the user always has a visible kill-switch.
+     */
+    fun showTacticalHUD(message: String, autoHideMs: Long = 0L) {
+        if (hudVisible) {
+            mainHandler.post { hudStatusLabel?.text = message }
+            return
+        }
+
+        // Views and WindowManager calls must happen on the main thread.
+        mainHandler.post {
+            if (hudVisible) {
+                hudStatusLabel?.text = message
+                return@post
+            }
+            val container = buildHUD()
+            hudView = container
+
+            try {
+                val wm = applicationContext.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+                val params = WindowManager.LayoutParams(
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    hudWindowType()
+                ).apply {
+                    format = PixelFormat.TRANSLUCENT
+                    gravity = Gravity.TOP or Gravity.START
+                    x = dp(12)
+                    y = dp(48)
+                    flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                }
+                wm?.addView(container, params)
+                hudVisible = true
+                hudStatusLabel?.text = message
+            } catch (e: Exception) {
+                hudView = null
+                hudStatusLabel = null
+                recordStatus("HUD blocked: enable 'Display over other apps' in Settings", showToast = true)
+                return@post
+            }
+
+            if (autoHideMs > 0L) {
+                mainHandler.postDelayed({ hideTacticalHUD() }, autoHideMs)
+            }
+        }
+    }
+
+    fun hideTacticalHUD() {
+        mainHandler.post {
+            try {
+                hudView?.let { view ->
+                    val wm = applicationContext.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+                    wm?.removeViewImmediate(view)
+                }
+            } catch (_: Exception) {}
+            hudView = null
+            hudStatusLabel = null
+            hudVisible = false
+        }
+    }
+
+    /** Resumes automation after a kill-switch halt. */
+    fun resumeAutomation() {
+        automationPaused = false
+        resetLoopGuard()
+        lastStatus = "idle"
+        recordStatus("Automation resumed", showToast = true)
+        hudStatusLabel?.text = "PULSE ARMED"
+        hudStatusLabel?.setTextColor(Color.parseColor("#34C759"))
+    }
+
+    /** Halts all automation immediately (kill-switch). */
+    fun haltAutomation() {
+        automationPaused = true
+        resetLoopGuard()
+        lastStatus = "halted"
+        recordStatus("HALTED — automation stopped", showToast = true)
+        hudStatusLabel?.text = "PULSE HALTED"
+        hudStatusLabel?.setTextColor(Color.parseColor("#FF3B30"))
     }
 
     private fun recordStatus(message: String, showToast: Boolean = false) {
@@ -415,6 +712,9 @@ class PulseAccessibilityService : AccessibilityService() {
         lastStepLogs.add(message)
         while (lastStepLogs.size > 16) {
             lastStepLogs.removeAt(0)
+        }
+        if (hudVisible) {
+            mainHandler.post { hudStatusLabel?.text = message.take(48) }
         }
         if (showToast) {
             mainHandler.post {
@@ -445,6 +745,152 @@ class PulseAccessibilityService : AccessibilityService() {
             return rootInActiveWindow
         }
     }
+
+    // ---- Compact semantic UI model ----
+
+    data class SemanticNode(
+        val node: AccessibilityNodeInfo,
+        val label: String,
+        val role: String,
+        val bounds: Rect,
+        val clickable: Boolean,
+        val editable: Boolean,
+        val scrollable: Boolean,
+        val checked: Boolean,
+        val enabled: Boolean,
+        val depth: Int
+    )
+
+    private fun nodeRole(n: AccessibilityNodeInfo): String {
+        if (n.isEditable) return "input"
+        val cls = n.className?.toString()?.lowercase() ?: ""
+        return when {
+            n.isCheckable -> "checkbox"
+            n.isButton || cls.contains("button") -> "button"
+            n.isClickable -> "clickable"
+            n.isScrollable -> "scrollable"
+            cls.contains("edittext") || cls.contains("textfield") -> "input"
+            cls.contains("image") || cls.contains("icon") -> "icon"
+            cls.contains("text") -> "text"
+            else -> "node"
+        }
+    }
+
+    private fun nodeLabel(n: AccessibilityNodeInfo): String {
+        val t = n.text?.toString()?.trim().orEmpty()
+        val d = n.contentDescription?.toString()?.trim().orEmpty()
+        val hint = if (Build.VERSION.SDK_INT >= 26) n.hintText?.toString()?.trim().orEmpty() else ""
+        val id = n.viewIdResourceName?.substringAfterLast("/")?.trim().orEmpty()
+        val primary = when {
+            t.isNotEmpty() -> t
+            d.isNotEmpty() -> d
+            hint.isNotEmpty() -> hint
+            else -> ""
+        }
+        val secondary = when {
+            primary.isEmpty() -> id
+            id.isNotEmpty() && id != primary -> "\$primary · \$id"
+            else -> primary
+        }
+        return secondary.replace("\\n", " ").replace("\\s+".toRegex(), " ").trim().take(120)
+    }
+
+    /**
+     * Prunes the raw accessibility tree down to a compact semantic set:
+     * drops invisible/empty/zero-size nodes, collapses container chains that
+     * carry no label of their own, and keeps only nodes that a human could
+     * actually act on or read.
+     */
+    private fun collectSemanticNodes(root: AccessibilityNodeInfo, limit: Int = MAX_SEMANTIC_NODES): List<SemanticNode> {
+        val out = ArrayList<SemanticNode>()
+        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
+        val seen = HashSet<String>()
+        queue.add(Pair(root, 0))
+        var scanned = 0
+
+        while (queue.isNotEmpty() && out.size < limit && scanned < MAX_NODE_SCAN) {
+            val (n, depth) = queue.removeFirst()
+            scanned++
+
+            try {
+                if (!n.isVisibleToUser) continue
+                val rect = Rect()
+                n.getBoundsInScreen(rect)
+                if (rect.width() <= 0 || rect.height() <= 0) continue
+
+                val label = nodeLabel(n)
+                val role = nodeRole(n)
+                val actionable = n.isClickable || n.isEditable || n.isCheckable || n.isScrollable || n.isLongClickable
+                val readable = label.isNotEmpty()
+
+                if (actionable || readable) {
+                    // Dedupe on a semantic key so repeated list rows collapse but
+                    // distinct elements at different positions are preserved.
+                    val key = "\$role|\$label|\${rect.left},\${rect.top},\${rect.width()},\${rect.height()}"
+                    if (seen.add(key)) {
+                        out.add(
+                            SemanticNode(
+                                node = n,
+                                label = label,
+                                role = role,
+                                bounds = Rect(rect),
+                                clickable = n.isClickable,
+                                editable = n.isEditable,
+                                scrollable = n.isScrollable,
+                                checked = n.isChecked,
+                                enabled = n.isEnabled,
+                                depth = depth
+                            )
+                        )
+                    }
+                }
+
+                // Only descend into containers that could still hold meaningful children.
+                if (depth < 40) {
+                    for (i in 0 until n.childCount) {
+                        n.getChild(i)?.let { queue.add(Pair(it, depth + 1)) }
+                    }
+                }
+            } catch (_: Exception) {
+                // Stale node — skip and continue.
+            }
+        }
+        return out
+    }
+
+    // ---- Loop detection & retry guards ----
+
+    private fun actionSignature(action: String, payload: String): String = "\$action::\$payload"
+
+    /**
+     * Returns false when the same action has been repeated too many times in a row,
+     * which indicates the automation is stuck in a loop.
+     */
+    private fun guardAgainstLoop(action: String, payload: String): Boolean {
+        val sig = actionSignature(action, payload)
+        if (sig == lastActionSignature) {
+            repeatActionCount++
+        } else {
+            lastActionSignature = sig
+            repeatActionCount = 1
+        }
+        if (repeatActionCount > MAX_REPEAT_SAME_ACTION) {
+            lastLoopGuardHit = "\$action x\$repeatActionCount"
+            recordStep("loop_guard", action, "error", 0L, "Loop guard tripped on \$action (x\$repeatActionCount)")
+            currentSession?.loopGuardHit = true
+            recordStatus("Loop guard tripped on \$action — aborting", showToast = true)
+            return false
+        }
+        return true
+    }
+
+    private fun resetLoopGuard() {
+        lastActionSignature = ""
+        repeatActionCount = 0
+        lastLoopGuardHit = ""
+    }
+
+    private fun isAutomationPaused(): Boolean = automationPaused
 
     private fun waitForExternalAppWindow(timeoutMs: Long = 5500L): Boolean {
         val start = System.currentTimeMillis()
@@ -584,21 +1030,93 @@ class PulseAccessibilityService : AccessibilityService() {
     }
 
     private fun setNodeTextDirect(node: AccessibilityNodeInfo, value: String): Boolean {
-        node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        if (isAutomationPaused()) return false
+        try { node.performAction(AccessibilityNodeInfo.ACTION_CLICK) } catch (_: Exception) {}
+        try { node.performAction(AccessibilityNodeInfo.ACTION_FOCUS) } catch (_: Exception) {}
+
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value)
         }
-        if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+        if (try { node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args) } catch (_: Exception) { false }) {
             return true
         }
-        return try {
+
+        // Clipboard paste fallback for fields that reject ACTION_SET_TEXT.
+        val pasted = try {
             val cm = applicationContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
             cm?.setPrimaryClip(ClipData.newPlainText("pulse_input", value))
             node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
         } catch (_: Exception) {
             false
         }
+        if (pasted) return true
+
+        // Last resort: focus the field and inject the text via the IME.
+        return try {
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            val root = getActiveRoot()
+            val focused = root?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            if (focused != null && focused.isEditable) {
+                val focusedArgs = Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value)
+                }
+                focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, focusedArgs)
+            } else {
+                false
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Types text into a target field with retries: focuses the field, sets the
+     * text, and verifies the field actually holds the value before reporting
+     * success. Falls back to re-acquiring the editable node between attempts.
+     */
+    private fun typeTextWithRetry(targetLabel: String?, textToEnter: String, attempts: Int = 3): Boolean {
+        if (isAutomationPaused()) return false
+        for (attempt in 0 until attempts) {
+            if (isAutomationPaused()) return false
+            var targetNode: AccessibilityNodeInfo? = null
+
+            if (!targetLabel.isNullOrBlank()) {
+                val root = getActiveRoot()
+                if (root != null) {
+                    val found = findNodeMultiTier(root, targetLabel.trim())
+                    if (found != null) {
+                        if (found.isEditable) {
+                            targetNode = found
+                        } else {
+                            performClickOrTap(found)
+                            Thread.sleep(420)
+                            targetNode = findEditableNode(getActiveRoot())
+                        }
+                    }
+                }
+            }
+            if (targetNode == null) {
+                targetNode = findEditableNode(getActiveRoot())
+            }
+
+            val node = targetNode ?: run {
+                Thread.sleep(320)
+                continue
+            }
+
+            if (setNodeTextDirect(node, textToEnter)) {
+                // Verify the field actually received the text.
+                Thread.sleep(220)
+                val current = node.text?.toString()?.trim().orEmpty()
+                if (current.contains(textToEnter.trim().take(24)) || current.isEmpty()) {
+                    return true
+                }
+                // Field may have masked the value (password) — accept the write.
+                if (node.isPassword) return true
+            }
+            Thread.sleep(280)
+        }
+        return false
     }
 
     fun captureVerificationScreenshotSync(timeoutMs: Long = 2500L): String {
@@ -718,9 +1236,13 @@ class PulseAccessibilityService : AccessibilityService() {
             try {
                 lastStepLogs.clear()
                 lastStatus = "running"
+                automationPaused = false
+                resetLoopGuard()
+                showTacticalHUD("PULSE · messaging \$appKey")
                 recordStatus("Opening \$appKey for messaging…", showToast = false)
                 waitForExternalAppWindow(5200L)
                 if (workflowSeq.get() != mySeq) return@execute
+                if (isAutomationPaused()) return@execute
                 Thread.sleep(900)
 
                 if (hasDirectDeepLink) {
@@ -767,9 +1289,11 @@ class PulseAccessibilityService : AccessibilityService() {
                 lastCartVerified = true
                 lastCartSummary = "Message action completed in \$appKey"
                 recordStatus(lastCartSummary, showToast = true)
+                hideTacticalHUD()
             } catch (e: Exception) {
                 lastStatus = "error"
                 recordStatus("Messaging error: \${e.message}", showToast = false)
+                hideTacticalHUD()
             }
         }
     }
@@ -839,10 +1363,15 @@ class PulseAccessibilityService : AccessibilityService() {
                 lastStatus = "running"
                 lastCartVerified = false
                 lastScreenshotBase64 = ""
+                automationPaused = false
+                resetLoopGuard()
+                showTacticalHUD("PULSE · \$appKey")
                 recordStatus("Launching workflow in \$appKey…", showToast = false)
+                startSession("autonomous_workflow")
 
                 waitForExternalAppWindow(5200L)
                 if (workflowSeq.get() != mySeq) return@execute
+                if (isAutomationPaused()) return@execute
                 Thread.sleep(800)
 
                 if (actionMode.equals("login", ignoreCase = true)) {
@@ -901,6 +1430,8 @@ class PulseAccessibilityService : AccessibilityService() {
                     var typedOk = false
                     for (attempt in 0 until 3) {
                         if (workflowSeq.get() != mySeq) return@execute
+                        if (isAutomationPaused()) return@execute
+                        if (!guardAgainstLoop("type_search", query)) return@execute
                         val existingEdit = findEditableNode(getActiveRoot())
                         if (existingEdit != null && setNodeTextDirect(existingEdit, query)) {
                             typedOk = true
@@ -1047,6 +1578,13 @@ class PulseAccessibilityService : AccessibilityService() {
                         }
                     }
 
+                    if (!added && !guardAgainstLoop("add_to_cart", query)) {
+                        lastStatus = "halted"
+                        recordStatus("Loop guard tripped while adding to cart", showToast = true)
+                        hideTacticalHUD()
+                        return@execute
+                    }
+
                     Thread.sleep(850)
                     val sheetConfirm = waitForMatchingNode(listOf("Add item", "Confirm", "Continue", "Done", "Go to Cart", "View Cart"), 1000L)
                     if (sheetConfirm != null && !sheetConfirm.isEditable) {
@@ -1077,9 +1615,13 @@ class PulseAccessibilityService : AccessibilityService() {
                     lastStatus = "verified"
                     recordStatus("Completed '\$query' in \$appKey", showToast = true)
                 }
+                hideTacticalHUD()
             } catch (e: Exception) {
                 lastStatus = "error"
                 recordStatus("Workflow error in \$appKey: \${e.message ?: "paused"}", showToast = false)
+                hideTacticalHUD()
+            } finally {
+                endSession(if (lastLoopGuardHit) "error" else "completed", lastStatus, lastLoopGuardHit)
             }
         }
     }
@@ -1214,40 +1756,85 @@ class PulseAccessibilityService : AccessibilityService() {
         val root = getActiveRoot() ?: return ""
         val pkg = root.packageName?.toString() ?: "unknown"
         val sb = StringBuilder("ActiveAppPackage: \$pkg\\nElements:\\n")
-        val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.add(root)
-        var count = 0
-        while (queue.isNotEmpty() && count < maxNodes) {
-            val node = queue.removeFirst()
-            if (node.isVisibleToUser) {
-                val t = node.text?.toString()?.trim()?.replace("\\n", " ").orEmpty()
-                val d = node.contentDescription?.toString()?.trim()?.replace("\\n", " ").orEmpty()
-                val id = node.viewIdResourceName?.substringAfterLast("/").orEmpty()
-                val rect = Rect()
-                node.getBoundsInScreen(rect)
-                if ((t.isNotEmpty() || d.isNotEmpty() || node.isClickable || node.isEditable) && rect.width() > 0 && rect.height() > 0) {
-                    val tag = when {
-                        node.isEditable -> "INPUT"
-                        node.isClickable -> "BTN"
-                        else -> "TXT"
-                    }
-                    val label = listOf(t, d, id).filter { it.isNotEmpty() }.joinToString(" | ").take(80)
-                    if (label.isNotEmpty() || node.isEditable) {
-                        sb.append("[\$count] \$tag (\$label) @(\${rect.centerX()},\${rect.centerY()})\\n")
-                        count++
-                    }
-                }
+        val nodes = collectSemanticNodes(root, maxNodes.coerceAtMost(MAX_SEMANTIC_NODES))
+        nodes.forEachIndexed { index, sn ->
+            val tag = when {
+                sn.editable -> "INPUT"
+                sn.clickable -> "BTN"
+                sn.scrollable -> "SCROLL"
+                sn.role == "checkbox" -> "CHECK"
+                else -> "TXT"
             }
-            for (i in 0 until node.childCount) {
-                node.getChild(i)?.let { queue.add(it) }
-            }
+            val label = sn.label.ifEmpty { sn.role }.take(80)
+            sb.append("[\$index] \$tag (\$label) @(\${sn.bounds.centerX()},\${sn.bounds.centerY()})\\n")
         }
         val out = sb.toString()
         lastScreenTextDump = out
         return out
     }
 
+    /**
+     * Dispatches a gesture and waits for the system to actually complete it.
+     * AccessibilityService.dispatchGesture is asynchronous and silently drops
+     * gestures when another gesture is still in flight, so we serialise them
+     * behind a lock and confirm completion via the callback.
+     *
+     * The callback is delivered on the main thread, so this must never be
+     * invoked from the main thread itself — otherwise the latch would never
+     * be released.
+     */
+    private val gestureLock = Object()
+
+    private fun dispatchGestureReliable(gesture: GestureDescription, retries: Int = 2): Boolean {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            // Called from the main thread: dispatch without waiting for the callback.
+            return try {
+                dispatchGesture(gesture, null, mainHandler)
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        var attempt = 0
+        while (attempt <= retries) {
+            val latch = CountDownLatch(1)
+            var completed = false
+            try {
+                synchronized(gestureLock) {
+                    val ok = dispatchGesture(
+                        gesture,
+                        object : GestureResultCallback() {
+                            override fun onCompleted(description: GestureDescription?) {
+                                completed = true
+                                latch.countDown()
+                            }
+
+                            override fun onCancelled(description: GestureDescription?) {
+                                latch.countDown()
+                            }
+                        },
+                        mainHandler
+                    )
+                    if (!ok) {
+                        latch.countDown()
+                    } else {
+                        latch.await(2500L, TimeUnit.MILLISECONDS)
+                    }
+                }
+            } catch (_: Exception) {
+                completed = false
+            }
+            if (completed) return true
+            attempt++
+            if (attempt <= retries) {
+                try { Thread.sleep(120) } catch (_: InterruptedException) { return false }
+            }
+        }
+        return false
+    }
+
     fun tapCoordinate(x: Float, y: Float, durationMs: Long = 75L): Boolean {
+        if (isAutomationPaused()) return false
         val w = screenWidth().toFloat()
         val h = screenHeight().toFloat()
         val px = if (x in 0.001f..1.0f && y in 0.001f..1.0f) x * w else x
@@ -1258,10 +1845,14 @@ class PulseAccessibilityService : AccessibilityService() {
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0L, durationMs.coerceIn(40L, 600L)))
             .build()
-        return dispatchGesture(gesture, null, mainHandler)
+        val started = System.currentTimeMillis()
+        val ok = dispatchGestureReliable(gesture)
+        recordStep("tap", "\${clampedX.toInt()},\${clampedY.toInt()}", if (ok) "done" else "error", System.currentTimeMillis() - started, "Tap at \${clampedX.toInt()},\${clampedY.toInt()}")
+        return ok
     }
 
     fun swipe(startX: Float, startY: Float, endX: Float, endY: Float, durationMs: Long = 260L): Boolean {
+        if (isAutomationPaused()) return false
         val w = screenWidth().toFloat()
         val h = screenHeight().toFloat()
         val sx = startX.coerceIn(1f, w - 1f)
@@ -1275,70 +1866,142 @@ class PulseAccessibilityService : AccessibilityService() {
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0L, durationMs.coerceIn(100L, 1000L)))
             .build()
-        return dispatchGesture(gesture, null, mainHandler)
+        val started = System.currentTimeMillis()
+        val ok = dispatchGestureReliable(gesture)
+        recordStep("swipe", "\${sx.toInt()},\${sy.toInt()} -> \${ex.toInt()},\${ey.toInt()}", if (ok) "done" else "error", System.currentTimeMillis() - started, "Swipe from \${sx.toInt()},\${sy.toInt()} to \${ex.toInt()},\${ey.toInt()}")
+        return ok
     }
 
+    /**
+     * Scrolls using the accessibility scroll action on a scrollable node when one
+     * is available, falling back to a swipe gesture otherwise. Retries with a
+     * different anchor if the first attempt does not move the content.
+     */
     fun scrollDirection(dir: String): Boolean {
+        if (isAutomationPaused()) return false
+        val direction = dir.lowercase().trim()
         val w = screenWidth().toFloat()
         val h = screenHeight().toFloat()
-        return when (dir.lowercase().trim()) {
+        val started = System.currentTimeMillis()
+
+        val action = when (direction) {
+            "up" -> AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+            "left" -> AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+            "right" -> AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+            else -> AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+        }
+
+        // Prefer a real scrollable node so nested scroll containers behave.
+        val root = getActiveRoot()
+        if (root != null) {
+            val scrollable = collectSemanticNodes(root, 120).firstOrNull { it.scrollable && it.enabled }
+            if (scrollable != null) {
+                val args = Bundle().apply {
+                    putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SCROLL_AXIS_VERTICAL, 1)
+                }
+                if (scrollable.node.performAction(action, args)) {
+                    recordStep("scroll", direction, "done", System.currentTimeMillis() - started, "Scrolled \$direction")
+                    return true
+                }
+                if (scrollable.node.performAction(action)) {
+                    recordStep("scroll", direction, "done", System.currentTimeMillis() - started, "Scrolled \$direction")
+                    return true
+                }
+            }
+        }
+
+        val swipeOk = when (direction) {
             "up" -> swipe(w * 0.5f, h * 0.30f, w * 0.5f, h * 0.78f, 260L)
             "left" -> swipe(w * 0.82f, h * 0.5f, w * 0.18f, h * 0.5f, 260L)
             "right" -> swipe(w * 0.18f, h * 0.5f, w * 0.82f, h * 0.5f, 260L)
             else -> swipe(w * 0.5f, h * 0.76f, w * 0.5f, h * 0.26f, 260L)
         }
+        if (swipeOk) {
+            recordStep("scroll", direction, "done", System.currentTimeMillis() - started, "Scrolled \$direction")
+            return true
+        }
+
+        // Retry once from a slightly different anchor in case the first swipe
+        // landed on a non-scrollable region.
+        val retried = when (direction) {
+            "up" -> swipe(w * 0.5f, h * 0.38f, w * 0.5f, h * 0.72f, 300L)
+            "left" -> swipe(w * 0.75f, h * 0.5f, w * 0.25f, h * 0.5f, 300L)
+            "right" -> swipe(w * 0.25f, h * 0.5f, w * 0.75f, h * 0.5f, 300L)
+            else -> swipe(w * 0.5f, h * 0.70f, w * 0.5f, h * 0.32f, 300L)
+        }
+        recordStep("scroll", direction, if (retried) "done" else "error", System.currentTimeMillis() - started, "Scrolled \$direction")
+        return retried
     }
 
     fun clickNodeByText(targetText: String): Boolean {
+        if (isAutomationPaused()) return false
+        if (!guardAgainstLoop("click_text", targetText.trim().lowercase())) return false
+        val started = System.currentTimeMillis()
         val root = getActiveRoot() ?: return false
         val matched = findNodeMultiTier(root, targetText) ?: return false
-        return performClickOrTap(matched)
+        val ok = performClickOrTap(matched)
+        recordStep("click", targetText.trim(), if (ok) "done" else "error", System.currentTimeMillis() - started, "Clicked '\$targetText'")
+        return ok
     }
 
+    /**
+     * Clicks a node, walking up to the nearest clickable ancestor. If the
+     * accessibility click does not take effect, falls back to a coordinate tap
+     * at the node's centre. Retries once with a small offset jitter because
+     * some apps ignore taps that land exactly on a text baseline.
+     */
     private fun performClickOrTap(node: AccessibilityNodeInfo): Boolean {
+        if (isAutomationPaused()) return false
         var cur: AccessibilityNodeInfo? = node
         var depth = 0
         while (cur != null && depth < 6) {
-            if (cur.isClickable && cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
-            cur = cur.parent
+            try {
+                if (cur.isClickable && cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+            } catch (_: Exception) {}
+            cur = try { cur.parent } catch (_: Exception) { null }
             depth++
         }
+
         val rect = Rect()
-        node.getBoundsInScreen(rect)
-        if (!rect.isEmpty && rect.centerX() > 0 && rect.centerY() > 0) {
-            return tapCoordinate(rect.centerX().toFloat(), rect.centerY().toFloat())
-        }
-        return false
+        try { node.getBoundsInScreen(rect) } catch (_: Exception) {}
+        if (rect.isEmpty || rect.centerX() <= 0 || rect.centerY() <= 0) return false
+
+        if (tapCoordinate(rect.centerX().toFloat(), rect.centerY().toFloat())) return true
+
+        // Retry with a slight vertical offset — some hit targets are offset from
+        // their reported bounds.
+        val offsetY = (rect.height() * 0.18f).coerceAtLeast(6f)
+        val retryY = if (rect.centerY() + offsetY < rect.bottom) rect.centerY() + offsetY else rect.centerY() - offsetY
+        return tapCoordinate(rect.centerX().toFloat(), retryY.toFloat())
+    }
+
+    /**
+     * Cheap hash of the visible semantic surface, used to detect whether the
+     * screen actually changed after an action.
+     */
+    private fun screenFingerprint(): String {
+        val root = getActiveRoot() ?: return ""
+        val nodes = collectSemanticNodes(root, 40)
+        val sb = StringBuilder()
+        nodes.forEach { sb.append(it.label).append('|').append(it.role).append(';') }
+        return sb.toString().hashCode().toString()
     }
 
     fun inputTextIntoNode(targetLabel: String?, textToEnter: String): Boolean {
-        val root = getActiveRoot() ?: return false
-        var targetNode: AccessibilityNodeInfo? = null
-        if (!targetLabel.isNullOrBlank()) {
-            val found = findNodeMultiTier(root, targetLabel.trim())
-            if (found != null) {
-                if (found.isEditable) {
-                    targetNode = found
-                } else {
-                    performClickOrTap(found)
-                    Thread.sleep(500)
-                    targetNode = findEditableNode(getActiveRoot())
-                }
-            }
-        }
-        if (targetNode == null) {
-            targetNode = findEditableNode(root)
-        }
-        val node = targetNode ?: return false
-        val ok = setNodeTextDirect(node, textToEnter)
+        if (isAutomationPaused()) return false
+        if (!guardAgainstLoop("input_text", "\${targetLabel.orEmpty()}|\$textToEnter")) return false
+        val started = System.currentTimeMillis()
+        val ok = typeTextWithRetry(targetLabel, textToEnter)
         if (ok) {
             Thread.sleep(250)
             pressImeEnterOnFocused()
         }
+        recordStep("type", targetLabel ?: "field", if (ok) "done" else "error", System.currentTimeMillis() - started, "Typed into '\${targetLabel ?: "field"}'")
         return ok
     }
 
     fun selectPrimaryVisibleItem(hintText: String = ""): Boolean {
+        if (isAutomationPaused()) return false
         val cleanHint = hintText.trim()
         val lowerHint = cleanHint.lowercase()
 
@@ -1408,13 +2071,38 @@ class PulseAccessibilityService : AccessibilityService() {
             "Place Order", "Buy Now", "Add to Cart", "Go to Cart", "View Cart",
             "Next", "Submit", "Confirm", "Send", "Apply", "Done", "Accept", "Allow", "OK", "ADD"
         )
+        val started = System.currentTimeMillis()
         for (label in ctas) {
-            if (clickNodeByText(label)) {
-                recordStatus("Proceeded via " + label, false)
-                return true
+            if (!guardAgainstLoop("proceed_cta", label)) return false
+            val root = getActiveRoot() ?: continue
+            val node = findNodeMultiTier(root, label) ?: continue
+            if (node.isEditable) continue
+            // Verify the CTA actually advanced the screen; fall back to a raw tap
+            // when the accessibility click is swallowed by the app.
+            val before = screenFingerprint()
+            if (performClickOrTap(node)) {
+                Thread.sleep(320)
+                if (screenFingerprint() != before) {
+                    recordStatus("Proceeded via " + label, false)
+                    recordStep("proceed", label, "done", System.currentTimeMillis() - started, "Proceeded via \$label")
+                    return true
+                }
+                val rect = Rect()
+                try { node.getBoundsInScreen(rect) } catch (_: Exception) {}
+                if (!rect.isEmpty) {
+                    tapCoordinate(rect.centerX().toFloat(), rect.centerY().toFloat())
+                    Thread.sleep(320)
+                    if (screenFingerprint() != before) {
+                        recordStatus("Proceeded via " + label, false)
+                        recordStep("proceed", label, "done", System.currentTimeMillis() - started, "Proceeded via \$label")
+                        return true
+                    }
+                }
             }
         }
-        return selectPrimaryVisibleItem("")
+        val ok = selectPrimaryVisibleItem("")
+        recordStep("proceed", "fallback", if (ok) "done" else "error", System.currentTimeMillis() - started, "Proceeded via fallback selection")
+        return ok
     }
 
     fun executeHandsFreeVoiceAction(spokenText: String): JSONObject {
@@ -1422,6 +2110,8 @@ class PulseAccessibilityService : AccessibilityService() {
         val raw = spokenText.trim()
         val lower = raw.lowercase()
         res.put("spoken", raw)
+        startSession("handsfree_voice")
+        try {
         when {
             lower.contains("scroll down") || lower.contains("go down") || lower == "down" ||
             lower.contains("kindiki") || raw.contains("క్రిందికి") || raw.contains("కిందికి") -> {
@@ -1488,6 +2178,9 @@ class PulseAccessibilityService : AccessibilityService() {
             else -> {
                 res.put("handled", false)
             }
+        }
+        } finally {
+            endSession("completed", if (res.optBoolean("handled")) "" else "No matching voice action")
         }
         return res
     }
@@ -1624,13 +2317,31 @@ class PulseBridgeModule(private val reactContext: ReactApplicationContext) :
                 "sound", "volume" -> Settings.ACTION_SOUND_SETTINGS
                 "accessibility" -> Settings.ACTION_ACCESSIBILITY_SETTINGS
                 "location" -> Settings.ACTION_LOCATION_SOURCE_SETTINGS
+                "overlay" -> Settings.ACTION_MANAGE_OVERLAY_PERMISSION
                 else -> Settings.ACTION_SETTINGS
             }
             val intent = Intent(action).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                if (panel?.lowercase()?.trim() == "overlay") {
+                    intent.data = Uri.parse("package:\${reactContext.packageName}")
+                }
             }
             reactContext.startActivity(intent)
             promise.resolve(true)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun hasOverlayPermission(promise: Promise) {
+        try {
+            val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                Settings.canDrawOverlays(reactContext)
+            } else {
+                true
+            }
+            promise.resolve(granted)
         } catch (e: Exception) {
             promise.resolve(false)
         }
@@ -2001,6 +2712,27 @@ class PulseBridgeModule(private val reactContext: ReactApplicationContext) :
             logsArr.pushString(l)
         }
         map.putArray("stepLogs", logsArr)
+        // Include the persisted bridge session (steps with latency/status) when present.
+        try {
+            val svc = PulseAccessibilityService.instance
+            if (svc != null) {
+                val prefs = reactContext.getSharedPreferences("pulseos.bridge_session.v1", Context.MODE_PRIVATE)
+                val raw = prefs.getString("last_session", "") ?: ""
+                if (raw.isNotEmpty()) map.putString("bridgeSession", raw)
+                val structured = Arguments.createArray()
+                for (e in svc.savedStepLogs) {
+                    val o = Arguments.createMap()
+                    o.putString("actionType", e.actionType)
+                    o.putString("target", e.target)
+                    o.putString("status", e.status)
+                    o.putDouble("latencyMs", e.latencyMs.toDouble())
+                    o.putString("detail", e.detail)
+                    o.putDouble("at", e.at.toDouble())
+                    structured.pushMap(o)
+                }
+                map.putArray("actionSteps", structured)
+            }
+        } catch (_: Exception) {}
         promise.resolve(map)
     }
 
@@ -2024,6 +2756,61 @@ class PulseBridgeModule(private val reactContext: ReactApplicationContext) :
             promise.resolve(dump)
         } catch (e: Exception) {
             promise.resolve("")
+        }
+    }
+
+    @ReactMethod
+    fun showTacticalHUD(message: String?, promise: Promise) {
+        try {
+            PulseAccessibilityService.instance?.showTacticalHUD(message ?: "PULSE ARMED")
+            promise.resolve(PulseAccessibilityService.hudVisible)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun hideTacticalHUD(promise: Promise) {
+        try {
+            PulseAccessibilityService.instance?.hideTacticalHUD()
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun haltAutomation(promise: Promise) {
+        try {
+            PulseAccessibilityService.instance?.haltAutomation()
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun resumeAutomation(promise: Promise) {
+        try {
+            PulseAccessibilityService.instance?.resumeAutomation()
+            promise.resolve(!PulseAccessibilityService.automationPaused)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun getAutomationGuardState(promise: Promise) {
+        try {
+            val map = Arguments.createMap()
+            map.putBoolean("paused", PulseAccessibilityService.automationPaused)
+            map.putString("lastActionSignature", PulseAccessibilityService.lastActionSignature)
+            map.putInt("repeatActionCount", PulseAccessibilityService.repeatActionCount)
+            map.putString("lastLoopGuardHit", PulseAccessibilityService.lastLoopGuardHit)
+            map.putBoolean("hudVisible", PulseAccessibilityService.hudVisible)
+            promise.resolve(map)
+        } catch (e: Exception) {
+            promise.reject("GUARD_STATE_ERR", e.message)
         }
     }
 

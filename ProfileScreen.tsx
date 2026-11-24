@@ -1,7 +1,7 @@
 /*
  * Pulse OS — Dedicated User Profile & Account Management Page
  */
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   Alert,
   Pressable,
@@ -15,6 +15,23 @@ import {
 import type { VoiceLanguageMode } from './pulseFeatures';
 import { UserProfile } from './src/assistant';
 import { changeAccountPassword, PublicUser, updateAccountProfile } from './src/auth';
+import {
+  getAutomationGuardState,
+  haltAutomation,
+  hasOverlayPermission,
+  isAccessibilityEnabled,
+  openAccessibilitySettings,
+  openOverlaySettings,
+  resumeAutomation,
+} from './src/bridge';
+import {
+  deleteMacro,
+  loadMacros,
+  loadSessionLogs,
+  MacroSequence,
+  SessionLog,
+  syncBridgeSession,
+} from './src/sessionLog';
 
 const C = {
   bg: '#090C12',
@@ -26,6 +43,7 @@ const C = {
   accent: '#6366F1',
   cyan: '#38BDF8',
   good: '#10B981',
+  warn: '#F59E0B',
   danger: '#EF4444',
 };
 
@@ -46,6 +64,7 @@ export default function ProfileScreen({
   setVoiceOn,
   stats,
   onClose,
+  onRunMacro,
 }: {
   user: PublicUser | null;
   profile: UserProfile;
@@ -61,6 +80,7 @@ export default function ProfileScreen({
   setVoiceOn: (v: boolean) => void;
   stats: { memories: number; reminders: number; workflows: number; notes: number };
   onClose: () => void;
+  onRunMacro?: (trigger: string) => void;
 }) {
   const [name, setName] = useState(user?.name || profile.name);
   const [email, setEmail] = useState(user?.email || profile.email);
@@ -70,6 +90,97 @@ export default function ProfileScreen({
   const [newPw, setNewPw] = useState('');
   const [status, setStatus] = useState('');
   const [pwStatus, setPwStatus] = useState('');
+
+  const [overlayOn, setOverlayOn] = useState(false);
+  const [overlayKnown, setOverlayKnown] = useState(false);
+  const [accessOn, setAccessOn] = useState(false);
+  const [guardPaused, setGuardPaused] = useState(false);
+  const [guardText, setGuardText] = useState('');
+  const [sessions, setSessions] = useState<SessionLog[]>([]);
+  const [macros, setMacros] = useState<MacroSequence[]>([]);
+  const [logOpen, setLogOpen] = useState(false);
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  const refreshPermissions = useCallback(async () => {
+    const [overlay, access] = await Promise.all([hasOverlayPermission(), isAccessibilityEnabled()]);
+    setOverlayOn(overlay);
+    setOverlayKnown(true);
+    setAccessOn(access);
+  }, []);
+
+  const refreshLogs = useCallback(async () => {
+    await syncBridgeSession().catch(() => undefined);
+    const [s, m] = await Promise.all([loadSessionLogs(), loadMacros()]);
+    setSessions(s);
+    setMacros(m);
+  }, []);
+
+  useEffect(() => {
+    refreshPermissions();
+    refreshLogs();
+  }, [refreshPermissions, refreshLogs]);
+
+  const toggleOverlay = async (next: boolean) => {
+    if (!next) {
+      // Android has no runtime revoke — the user must turn it off in system settings.
+      setOverlayOn(false);
+      await openOverlaySettings();
+      return;
+    }
+    const granted = await hasOverlayPermission();
+    if (granted) {
+      setOverlayOn(true);
+      return;
+    }
+    await openOverlaySettings();
+    setOverlayOn(false);
+  };
+
+  const toggleAccessibility = async (next: boolean) => {
+    if (!next) {
+      setAccessOn(false);
+      await openAccessibilitySettings();
+      return;
+    }
+    await openAccessibilitySettings();
+  };
+
+  const toggleGuard = async () => {
+    const next = !guardPaused;
+    const ok = next ? await haltAutomation() : await resumeAutomation();
+    setGuardPaused(next);
+    setGuardText(ok ? (next ? 'Automation paused.' : 'Automation resumed.') : 'Guard control is unavailable on this build.');
+  };
+
+  const refreshGuard = async () => {
+    const g = await getAutomationGuardState();
+    if (!g) {
+      setGuardText('Guard status is only available on an Android build with the Pulse service enabled.');
+      return;
+    }
+    setGuardPaused(g.paused);
+    setGuardText(
+      [
+        `HUD ${g.hudVisible ? 'visible' : 'hidden'}`,
+        `repeat ${g.repeatActionCount}${g.lastActionSignature ? ` (${g.lastActionSignature})` : ''}`,
+        g.lastLoopGuardHit ? `loop guard: ${g.lastLoopGuardHit}` : 'loop guard clear',
+      ].join(' · '),
+    );
+  };
+
+  const removeMacro = (m: MacroSequence) => {
+    Alert.alert('Delete macro?', `"${m.name}" will no longer be replayable.`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: async () => {
+          await deleteMacro(m.id);
+          refreshLogs();
+        },
+      },
+    ]);
+  };
 
   const initials = (name || email || 'P')
     .split(/\s+/)
@@ -205,6 +316,131 @@ export default function ProfileScreen({
           </View>
         </View>
 
+        <View style={s.card}>
+          <Text style={s.cardTitle}>Automation Permissions</Text>
+          <Text style={s.muted}>
+            Pulse draws a tactical HUD over other apps while it automates your phone. Both permissions are managed by Android.
+          </Text>
+          <View style={s.rowBetween}>
+            <View style={{ flex: 1, paddingRight: 10 }}>
+              <Text style={s.bodyText}>Overlay permission</Text>
+              <Text style={s.muted}>
+                {overlayKnown ? (overlayOn ? 'Granted — the HUD can float above other apps.' : 'Not granted — tap to open Android settings.') : 'Checking…'}
+              </Text>
+            </View>
+            <Switch value={overlayOn} onValueChange={toggleOverlay} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
+          </View>
+          <View style={s.rowBetween}>
+            <View style={{ flex: 1, paddingRight: 10 }}>
+              <Text style={s.bodyText}>Accessibility service</Text>
+              <Text style={s.muted}>
+                {accessOn ? 'Enabled — Pulse can tap and scroll for you.' : 'Not enabled — tap to open Android accessibility settings.'}
+              </Text>
+            </View>
+            <Switch value={accessOn} onValueChange={toggleAccessibility} trackColor={{ false: C.border, true: C.accent }} thumbColor="#fff" />
+          </View>
+          <View style={s.rowBetween}>
+            <View style={{ flex: 1, paddingRight: 10 }}>
+              <Text style={s.bodyText}>Pause automation</Text>
+              <Text style={s.muted}>Stops every automated action until you resume it.</Text>
+            </View>
+            <Switch value={guardPaused} onValueChange={toggleGuard} trackColor={{ false: C.border, true: C.warn }} thumbColor="#fff" />
+          </View>
+          {!!guardText && <Text style={s.muted}>{guardText}</Text>}
+          <View style={s.chipRow}>
+            <Pressable onPress={refreshPermissions} style={s.chip}>
+              <Text style={s.chipText}>Refresh permissions</Text>
+            </Pressable>
+            <Pressable onPress={refreshGuard} style={s.chip}>
+              <Text style={s.chipText}>Guard status</Text>
+            </Pressable>
+          </View>
+        </View>
+
+        <View style={s.card}>
+          <View style={s.rowBetween}>
+            <Text style={s.cardTitle}>Execution Log</Text>
+            <Pressable onPress={() => setLogOpen((v) => !v)} style={s.chip}>
+              <Text style={s.chipText}>{logOpen ? 'Hide' : 'Show'}</Text>
+            </Pressable>
+          </View>
+          <Text style={s.muted}>
+            {sessions.length} session(s) · {macros.length} macro(s). Macros replay a saved sequence of actions.
+          </Text>
+
+          {logOpen ? (
+            <>
+              <View style={s.chipRow}>
+                <Pressable onPress={refreshLogs} style={s.chip}>
+                  <Text style={s.chipText}>Refresh</Text>
+                </Pressable>
+              </View>
+
+              <Text style={s.label}>Saved macros</Text>
+              {macros.length === 0 ? (
+                <Text style={s.muted}>No macros yet. Run a workflow, then say "save this as a macro".</Text>
+              ) : (
+                macros.map((m) => (
+                  <View key={m.id} style={s.logRow}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={s.bodyText}>{m.name}</Text>
+                      <Text style={s.muted}>
+                        say "{m.trigger}" · {m.steps.length} steps · used {m.useCount}×
+                      </Text>
+                    </View>
+                    {onRunMacro ? (
+                      <Pressable onPress={() => onRunMacro(m.trigger)} style={s.smallBtn}>
+                        <Text style={s.smallBtnText}>Run</Text>
+                      </Pressable>
+                    ) : null}
+                    <Pressable onPress={() => removeMacro(m)} hitSlop={8}>
+                      <Text style={{ color: C.danger, fontSize: 12 }}>Delete</Text>
+                    </Pressable>
+                  </View>
+                ))
+              )}
+
+              <Text style={s.label}>Recent sessions</Text>
+              {sessions.length === 0 ? (
+                <Text style={s.muted}>No automation sessions recorded yet.</Text>
+              ) : (
+                sessions.slice(0, 20).map((sess) => {
+                  const open = expanded === sess.id;
+                  const when = new Date(sess.startedAt).toLocaleString('en-IN', {
+                    day: 'numeric',
+                    month: 'short',
+                    hour: 'numeric',
+                    minute: '2-digit',
+                  });
+                  return (
+                    <View key={sess.id} style={s.logRow}>
+                      <Pressable style={{ flex: 1 }} onPress={() => setExpanded(open ? null : sess.id)}>
+                        <Text style={s.bodyText}>{sess.workflowName}</Text>
+                        <Text style={s.muted}>
+                          {when} · {sess.summary}
+                          {sess.loopGuardHit ? ' · loop guard' : ''}
+                        </Text>
+                      </Pressable>
+                      {open ? (
+                        <View style={s.stepList}>
+                          {sess.steps.map((st) => (
+                            <Text key={st.stepId} style={s.stepText}>
+                              {st.status === 'done' ? '✓' : st.status === 'error' ? '✕' : st.status === 'needs_confirm' ? '⏰' : '•'} {st.actionType}
+                              {st.target ? ` → ${st.target}` : ''}
+                              {st.latencyMs ? ` · ${st.latencyMs}ms` : ''}
+                              {st.detail ? `\n   ${st.detail}` : ''}
+                            </Text>
+                          ))}
+                        </View>
+                      ) : null}
+                    </View>
+                  );
+                })
+              )}
+            </>
+          ) : null}
+        </View>
+
         {user ? (
           <View style={s.card}>
             <Text style={s.cardTitle}>Security</Text>
@@ -268,6 +504,11 @@ const s = StyleSheet.create({
   cardTitle: { color: C.text, fontSize: 15, fontWeight: '700' },
   label: { color: C.muted, fontSize: 12, fontWeight: '600' },
   bodyText: { color: C.text, fontSize: 14 },
+  logRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingTop: 8, borderTopWidth: 1, borderTopColor: C.border },
+  stepList: { marginTop: 6, gap: 3, backgroundColor: C.bg, borderRadius: 8, padding: 8 },
+  stepText: { color: C.muted, fontSize: 11, lineHeight: 16 },
+  smallBtn: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8, backgroundColor: C.surface2, borderWidth: 1, borderColor: C.border },
+  smallBtnText: { color: '#fff', fontSize: 12, fontWeight: '700' },
   rowBetween: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   chip: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 14, backgroundColor: C.surface2, borderWidth: 1, borderColor: C.border },

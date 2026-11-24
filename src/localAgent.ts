@@ -14,6 +14,8 @@ import type { Attachment } from './attachments';
 import { AutomationWorkflow, executeAutomation, looksLikeAutomation } from './automation';
 import { runLocalCommand, MemoryOps } from './commands';
 import { describeWhen, Reminder, ReminderDraft } from './reminders';
+import { loadMacros, loadSessionLogs, macroFromSession, saveMacro, deleteMacro, sessionStats, syncBridgeSession, appendSession, finishSession, makeStepLog, newSession, ActionType, SessionLog, StepStatus } from './sessionLog';
+import { getAutomationGuardState, haltAutomation, hideTacticalHUD, resumeAutomation, showTacticalHUD } from './bridge';
 
 export type LocalAgentResponse = {
   text: string;
@@ -299,6 +301,91 @@ function resolveFollowUp(input: string, history: ChatMessage[]): string {
 }
 
 /* ------------------------------------------------------------------ */
+/* Session log & macro commands                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Handles "show my session log", "save this as a macro", "list macros" and friends.
+ * Returns null when the input isn't a session-log command.
+ */
+async function handleSessionLogCommand(input: string): Promise<string | null> {
+  const lower = input.trim().toLowerCase();
+
+  if (/\b(?:show|list|view|open)\b.*\b(?:session\s+log|activity\s+log|run\s+history|automation\s+log)\b/.test(lower)) {
+    const sessions = await loadSessionLogs();
+    // Sync the native bridge session (accessibility-service step logs) into the shared store.
+    await syncBridgeSession().catch(() => undefined);
+    const sessionsAfter = await loadSessionLogs();
+    if (!sessionsAfter.length) return 'No automation sessions recorded yet.';
+    const stats = sessionStats(sessionsAfter);
+    const lines = sessionsAfter
+      .slice(0, 10)
+      .map((s) => {
+        const when = new Date(s.startedAt).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+        const guard = s.loopGuardHit ? ' · loop guard' : '';
+        return `- **${s.workflowName}** · ${when} · ${s.summary}${guard}`;
+      });
+    return [
+      `**Session log** (${stats.sessions} sessions · ${stats.steps} steps · ${stats.errors} errors${stats.tokens ? ` · ${stats.tokens} tokens` : ''}${stats.avgLatency ? ` · avg ${stats.avgLatency}ms` : ''})`,
+      ...lines,
+    ].join('\n');
+  }
+
+  if (/\b(?:list|show)\b.*\bmacros?\b/.test(lower)) {
+    const macros = await loadMacros();
+    if (!macros.length) return 'No macros saved yet. Run a workflow, then say "save this as a macro".';
+    return [
+      '**Saved macros:**',
+      ...macros.map((m) => `- **${m.name}** (say "${m.trigger}") · ${m.steps.length} steps · used ${m.useCount}×`),
+    ].join('\n');
+  }
+
+  if (/\bsave\b.*\b(?:as\s+)?(?:a\s+)?macro\b/.test(lower)) {
+    const sessions = await loadSessionLogs();
+    const latest = sessions.find((s) => s.status === 'completed' && s.steps.length);
+    if (!latest) return 'No completed session to save yet — run a workflow first.';
+    const macro = macroFromSession(latest);
+    if (!macro) return 'That session had no reusable steps.';
+    await saveMacro(macro);
+    return `Saved macro **${macro.name}** (${macro.steps.length} steps). Say "${macro.trigger}" to replay it.`;
+  }
+
+  if (/\b(?:delete|remove|forget)\b.*\bmacros?\b/.test(lower)) {
+    const macros = await loadMacros();
+    if (!macros.length) return 'No macros saved yet.';
+    const named = macros.find((m) => lower.includes(m.name.toLowerCase()) || lower.includes(m.trigger.toLowerCase()));
+    if (!named) return `Which macro? I have: ${macros.map((m) => m.name).join(', ')}.`;
+    await deleteMacro(named.id);
+    return `Deleted macro **${named.name}**.`;
+  }
+
+  // Automation guard controls: halt / resume / status
+  if (/\b(?:halt|pause|stop)\b.*\b(?:automation|guard|run)\b/.test(lower)) {
+    const ok = await haltAutomation();
+    return ok ? 'Automation halted. Say "resume automation" to continue.' : 'Automation is not running on this device.';
+  }
+
+  if (/\b(?:resume|continue|unpause)\b.*\b(?:automation|guard|run)\b/.test(lower)) {
+    const ok = await resumeAutomation();
+    return ok ? 'Automation resumed.' : 'Automation is not running on this device.';
+  }
+
+  if (/\b(?:automation|guard)\b.*\b(?:status|state)\b/.test(lower)) {
+    const state = await getAutomationGuardState();
+    if (!state) return 'The automation guard is only available on an Android build with the Pulse service enabled.';
+    const lines = [
+      `**Automation guard** · ${state.paused ? '⏸ paused' : '▶ running'}`,
+      `- HUD: ${state.hudVisible ? 'visible' : 'hidden'}`,
+      `- Repeat count: ${state.repeatActionCount}${state.lastActionSignature ? ` (${state.lastActionSignature})` : ''}`,
+      state.lastLoopGuardHit ? `- Loop guard tripped: ${state.lastLoopGuardHit}` : '- Loop guard: clear',
+    ];
+    return lines.join('\n');
+  }
+
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
 /* Main Local Agent Entry Point                                       */
 /* ------------------------------------------------------------------ */
 
@@ -314,15 +401,77 @@ export async function runLocalAgent(
     attachment?: Attachment;
     webEnabled?: boolean;
     voice?: boolean;
+    source?: 'agent' | 'handsfree';
   },
+): Promise<LocalAgentResponse> {
+  const source = ctx.source || 'agent';
+  const session = newSession('agent_turn', source);
+  const startedAt = Date.now();
+  const control = { skipPersist: false };
+
+  // The tactical HUD mirrors what the native layer is doing right now.
+  await showTacticalHUD('PULSE · working').catch(() => undefined);
+
+  try {
+    const res = await runLocalAgentCore(input, ctx, session, control);
+    if (!control.skipPersist) {
+      await appendSession(finishSession(session, 'completed')).catch(() => undefined);
+    }
+    return res;
+  } catch (e: any) {
+    session.steps.push(
+      makeStepLog('command', {
+        query: input,
+        status: 'error',
+        detail: e?.message || 'Agent turn failed.',
+        latencyMs: Date.now() - startedAt,
+      }),
+    );
+    await appendSession(finishSession(session, 'error')).catch(() => undefined);
+    throw e;
+  } finally {
+    await hideTacticalHUD().catch(() => undefined);
+  }
+}
+
+async function runLocalAgentCore(
+  input: string,
+  ctx: {
+    profile: UserProfile;
+    memory: MemoryOps;
+    reminders: Reminder[];
+    knowledge: RagChunk[];
+    workflows: AutomationWorkflow[];
+    history?: ChatMessage[];
+    attachment?: Attachment;
+    webEnabled?: boolean;
+    voice?: boolean;
+    source?: 'agent' | 'handsfree';
+  },
+  session: SessionLog,
+  control: { skipPersist: boolean },
 ): Promise<LocalAgentResponse> {
   const q = resolveFollowUp(input.trim(), ctx.history || []);
   const lower = q.toLowerCase();
   const firstName = ctx.profile.name ? ctx.profile.name.split(' ')[0] : '';
+  const startedAt = Date.now();
+  const mark = (actionType: ActionType, detail: string, status: StepStatus = 'done', query?: string) => {
+    session.steps.push(
+      makeStepLog(actionType, { query, status, detail, latencyMs: Date.now() - startedAt }),
+    );
+  };
 
   // 0. Attachment handling (100% local, never hits external quota)
   if (ctx.attachment) {
+    mark('command', 'Analyzed attachment locally.', 'done', q);
     return analyzeAttachmentLocally(ctx.attachment, q);
+  }
+
+  // 0b. Session-log commands: inspect recorded sessions, save/replay macros
+  const logCmd = await handleSessionLogCommand(q).catch(() => null);
+  if (logCmd) {
+    mark('command', 'Handled session-log command.', 'done', q);
+    return { handled: true, text: logCmd };
   }
 
   // 1. Multi-step automation workflows & compound commands
@@ -335,6 +484,8 @@ export async function runLocalAgent(
       userName: ctx.profile.name,
     });
     if (auto) {
+      // The automation engine persists its own detailed session; don't double-log.
+      control.skipPersist = true;
       return {
         handled: true,
         text: auto.summary,
@@ -347,6 +498,7 @@ export async function runLocalAgent(
   // 2. Instant device commands (memory, reminders, open apps, call, sms, email)
   const localCmd = await runLocalCommand(q, { apiKey: '', memory: ctx.memory }).catch(() => null);
   if (localCmd) {
+    mark('command', localCmd.reply, 'done', q);
     return {
       handled: true,
       text: localCmd.reply,
@@ -357,11 +509,13 @@ export async function runLocalAgent(
   // 3. List workflows
   if (/\b(?:list|show|what\s+are)\s+(?:my\s+)?(?:workflows|automations|routines|skills)\b/i.test(lower)) {
     const list = ctx.workflows.map((w) => `- **${w.name}** (say "${w.trigger}"): ${w.description}`).join('\n');
+    mark('command', `Listed ${ctx.workflows.length} workflow(s).`, 'done', q);
     return { handled: true, text: `Here are your multi-step automations:\n${list}` };
   }
 
   // 4. List reminders
   if (/\b(?:list|show|check|what\s+are|any)\s+(?:my\s+)?reminders?\b/i.test(lower)) {
+    mark('command', `Listed ${ctx.reminders.length} reminder(s).`, 'done', q);
     if (!ctx.reminders.length) {
       return { handled: true, text: 'You have no upcoming reminders right now. Just say "remind me at 6pm to..." whenever you want to add one.' };
     }
@@ -471,6 +625,7 @@ export async function runLocalAgent(
   const mapMatch = q.match(/(?:directions?\s+to|navigate\s+to|take\s+me\s+to|how\s+(?:do\s+i|to)\s+get\s+to|find\s+on\s+maps?|places?\s+near)\s+(.+)$/i);
   if (mapMatch) {
     const place = mapMatch[1].trim();
+    mark('maps', `Opened Maps for "${place}".`, 'done', q);
     return {
       handled: true,
       text: `Sure—tap below to open **${place}** in Google Maps.`,
@@ -485,6 +640,7 @@ export async function runLocalAgent(
     return words.some((w) => m.text.toLowerCase().includes(w));
   });
   if (rag.results.length > 0 || memHits.length > 0) {
+    mark('knowledge', `Found ${rag.results.length} knowledge hit(s) and ${memHits.length} memory hit(s).`, 'done', q);
     const sections: string[] = [];
     if (rag.results.length > 0) {
       sections.push(rag.results.map((r) => `**${r.chunk.title}**\n${r.chunk.content}`).join('\n\n'));
@@ -499,10 +655,12 @@ export async function runLocalAgent(
   if (ctx.webEnabled !== false) {
     const wxMatch = q.match(/\b(?:weather|temperature|forecast|rain)\s+(?:in|at|for)\s+([a-zA-Z\s]{2,40})/i);
     if (wxMatch) {
+      mark('web_lookup', `Fetched weather for "${wxMatch[1].trim()}".`, 'done', q);
       const wx = await fetchWeather(wxMatch[1].trim());
       if (wx) return wx;
     } else if (/\b(?:weather|temperature|forecast)\b/i.test(lower)) {
       const city = ctx.profile.address?.split(',')[0]?.trim() || 'Hyderabad';
+      mark('web_lookup', `Fetched weather for "${city}".`, 'done', q);
       const wx = await fetchWeather(city);
       if (wx) return wx;
     }
@@ -511,6 +669,7 @@ export async function runLocalAgent(
     if (curMatch) {
       const norm = (s: string) =>
         s.toLowerCase().startsWith('dollar') ? 'USD' : s.toLowerCase().startsWith('rupee') ? 'INR' : s.toLowerCase().startsWith('euro') ? 'EUR' : s.toLowerCase().startsWith('pound') ? 'GBP' : s.toUpperCase();
+      mark('web_lookup', `Fetched currency conversion.`, 'done', q);
       const res = await fetchCurrency(parseFloat(curMatch[1]), norm(curMatch[2]), norm(curMatch[3]));
       if (res) return res;
     }
@@ -519,17 +678,22 @@ export async function runLocalAgent(
     if (defMatch) {
       const word = (defMatch[1] || defMatch[2] || '').trim();
       if (word && !/\s/.test(word)) {
+        mark('web_lookup', `Fetched definition for "${word}".`, 'done', q);
         const res = await fetchDefinition(word);
         if (res) return res;
       }
     }
 
     const wiki = await fetchOpenKnowledge(q);
-    if (wiki) return wiki;
+    if (wiki) {
+      mark('web_lookup', `Fetched open knowledge result.`, 'done', q);
+      return wiki;
+    }
   }
 
   // 12. Natural conversational fallback with helpful web search action
   const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+  mark('web', `Searched Google for "${q}".`, 'done', q);
   return {
     handled: true,
     text: ctx.voice
